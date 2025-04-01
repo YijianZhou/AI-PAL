@@ -44,7 +44,7 @@ AI-PAL is a set of codes. All you need is to setup proper Python environment. Th
 
 ## Reference  
 
-- **Zhou, Y.**<sup>`*`</sup>, H. Ding, A. Ghosh, & Z. Ge (2024, under review). AI-PAL: Localize AI Phase Picker with Rule-based Algorithm for Generalized Earthquake Detection. *Journal of Geophysical Research: Solid Earth*  
+- **Zhou, Y.**<sup>`*`</sup>, H. Ding, A. Ghosh, & Z. Ge (2025). AI-PAL: Self-Supervised AI Phase Picking via Rule-based Algorithm for Generalized Earthquake Detection. *Journal of Geophysical Research: Solid Earth*; doi: [10.1029/2025JB031294](https://doi.org/10.1029/2025JB031294)  
 
 - **Zhou, Y.**, A. Ghosh, L. Fang<sup>`*`</sup>, H. Yue<sup>`*`</sup>, S. Zhou, & Y. Su (2021). A High-Resolution Seismic Catalog for the 2021 M<sub>S</sub>6.4/M<sub>w</sub>6.1 YangBi Earthquake Sequence, Yunnan, China: Application of AI picker and Matched Filter. *Earthquake Science*; 34(5): 390-398. doi: [10.29382/eqs-2021-0031](https://doi.org/10.29382/eqs-2021-0031)  
 
