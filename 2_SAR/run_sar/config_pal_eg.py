@@ -30,6 +30,7 @@ class Config(object):
     self.xy_grid    = 0.02               # lateral grid width, in degree
     self.z_grids    = np.arange(2,20,3)  # z (dep) grids
     self.vp         = 5.9                # averaged P velocity
+    self.vs         = 3.5               # averaged S velocity
     # 3. data pipeline
     self.get_data_dict = dp.get_data_dict
     self.get_sta_dict = dp.get_sta_dict
