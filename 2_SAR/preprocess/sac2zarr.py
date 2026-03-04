@@ -32,8 +32,15 @@ def write_sequence(zarr_dset, data_loader):
     z_target = zarr.open(target_out, mode='w', shape=target_shape, chunks=target_chunks, dtype=np.int_)
     for idx, (data, target) in enumerate(data_loader):
         if idx%1000==0: print("done / total = %d / %d" %(idx, num_samples))
-        z_data[idx] = data
-        z_target[idx] = target
+        if hasattr(data, "detach"): data_np = data.detach().cpu().numpy()
+        else: data_np = np.asarray(data)
+        if hasattr(target, "detach"): target_np = target.detach().cpu().numpy()
+        else: target_np = np.asarray(target)
+        # enforce dtype to match zarr arrays
+        data_np = data_np.astype(np.float32, copy=False)
+        target_np = target_np.astype(np.int32, copy=False) 
+        z_data[idx] = data_np
+        z_target[idx] = target_np
 
 
 if __name__ == '__main__':
