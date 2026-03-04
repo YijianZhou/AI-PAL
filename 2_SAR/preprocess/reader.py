@@ -94,6 +94,22 @@ def get_data_dict(date, data_dir):
     for net_sta in todel: data_dict.pop(net_sta)
     return data_dict
 
+# if your data contains single-channel stations
+def get_1chn_data(date, data_dir):
+    # get data paths
+    data_dict = {}
+    date_code = '{:0>4}{:0>2}{:0>2}'.format(date.year, date.month, date.day)
+    st_paths = sorted(glob.glob(os.path.join(data_dir, date_code, '*')))
+    for st_path in st_paths:
+        fname = os.path.basename(st_path)
+        net_sta = '.'.join(fname.split('.')[0:2])
+        if net_sta in data_dict: data_dict[net_sta].append(st_path)
+        else: data_dict[net_sta] = [st_path]
+    # expand single channel station
+    for net_sta in data_dict:
+        if len(data_dict[net_sta])!=3: data_dict[net_sta] = [data_dict[net_sta][-1]]*3
+    return data_dict
+
 # read stream data
 def read_data(st_paths, sta_dict):
     # read data
