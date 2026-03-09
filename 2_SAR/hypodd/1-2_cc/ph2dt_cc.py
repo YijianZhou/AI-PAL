@@ -132,7 +132,7 @@ class Get_Neighbor(Dataset):
         if evid==index: continue
         evid1, evid2 = np.sort([evid, index])
         pair_list.append([evid1, evid2])
-    return np.array(pair_list, dtype=np.int)
+    return np.array(pair_list, dtype=np.int32)
 
   def __len__(self):
     return len(self.loc_sta_list)
