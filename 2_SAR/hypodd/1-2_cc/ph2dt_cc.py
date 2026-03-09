@@ -118,7 +118,7 @@ class Get_Neighbor(Dataset):
     cond_sta = [len(np.intersect1d(sta_list, sta_ref)) >= num_sta_thres for sta_list in sta_lists]
     # 3. select to maximum num of neighbor
     sub_list = self.loc_sta_list[cond_loc][cond_sta]
-    if len(sub_list)==0: return np.array([], dtype=np.int)
+    if len(sub_list)==0: return np.array([], dtype=np.int32)
     dist_lat = 111*abs(sub_list['lat']-lat)
     dist_lon = 111*abs(sub_list['lon']-lon)*cos_lat
     dist_dep = abs(sub_list['dep']-dep)
