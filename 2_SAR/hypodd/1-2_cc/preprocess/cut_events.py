@@ -59,7 +59,7 @@ class Cut_Events(Dataset):
     for net_sta, [tp, ts] in pick_dict.items():
         if net_sta not in data_dict: continue
         stream_paths = data_dict[net_sta]
-        out_paths = [os.path.join(event_dir,'%s.%s'%(net_sta,ii)) for ii in range(3)]
+        out_paths = [os.path.join(event_dir,'%s.%s.sac'%(net_sta,ii)) for ii in range(3)]
         is_cut = cut_event_window(stream_paths, tp, ts, out_paths)
         if not is_cut: continue
         data_paths_i.append(out_paths)
