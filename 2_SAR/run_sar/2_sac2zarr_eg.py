@@ -1,14 +1,5 @@
-""" Make Zarr dataset with SAC files
-"""
-import os, shutil
+"""Compatibility wrapper. Prefer 2_npy2zarr_eg.py."""
+import os
+import runpy
 
-# i/o paths
-out_path = '/data/bigdata/eg_train-samples.zarr'
-sac_root = '/data/bigdata/eg_train-samples_sac'
-sar_prep_dir = '/home/zhouyj/software/2_SAR/preprocess'
-shutil.copyfile('config_eg.py', os.path.join(sar_prep_dir, 'config.py'))
-num_workers = 10
-
-# sac2zarr
-os.system("python {}/sac2zarr.py --out_path={} --sac_root={} --num_workers={}"\
-    .format(sar_prep_dir, out_path, sac_root, num_workers))
+runpy.run_path(os.path.join(os.path.dirname(__file__), '2_npy2zarr_eg.py'), run_name='__main__')

@@ -1,13 +1,10 @@
-""" Data pipeline for SAR training
-"""
-import os, glob
+"""SAC reader for SAR Zarr generation using raw waveform windows."""
 import torch
 from torch.utils.data import Dataset
 from obspy import read, Stream
 import numpy as np
 import config
 
-# set config
 cfg = config.Config()
 samp_rate = cfg.samp_rate
 num_chn = cfg.num_chn
@@ -16,44 +13,46 @@ win_len = int(cfg.win_len * samp_rate)
 step_len = int(cfg.rnn_step_len * samp_rate)
 step_stride = int(cfg.rnn_step_stride * samp_rate)
 
+
 class Sequences(Dataset):
   def __init__(self, sample_list, is_pos):
     self.samples = np.load(sample_list)
-    self.get_seq_target = get_seq_target
     self.is_pos = is_pos
 
   def __getitem__(self, index):
-    # read data
     st_paths = self.samples[index]
     st = Stream([read(st_path)[0] for st_path in st_paths])
-    st_data = torch.from_numpy(np.array([tr.data[0:win_len] for tr in st])).float()
-    # slice stream into sequence
-    try: data_seq = st_data.unfold(1, step_len, step_stride).permute(1,0,2)
-    except: data_seq = torch.zeros(num_steps, num_chn, step_len)
-    data_seq = data_seq.reshape(data_seq.size(0), -1)
-    if data_seq.size(0)!=num_steps:
-        num_step_pad = num_steps - data_seq.size(0)
-        data_seq = torch.cat((data_seq, torch.zeros(num_step_pad, data_seq.size(1))))
-    # get target
-    header = st[0].stats.sac
-    if self.is_pos: tp, ts = header.t0, header.t1
-    else: tp, ts = -1, -1
-    target_seq = self.get_seq_target(tp, ts, self.is_pos)
-    return data_seq, target_seq
+    data = np.zeros((num_chn, win_len), dtype=np.float32)
+    for ii, tr in enumerate(st[:num_chn]):
+        npts = min(len(tr.data), win_len)
+        data[ii, 0:npts] = np.asarray(tr.data[:npts], dtype=np.float32)
+    if self.is_pos:
+        header = st[0].stats.sac
+        tp, ts = header.t0, header.t1
+    else:
+        tp, ts = -1, -1
+    target_seq = get_seq_target(tp, ts, self.is_pos)
+    return data, target_seq
 
   def __len__(self):
     return len(self.samples)
 
-# get target of sequence samples
+
 def get_seq_target(tp, ts, is_pos):
-    target_seq = np.zeros(num_steps, dtype=np.int_)
-    if not is_pos: return target_seq
+    target_seq = np.zeros(num_steps, dtype=np.int32)
+    if not is_pos:
+        return target_seq
     tp_idx, ts_idx = tp*samp_rate, ts*samp_rate
-    tp_step_idx0 = 0 if tp_idx<step_len else int((tp_idx-step_len)/step_stride) + 1
+    tp_step_idx0 = 0 if tp_idx < step_len else int((tp_idx-step_len)/step_stride) + 1
     tp_step_idx1 = int(tp_idx / step_stride) + 1
+    tp_step_idx0 = max(0, min(tp_step_idx0, num_steps))
+    tp_step_idx1 = max(0, min(tp_step_idx1, num_steps))
     target_seq[tp_step_idx0:tp_step_idx1] = 1
-    ts_step_idx0 = int((ts_idx-step_len)/step_stride) + 1 
+    ts_step_idx0 = int((ts_idx-step_len)/step_stride) + 1
     ts_step_idx1 = int(ts_idx / step_stride) + 1
-    if ts_step_idx0<=tp_step_idx0: ts_step_idx0 = tp_step_idx0 + int((tp_step_idx1-tp_step_idx0)/2)
+    if ts_step_idx0 <= tp_step_idx0:
+        ts_step_idx0 = tp_step_idx0 + int((tp_step_idx1-tp_step_idx0)/2)
+    ts_step_idx0 = max(0, min(ts_step_idx0, num_steps))
+    ts_step_idx1 = max(0, min(ts_step_idx1, num_steps))
     target_seq[ts_step_idx0:ts_step_idx1] = 2
     return target_seq

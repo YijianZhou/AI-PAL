@@ -105,14 +105,16 @@ class SAR_Picker(object):
     num_batch = int(np.ceil(num_win / batch_size))
     picks_raw = []
     dtype = [('tp','O'),('ts','O'),('p_prob','O'),('s_prob','O')]
+    st_win_cuda = st_data_cuda.unfold(1, win_len_npts, win_stride_npts).permute(1, 0, 2)
     for batch_idx in range(num_batch):
         # get win_data
         n_win = batch_size if batch_idx<num_batch-1 else num_win%batch_size
         if n_win==0: n_win = batch_size
         win_idx_list = [nn + batch_idx*batch_size for nn in range(n_win)]
-        data_seq = self.st2seq(st_data_cuda, win_idx_list, miss_chn)
-        pred_logits = self.model(data_seq)
-        pred_probs = F.softmax(pred_logits, dim=-1).detach().cpu().numpy()
+        data_seq = self.st2seq(st_win_cuda, win_idx_list, miss_chn)
+        with torch.inference_mode():
+            pred_logits = self.model(data_seq)
+            pred_probs = F.softmax(pred_logits, dim=-1).detach().cpu().numpy()
         # decode to sec
         for nn, pred_prob in enumerate(pred_probs):
             win_idx = nn + batch_idx*batch_size
@@ -141,15 +143,18 @@ class SAR_Picker(object):
     print('  {} raw P&S picks | SAR run time {:.2f}s'.format(len(picks_raw), time.time()-t))
     return np.array(picks_raw, dtype=dtype)
 
-  def st2seq(self, st_data_cuda, win_idx_list, miss_chn):
-    num_win = len(win_idx_list)
-    data_seq = torch.zeros((num_win, num_steps, num_chn*step_len_npts), dtype=torch.float32, device=self.device)
-    for i,win_idx in enumerate(win_idx_list):
-        win_data = st_data_cuda[:,win_idx*win_stride_npts : win_idx*win_stride_npts+win_len_npts].clone()
-        win_data = self.preprocess_cuda(win_data, miss_chn[win_idx])
-        win_data = win_data.unfold(1, step_len_npts, step_stride_npts).permute(1,0,2)
-        data_seq[i] = win_data.reshape(win_data.size(0), -1)
-    return data_seq
+  def st2seq(self, st_win_cuda, win_idx_list, miss_chn):
+    win_idx_tensor = torch.as_tensor(win_idx_list, dtype=torch.long, device=self.device)
+    win_data = st_win_cuda.index_select(0, win_idx_tensor).contiguous()
+    win_data = self.preprocess_cuda_batch(win_data, miss_chn[win_idx_list])
+    data_seq = win_data.unfold(2, step_len_npts, step_stride_npts)
+    data_seq = data_seq.permute(0, 2, 1, 3).reshape(win_data.size(0), -1, num_chn*step_len_npts)
+    if data_seq.size(1) < num_steps:
+        pad = data_seq.new_zeros(data_seq.size(0), num_steps-data_seq.size(1), data_seq.size(2))
+        data_seq = torch.cat((data_seq, pad), dim=1)
+    elif data_seq.size(1) > num_steps:
+        data_seq = data_seq[:, 0:num_steps, :]
+    return data_seq.contiguous()
 
   def preprocess(self, st, max_gap=5.):
     # align time
@@ -204,8 +209,24 @@ class SAR_Picker(object):
     if 0<sum(is_miss)<3: data[is_miss] = data[~is_miss][-1]
     # rmean & norm
     data -= torch.mean(data, axis=1).view(num_chn,1)
-    if global_max_norm: data /= torch.max(abs(data))
-    else: data /= torch.max(abs(data), axis=1).values.view(num_chn,1)
+    if global_max_norm: data /= torch.max(abs(data)).clamp_min(1e-12)
+    else: data /= torch.max(abs(data), axis=1).values.clamp_min(1e-12).view(num_chn,1)
+    return data
+
+  def preprocess_cuda_batch(self, data, miss_chn_batch):
+    # data: (num_win, num_chn, win_len_npts)
+    miss_chn_batch = np.asarray(miss_chn_batch, dtype=bool)
+    miss_count = np.sum(miss_chn_batch, axis=1)
+    repair_rows = np.where((miss_count > 0) & (miss_count < num_chn))[0]
+    for row in repair_rows:
+        miss = torch.as_tensor(miss_chn_batch[row], dtype=torch.bool, device=self.device)
+        data[row, miss] = data[row, ~miss][-1]
+    data -= torch.mean(data, dim=2, keepdim=True)
+    if global_max_norm:
+        scale = torch.amax(torch.abs(data), dim=(1, 2), keepdim=True)
+    else:
+        scale = torch.amax(torch.abs(data), dim=2, keepdim=True)
+    data /= scale.clamp_min(1e-12)
     return data
 
   # get S amplitide

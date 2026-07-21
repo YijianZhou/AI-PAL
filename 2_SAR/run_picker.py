@@ -1,50 +1,52 @@
-""" Main function for stream picking with LoSAR
+"""Main function for offline stream picking with LoSAR.
+
+The SAR model is loaded once in the main process.  Parallelism is handled with
+threads so all workers share the same GPU-resident model parameters, matching
+realtime picking behavior.
 """
-import os
 import argparse
-import numpy as np
-import torch.multiprocessing as mp
-from obspy import read, UTCDateTime
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
-import torch
-import picker 
-import config
+import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+
+import torch
+from obspy import UTCDateTime
+
+import config
+import picker as picker_module
+
 warnings.filterwarnings("ignore")
 
-# import readers
 cfg = config.Config()
 get_data_dict = cfg.get_data_dict
 get_sta_dict = cfg.get_sta_dict
 read_data = cfg.read_data
 
-class Pick_One_Day(Dataset):
-  def __init__(self, picker, date_list, data_dir, sta_dict, out_root):
-    self.picker = picker
-    self.date_list = date_list
-    self.data_dir = data_dir
-    self.sta_dict = sta_dict
-    self.out_root = out_root
 
-  def __getitem__(self, index):
-    date = self.date_list[index]
-    fout = open(os.path.join(self.out_root, '%s.pick'%(date.date)),'w')
-    data_dict = get_data_dict(date, self.data_dir)
-    for net_sta, data_paths in data_dict.items():
-        if net_sta not in self.sta_dict: continue
-        print('-'*40)
-        print('picking %s %s'%(net_sta, date.date))
-        st = read_data(data_paths, self.sta_dict)
-        self.picker.pick(st, fout)
-    fout.close()
+def pick_one_day(date, sar_picker, data_dir, sta_dict, out_root):
+    pick_path = os.path.join(out_root, '%s.pick' % date.date)
+    data_dict = get_data_dict(date, data_dir)
 
-  def __len__(self):
-    return len(date_list)
+    with open(pick_path, 'w') as fout:
+        for net_sta, data_paths in data_dict.items():
+            if net_sta not in sta_dict:
+                continue
+            print('-' * 40)
+            print('picking %s %s' % (net_sta, date.date))
+            st = read_data(data_paths, sta_dict)
+            with torch.inference_mode():
+                sar_picker.pick(st, fout)
+
+    return pick_path
 
 
-if __name__ == '__main__':
-    mp.set_start_method('spawn', force=True)  # 'spawn' or 'forkserver'
+def build_date_list(time_range):
+    start_time, end_time = [UTCDateTime(time) for time in time_range.split('-')]
+    num_days = int((end_time - start_time) / 86400)
+    return [start_time + 86400 * day_idx for day_idx in range(num_days)]
+
+
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--gpu_idx', type=int)
     parser.add_argument('--num_workers', type=int)
@@ -55,14 +57,38 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt_dir', type=str)
     parser.add_argument('--ckpt_idx', type=int)
     args = parser.parse_args()
-    # setup picker
-    picker = picker.SAR_Picker(args.ckpt_dir, args.ckpt_idx, args.gpu_idx)
+
+    sar_picker = picker_module.SAR_Picker(args.ckpt_dir, args.ckpt_idx, args.gpu_idx)
     sta_dict = get_sta_dict(args.fsta)
-    if not os.path.exists(args.out_root): os.makedirs(args.out_root)
-    # start picking 
-    start_time, end_time = [UTCDateTime(time) for time in args.time_range.split('-')]
-    num_days = int((end_time - start_time) / 86400)
-    date_list = [start_time+86400*day_idx for day_idx in range(num_days)]
-    dataset = Pick_One_Day(picker, date_list, args.data_dir, sta_dict, args.out_root)
-    dataloader = DataLoader(dataset, batch_size=None, num_workers=args.num_workers)
-    for i,_ in enumerate(dataloader): print('%s days done'%i) 
+    os.makedirs(args.out_root, exist_ok=True)
+
+    date_list = build_date_list(args.time_range)
+    if not date_list:
+        print('no dates to process')
+        return
+
+    num_workers = max(1, int(args.num_workers))
+    if num_workers == 1:
+        for idx, date in enumerate(date_list, start=1):
+            pick_path = pick_one_day(date, sar_picker, args.data_dir, sta_dict, args.out_root)
+            print('%s / %s days done: %s' % (idx, len(date_list), pick_path))
+    else:
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = [
+                executor.submit(
+                    pick_one_day,
+                    date,
+                    sar_picker,
+                    args.data_dir,
+                    sta_dict,
+                    args.out_root,
+                )
+                for date in date_list
+            ]
+            for idx, future in enumerate(futures, start=1):
+                pick_path = future.result()
+                print('%s / %s days done: %s' % (idx, len(date_list), pick_path))
+
+
+if __name__ == '__main__':
+    main()

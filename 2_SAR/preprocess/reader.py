@@ -110,6 +110,14 @@ def get_1chn_data(date, data_dir):
         if len(data_dict[net_sta])!=3: data_dict[net_sta] = [data_dict[net_sta][-1]]*3
     return data_dict
 
+# convert acceleration channels from m/s/s to m/s
+def convert_acc_to_vel(st):
+    for tr in st:
+        if tr.stats.channel.startswith('HN'):
+            tr.detrend('demean')
+            tr.integrate()
+    return st
+
 # read stream data
 def read_data(st_paths, sta_dict):
     # read data
@@ -138,6 +146,7 @@ def read_data(st_paths, sta_dict):
         for [ge,gn,gz,t0,t1] in gain:
             if t0<st_time<t1: break
         for ii in range(3): st[ii].data = st[ii].data / [ge,gn,gz][ii]
+    st = convert_acc_to_vel(st)
     return st
 
 # UTCDateTime to string
