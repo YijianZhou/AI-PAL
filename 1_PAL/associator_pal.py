@@ -1,5 +1,11 @@
+from datetime import timedelta
 import numpy as np
 
+
+def format_assoc_time(value):
+  dt = value.datetime + timedelta(microseconds=5000)
+  dt = dt.replace(microsecond=(dt.microsecond // 10000) * 10000)
+  return dt.isoformat(timespec='milliseconds')[:-1] + 'Z'
 class PS_Pair_Assoc(object):
   """ Associate P- & S-pick Pairs by searching ot and loc clustering
   Inputs
@@ -188,7 +194,7 @@ class PS_Pair_Assoc(object):
     lat = event_loc['evt_lat']
     dep = event_loc['evt_dep']
     mag = event_loc['mag'] if 'mag' in event_loc else -1
-    out_ctlg.write('{},{},{},{},{}\n'.format(ot, lat, lon, dep, mag))
+    out_ctlg.write('{},{:.5f},{:.5f},{:.1f},{:.2f}\n'.format(format_assoc_time(ot), lat, lon, dep, mag))
 
   def write_phase(self, event_loc, event_pick, out_pha):
     ot  = event_loc['evt_ot']
@@ -196,11 +202,16 @@ class PS_Pair_Assoc(object):
     lat = event_loc['evt_lat']
     dep = event_loc['evt_dep']
     mag = event_loc['mag']
-    out_pha.write('{},{},{},{},{}\n'.format(ot, lat, lon, dep, mag))
+    out_pha.write('{},{:.5f},{:.5f},{:.1f},{:.2f}\n'.format(format_assoc_time(ot), lat, lon, dep, mag))
     for pick in event_pick:
         net_sta = pick['net_sta']
         tp = pick['tp']
         ts = pick['ts']
         s_amp = pick['s_amp'] if 's_amp' in pick.dtype.names else -1
-        out_pha.write('{},{},{},{}\n'.format(net_sta, tp, ts, s_amp))
+        p_prob = pick['p_prob'] if 'p_prob' in pick.dtype.names else -1
+        s_prob = pick['s_prob'] if 's_prob' in pick.dtype.names else -1
+        if 'p_prob' in pick.dtype.names and 's_prob' in pick.dtype.names:
+            out_pha.write('{},{},{},{},{:.4f},{:.4f}\n'.format(net_sta, format_assoc_time(tp), format_assoc_time(ts), s_amp, p_prob, s_prob))
+        else:
+            out_pha.write('{},{},{},{}\n'.format(net_sta, format_assoc_time(tp), format_assoc_time(ts), s_amp))
 

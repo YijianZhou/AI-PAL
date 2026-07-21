@@ -335,12 +335,29 @@ class STA_LTA_Kurtosis(object):
     # filter
     stream.detrend('demean').detrend('linear').taper(max_percentage=0.05, max_length=5.)
     freq_min, freq_max = freq_band
-    if freq_min and freq_max:
-        return stream.filter('bandpass', freqmin=freq_min, freqmax=freq_max)
+    nyquist = 0.5 * min(float(trace.stats.sampling_rate) for trace in stream)
+    if freq_min and float(freq_min) >= nyquist:
+        raise ValueError(
+            "lower filter corner {} Hz is not below Nyquist {} Hz".format(
+                freq_min, nyquist
+            )
+        )
+    safe_freq_max = None
+    if freq_max:
+        safe_freq_max = min(float(freq_max), nyquist * 0.95)
+        if safe_freq_max < float(freq_max):
+            print(
+                "adjust filter upper corner from {} to {:.6g} Hz for "
+                "Nyquist {:.6g} Hz".format(freq_max, safe_freq_max, nyquist)
+            )
+    if freq_min and safe_freq_max:
+        return stream.filter(
+            'bandpass', freqmin=freq_min, freqmax=safe_freq_max
+        )
     elif not freq_max and freq_min:
         return stream.filter('highpass', freq=freq_min)
-    elif not freq_min and freq_max:
-        return stream.filter('lowpass', freq=freq_max)
+    elif not freq_min and safe_freq_max:
+        return stream.filter('lowpass', freq=safe_freq_max)
     else:
         print('filter type not supported!'); return []
 
