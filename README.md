@@ -231,11 +231,13 @@ Each model first consolidates repeated detections across sliding windows.
 Configured group support is then applied before accepted picks are merged into
 the preferred ensemble. Reference picker results remain separate.
 
-### 5.3 Association And Postprocessing
+### 5.3 Association
 
 PAL can associate one full network or several station subnets with independent
 parameters and travel-time tables. Subnet detections are merged with connected
 duplicate groups, including events detected by more than two subnets.
+
+### 5.4 Postprocessing
 
 Postprocessing uses repicker phase pairs detected by both POS_NEG and positive
 groups as PAL reassociation anchors. Compatible POS_NEG-only or positive-only
@@ -244,7 +246,7 @@ Final phase rows retain picker support, uncertainty, provenance, displacement
 amplitude, and per-component P-wave energy SNR for downstream quality control
 and location weighting.
 
-### 5.4 Realtime Event Ownership
+### 5.5 Realtime Event Ownership
 
 For each realtime miniSEED segment, `T0` and `T1` are the median trace start and
 exclusive end times after sampling-rate cleanup and trace merging. The valid
@@ -299,27 +301,12 @@ creates `2.1` plus the `1.3.*`, `2.2.*`, and `3.2.*` reference branches.
 Detailed row schemas and restart-completion rules are documented in
 [3_run_ai_pal/README.md](3_run_ai_pal/README.md).
 
-## 8. Production Handoff
-
-Before promoting a release to an unattended production service:
-
-1. Pin the Python, CUDA, and model environment.
-2. Version station metadata, gain intervals, configs, and checkpoints.
-3. Define atomic miniSEED input readiness and single-process ownership.
-4. Run under a service manager with restart policy and log rotation.
-5. Monitor input lag, successful segments, bad files, memory, GPU use,
-   throughput, and disk space.
-6. Define retention for waveforms, picks, phases, merge logs, and monitoring
-   products.
-7. Validate scientific performance and output compatibility on a frozen test
-   interval before tagging a release.
-
-## 9. Tutorials
+## Tutorials
 
 - 2021/10 Chinese online training: [KouShare](https://www.koushare.com/lives/room/549779)
 - 2022/08 Chinese online training: [KouShare](https://www.koushare.com/video/videodetail/31656)
 
-## 10. References
+## References
 
 - **Zhou, Y.**, H. Ding, A. Ghosh, and Z. Ge (2025). AI-PAL:
   Self-Supervised AI Phase Picking via Rule-Based Algorithm for Generalized
