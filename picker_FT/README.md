@@ -1,0 +1,5 @@
+# Frame Transformer Picker Source
+
+Frame Transformer model structure, dataset, training loop, and continuous/positive
+inference. Executable workflows and editable configs live in `../2_train_picker/`
+and `../3_run_ai_pal/`.

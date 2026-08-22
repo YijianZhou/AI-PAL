@@ -1,0 +1,55 @@
+"""Train configured AI-PAL picker models from one shared Zarr dataset."""
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+# ============================================================================
+# USER SETTINGS: DATASET, MODELS, OUTPUTS, AND EXECUTION
+# ============================================================================
+AI_PAL_ROOT = Path("~/software/AI-PAL").expanduser()  # Installed source package.
+CASE_CODE = "eg"  # "eg" is the packaged example; use e.g. "sc" for SoCal.
+ENABLED_MODELS = ["SAR", "FT", "PHN", "RUN"]
+ZARR_PATH = Path("/data/bigdata/%s_train-samples.zarr" % CASE_CODE)
+OUT_CKPT_ROOT = Path("output/%s_ckpt" % CASE_CODE)
+
+# Models train sequentially, so they share one GPU assignment.
+gpu_idx = 0
+NUM_WORKERS = 10
+PREFETCH_FACTOR = 2
+
+# ============================================================================
+# CONNECTION CODE: normally no edits are needed below this line
+# ============================================================================
+shutil.copyfile(
+    "config_ai_pal_{}.py".format(CASE_CODE),
+    AI_PAL_ROOT / "PAL_src" / "config_ai_pal.py",
+)
+
+if not ZARR_PATH.exists():
+    raise FileNotFoundError(ZARR_PATH)
+
+for model_name in ENABLED_MODELS:
+    model_code = model_name.lower()
+    src_dir = AI_PAL_ROOT / "picker_{}".format(model_name)
+    config_path = Path("config_{}_{}.py".format(model_code, CASE_CODE))
+    train_script = src_dir / "train.py"
+    ckpt_dir = OUT_CKPT_ROOT / model_name
+
+    for path in (src_dir, config_path, train_script):
+        if not path.exists():
+            raise FileNotFoundError(path)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(config_path, src_dir / "config.py")
+    print(
+        "training {} from {} -> {}".format(model_name, ZARR_PATH, ckpt_dir),
+        flush=True,
+    )
+    subprocess.check_call([
+        sys.executable, str(train_script),
+        "--gpu_idx", str(gpu_idx),
+        "--num_workers", str(NUM_WORKERS),
+        "--prefetch_factor", str(PREFETCH_FACTOR),
+        "--zarr_path", str(ZARR_PATH),
+        "--ckpt_dir", str(ckpt_dir),
+    ])
