@@ -1,18 +1,12 @@
-"""Cut CEED HDF5 station waveforms into augmented 25 s SAC samples.
+"""Shared CEED HDF5 reading and waveform preprocessing helpers.
 
-Input is the grouped training phase file from analyze_ceed_phase_feature_rarity.py:
+Input is the grouped training phase file from 0_analyze_ceed_phase_feature_rarity.py:
 
     ot,lat,lon,dep,mag,event_id
     net.sta.loc.chn,tp,ts,epi_dist_km,hypo_dist_km,split,num_aug,...
 
-For each station pick row, this script loads the corresponding 120 s CEED HDF5
-station waveform, preprocesses it, randomly cuts num_aug 25 s windows containing
-both P and S arrivals, normalizes each channel independently, and writes SAC.
-
-Output layout:
-
-    out_root/train/event_id_ot_yyyymmddhhmmss.ss/net.sta.chn.aug-idx.sac
-    out_root/valid/event_id_ot_yyyymmddhhmmss.ss/net.sta.chn.aug-idx.sac
+The indexed cutting executable uses these helpers to resolve phase rows, read
+raw CEED records, preprocess them, and cut normalized windows into NPY shards.
 
 The phase file may not contain the original HDF5 group id if it was generated
 before event ids were added to phase headers. In that case, events are resolved
@@ -21,7 +15,6 @@ by matching CEED event_time within a small tolerance.
 
 import bisect
 import csv
-import multiprocessing as mp
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -34,7 +27,6 @@ from obspy import Stream, Trace, UTCDateTime
 
 MISSING_PICK = "-1"
 DEFAULT_CEED_ROOT = Path("/nas/zhouyj/CEED")
-DEFAULT_OUT_ROOT = Path("/nas/zhouyj/CEED_train_sac")
 
 
 def parse_time(value):
@@ -344,26 +336,6 @@ def make_stream(dataset, sample, args):
         tr.stats.channel = channel
         tr.stats.starttime = start
         tr.stats.sampling_rate = sampling_rate
-        tr.stats.sac = {}
-        if np.isfinite(sample.get("lat", np.nan)):
-            tr.stats.sac.evla = float(sample["lat"])
-        if np.isfinite(sample.get("lon", np.nan)):
-            tr.stats.sac.evlo = float(sample["lon"])
-        if np.isfinite(sample.get("dep", np.nan)):
-            tr.stats.sac.evdp = float(sample["dep"])
-        if np.isfinite(sample.get("mag", np.nan)):
-            tr.stats.sac.mag = float(sample["mag"])
-        if np.isfinite(sample.get("epi_dist_km", np.nan)):
-            tr.stats.sac.dist = float(sample["epi_dist_km"])
-        sta_lat = attr_scalar(attrs, "latitude")
-        sta_lon = attr_scalar(attrs, "longitude")
-        sta_ele = attr_scalar(attrs, "elevation_m")
-        if sta_lat is not None:
-            tr.stats.sac.stla = float(sta_lat)
-        if sta_lon is not None:
-            tr.stats.sac.stlo = float(sta_lon)
-        if sta_ele is not None:
-            tr.stats.sac.stel = float(sta_ele)
         stream.append(tr)
 
     if args.integrate_acceleration and is_acceleration_channel(band):
@@ -424,160 +396,3 @@ def cut_and_normalize(stream, start_time, args):
         else:
             tr.data = tr.data.astype(np.float32)
     return st
-
-
-def update_sac_time_headers(trace, p_rel, s_rel):
-    t0 = trace.stats.starttime
-    if "sac" not in trace.stats:
-        trace.stats.sac = {}
-    trace.stats.sac.nzyear = t0.year
-    trace.stats.sac.nzjday = t0.julday
-    trace.stats.sac.nzhour = t0.hour
-    trace.stats.sac.nzmin = t0.minute
-    trace.stats.sac.nzsec = t0.second
-    trace.stats.sac.nzmsec = int(t0.microsecond / 1000)
-    trace.stats.sac.t0 = float(p_rel)
-    trace.stats.sac.t1 = float(s_rel)
-
-
-def write_sac_sample(stream, sample, aug_idx, start_time, args):
-    out_dir = Path(args.out_root) / sample["split"] / event_dir_name(sample["event_id"], sample["ot"])
-    out_dir.mkdir(parents=True, exist_ok=True)
-    p_rel = utc(sample["tp"]) - start_time
-    s_rel = utc(sample["ts"]) - start_time
-    paths = []
-    for tr in stream:
-        update_sac_time_headers(tr, p_rel, s_rel)
-        filename = f"{tr.stats.network}.{tr.stats.station}.{tr.stats.channel}.aug-{aug_idx}.sac"
-        out_path = out_dir / filename
-        tr.write(str(out_path), format="SAC")
-        paths.append(str(out_path))
-    return paths
-
-
-def process_sample(dataset, sample, args, rng):
-    counts = Counter()
-    written_paths = []
-    try:
-        stream = make_stream(dataset, sample, args)
-        if sample.get("integrated_acceleration"):
-            counts["acceleration_records_integrated"] += 1
-        if abs(stream[0].stats.sampling_rate - args.sample_rate) > 1e-6:
-            stream.resample(args.sample_rate)
-        stream = preprocess_stream(stream, args)
-        window_range = valid_window_start_range(stream, sample["tp"], sample["ts"], args)
-        if window_range is None:
-            counts["skipped_no_valid_window"] += 1
-            return counts, written_paths
-        min_start, max_start = window_range
-        span = max_start - min_start
-        for aug_idx in range(sample["num_aug"]):
-            offset = rng.random() * span if span > 0 else 0.0
-            start_time = min_start + offset
-            cut = cut_and_normalize(stream, start_time, args)
-            if len(cut) != 3:
-                counts["skipped_bad_cut_channel_count"] += 1
-                continue
-            paths = write_sac_sample(cut, sample, aug_idx, start_time, args)
-            written_paths.append(paths)
-            counts["sac_files_written"] += len(paths)
-            counts["augmented_samples_written"] += 1
-    except Exception as exc:
-        counts["skipped_exception"] += 1
-        if args.verbose_errors:
-            print(f"sample line {sample.get('line_number')} failed: {exc}", flush=True)
-    return counts, written_paths
-
-
-def process_h5_group(task):
-    group_index, h5_path, samples, args = task
-    counts = Counter()
-    train_paths = []
-    valid_paths = []
-    rng = np.random.default_rng(args.random_seed + group_index)
-    print(f"reading {h5_path}", flush=True)
-    with h5py.File(h5_path, "r") as h5:
-        by_event = defaultdict(list)
-        for sample in samples:
-            by_event[sample["h5_event_id"]].append(sample)
-        done = 0
-        for event_id in sorted(by_event):
-            if event_id not in h5:
-                counts["missing_event_in_h5"] += len(by_event[event_id])
-                continue
-            event = h5[event_id]
-            for sample in by_event[event_id]:
-                station_key = sample["station_key"]
-                if station_key not in event:
-                    counts["missing_station_dataset"] += 1
-                    continue
-                sample_counts, paths = process_sample(event[station_key], sample, args, rng)
-                counts.update(sample_counts)
-                if paths:
-                    if sample["split"] == "train":
-                        train_paths.extend(paths)
-                    else:
-                        valid_paths.extend(paths)
-                done += 1
-                if args.progress_every and done % args.progress_every == 0:
-                    print(f"{h5_path}: processed {done:,}/{len(samples):,}", flush=True)
-    counts["phase_samples_processed"] += len(samples)
-    return counts, train_paths, valid_paths
-
-
-def process_samples(samples, args):
-    counts = Counter()
-    train_paths = []
-    valid_paths = []
-    by_path = defaultdict(list)
-    for sample in samples:
-        by_path[str(Path(sample["h5_path"]))].append(sample)
-    tasks = [(idx, h5_path, by_path[h5_path], args) for idx, h5_path in enumerate(sorted(by_path))]
-
-    if args.num_workers <= 1 or len(tasks) == 1:
-        results = [process_h5_group(task) for task in tasks]
-    else:
-        with mp.Pool(processes=args.num_workers) as pool:
-            results = list(pool.imap_unordered(process_h5_group, tasks))
-
-    for group_counts, group_train_paths, group_valid_paths in results:
-        counts.update(group_counts)
-        train_paths.extend(group_train_paths)
-        valid_paths.extend(group_valid_paths)
-    return counts, train_paths, valid_paths
-
-
-def path_array(paths):
-    if not paths:
-        return np.empty((0, 3), dtype="U1")
-    return np.asarray(paths, dtype=str)
-
-
-def save_path_lists(out_root, train_paths, valid_paths):
-    root = Path(out_root)
-    root.mkdir(parents=True, exist_ok=True)
-    np.save(root / "train_pos.npy", path_array(train_paths))
-    np.save(root / "valid_pos.npy", path_array(valid_paths))
-
-
-def write_summary(path, phase_counts, resolve_counts, process_counts, args, n_samples, n_resolved):
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="") as fp:
-        writer = csv.writer(fp, lineterminator="\n")
-        writer.writerow(["parameter", "value"])
-        writer.writerow(["phase_file", args.phase_file])
-        writer.writerow(["ceed_root", args.ceed_root])
-        writer.writerow(["out_root", args.out_root])
-        writer.writerow(["window_length", args.window_length])
-        writer.writerow(["sample_rate", args.sample_rate])
-        writer.writerow(["freqmin", args.freqmin])
-        writer.writerow(["freqmax", args.freqmax])
-        writer.writerow(["phase_margin", args.phase_margin])
-        writer.writerow(["random_seed", args.random_seed])
-        writer.writerow(["num_workers", args.num_workers])
-        writer.writerow(["samples_read", n_samples])
-        writer.writerow(["samples_resolved", n_resolved])
-        for prefix, counts in [("phase", phase_counts), ("resolve", resolve_counts), ("process", process_counts)]:
-            for key in sorted(counts):
-                writer.writerow([f"{prefix}_{key}", counts[key]])
-

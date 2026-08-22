@@ -26,7 +26,7 @@ import multiprocessing as mp
 import h5py
 import numpy as np
 
-import ceed_waveform as sac
+import ceed_data_pipeline as ceed
 
 DEFAULT_OUT_ROOT = Path('/nas/zhouyj/CEED_train_npy')
 
@@ -34,7 +34,7 @@ DEFAULT_OUT_ROOT = Path('/nas/zhouyj/CEED_train_npy')
 # USER SETTINGS
 # =============================================================================
 PHASE_FILE = 'output/ceed_phase_train_augmented.pha'
-CEED_ROOT = sac.DEFAULT_CEED_ROOT
+CEED_ROOT = ceed.DEFAULT_CEED_ROOT
 NC_DIR = None
 SC_DIR = None
 OUT_ROOT = DEFAULT_OUT_ROOT
@@ -57,8 +57,8 @@ VERBOSE_ERRORS = False
 
 
 def make_npy_sample(stream, sample, start_time, args):
-    p_rel = float(sac.utc(sample['tp']) - start_time)
-    s_rel = float(sac.utc(sample['ts']) - start_time)
+    p_rel = float(ceed.utc(sample['tp']) - start_time)
+    s_rel = float(ceed.utc(sample['ts']) - start_time)
     win_len = int(round(args.window_length * args.sample_rate))
     out = np.zeros((3, win_len + 2), dtype=np.float32)
     out[:, 0] = p_rel
@@ -96,13 +96,13 @@ def process_sample(dataset, sample, args, rng):
     counts = Counter()
     sample_arrays = []
     try:
-        stream = sac.make_stream(dataset, sample, args)
+        stream = ceed.make_stream(dataset, sample, args)
         if sample.get('integrated_acceleration'):
             counts['acceleration_records_integrated'] += 1
         if abs(stream[0].stats.sampling_rate - args.sample_rate) > 1e-6:
             stream.resample(args.sample_rate)
-        stream = sac.preprocess_stream(stream, args)
-        window_range = sac.valid_window_start_range(stream, sample['tp'], sample['ts'], args)
+        stream = ceed.preprocess_stream(stream, args)
+        window_range = ceed.valid_window_start_range(stream, sample['tp'], sample['ts'], args)
         if window_range is None:
             counts['skipped_no_valid_window'] += 1
             return counts, sample_arrays
@@ -111,7 +111,7 @@ def process_sample(dataset, sample, args, rng):
         for aug_idx in range(sample['num_aug']):
             offset = rng.random() * span if span > 0 else 0.0
             start_time = min_start + offset
-            cut = sac.cut_and_normalize(stream, start_time, args)
+            cut = ceed.cut_and_normalize(stream, start_time, args)
             if len(cut) != 3:
                 counts['skipped_bad_cut_channel_count'] += 1
                 continue
@@ -230,11 +230,11 @@ def main():
         integrate_acceleration=INTEGRATE_ACCELERATION, verbose_errors=VERBOSE_ERRORS,
     )
     print(f"reading phase file: {args.phase_file}", flush=True)
-    samples, phase_counts = sac.read_training_phase(args.phase_file)
+    samples, phase_counts = ceed.read_training_phase(args.phase_file)
     print(f"phase rows loaded: {len(samples):,}", flush=True)
-    roots = sac.ceed_h5_roots(args)
+    roots = ceed.ceed_h5_roots(args)
     print("CEED HDF5 roots: " + ", ".join(str(root) for root in roots), flush=True)
-    resolved, resolve_counts = sac.resolve_samples(samples, roots, args.event_time_tolerance_sec)
+    resolved, resolve_counts = ceed.resolve_samples(samples, roots, args.event_time_tolerance_sec)
     print(f"resolved phase rows: {len(resolved):,}", flush=True)
     process_counts, train_rows, valid_rows = process_samples(resolved, args)
     save_shard_indexes(args.out_root, train_rows, valid_rows)
