@@ -19,7 +19,7 @@ OVERWRITE_PICKS = False  # False resumes complete days and reruns incomplete day
 CONFIG_AI_PAL = Path("config_ai_pal_%s.py" % CASE_CODE)
 CKPT_ROOT = Path("output/%s_ckpt" % CASE_CODE)
 PICK_ROOT = Path("output/%s" % CASE_CODE)
-ENSEMBLE_PICK_DIR = PICK_ROOT / "picks_ENSEMBLE"
+ENSEMBLE_PICK_DIR = PICK_ROOT / "1.2_picks_AI-PAL-ENSEMBLE"
 
 # ============================================================================
 # USER SETTINGS: AVAILABLE PICKERS, CHECKPOINTS, AND DEVICES
@@ -85,6 +85,17 @@ def case_path(path):
     return path if path.is_absolute() else RUN_DIR / path
 
 
+def migrate_legacy_directory(legacy, current):
+    legacy = case_path(legacy)
+    current = case_path(current)
+    if legacy.is_dir() and not current.exists():
+        current.parent.mkdir(parents=True, exist_ok=True)
+        legacy.replace(current)
+        print("migrated legacy local output: {} -> {}".format(
+            legacy, current
+        ))
+
+
 shutil.copyfile(case_path(CONFIG_AI_PAL), PAL_SRC / "config_ai_pal.py")
 for source_path in (AI_PAL_ROOT, PAL_SRC):
     if str(source_path) not in sys.path:
@@ -96,6 +107,9 @@ from offline_picker_runner import run_offline_picker_ensemble
 
 def main():
     workflow_cfg = cfg.Config()
+    migrate_legacy_directory(
+        PICK_ROOT / "picks_ENSEMBLE", ENSEMBLE_PICK_DIR
+    )
     selected_pos_neg = list(dict.fromkeys(
         workflow_cfg.picker_pos_neg_group
     ))

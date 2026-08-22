@@ -10,7 +10,6 @@ import sys
 # ============================================================================
 AI_PAL_ROOT = Path("~/software/AI-PAL").expanduser()  # Installed source package.
 CASE_CODE = "eg"  # Packaged example; drives the workflow config, picks, and phase paths.
-PICK_NAME = "ENSEMBLE"
 # May be None when SUBNET_STATION_FILES is not empty.
 FULL_STATION_FILE = Path("input/example_pal_format1.sta")
 # Leave empty for full-network association. Otherwise only these subnets are
@@ -21,6 +20,8 @@ SUBNET_STATION_FILES = [
 ]
 PICK_ROOT = Path("output/%s" % CASE_CODE)
 OUT_ROOT = Path("output/%s" % CASE_CODE)
+ENSEMBLE_PICK_DIR = PICK_ROOT / "1.2_picks_AI-PAL-ENSEMBLE"
+INITIAL_PHASE_ROOT = OUT_ROOT / "2.1.0_phase_init_AI-PAL"
 TIME_RANGE = "20190704-20190707"  # Exclusive end date.
 # The shared workflow config is derived from CASE_CODE.
 CONFIG_AI_PAL = Path("config_ai_pal_%s.py" % CASE_CODE)
@@ -43,6 +44,17 @@ def case_path(path):
     return path if path.is_absolute() else RUN_DIR / path
 
 
+def migrate_legacy_directory(legacy, current):
+    legacy = case_path(legacy)
+    current = case_path(current)
+    if legacy.is_dir() and not current.exists():
+        current.parent.mkdir(parents=True, exist_ok=True)
+        legacy.replace(current)
+        print("migrated legacy local output: {} -> {}".format(
+            legacy, current
+        ))
+
+
 shutil.copyfile(case_path(CONFIG_AI_PAL), PAL_SRC / "config_ai_pal.py")
 sys.path.insert(0, str(PAL_SRC))
 
@@ -53,6 +65,12 @@ from station_sets import association_station_file_mapping
 
 def main():
     workflow_cfg = cfg.Config()
+    migrate_legacy_directory(
+        PICK_ROOT / "picks_ENSEMBLE", ENSEMBLE_PICK_DIR
+    )
+    migrate_legacy_directory(
+        OUT_ROOT / "phase_ENSEMBLE_PAL", INITIAL_PHASE_ROOT
+    )
     full_station_file = (
         case_path(FULL_STATION_FILE)
         if FULL_STATION_FILE is not None else None
@@ -68,8 +86,8 @@ def main():
         name: str(path) for name, path in association_station_files.items()
     }))
 
-    pick_dir = case_path(PICK_ROOT) / "picks_{}".format(PICK_NAME)
-    out_root = case_path(OUT_ROOT) / "phase_{}_PAL".format(PICK_NAME)
+    pick_dir = case_path(ENSEMBLE_PICK_DIR)
+    out_root = case_path(INITIAL_PHASE_ROOT)
     out_root.mkdir(parents=True, exist_ok=True)
     run_buffered_association(
         subnet_station_files=association_station_files,

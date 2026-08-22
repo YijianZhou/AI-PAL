@@ -495,10 +495,28 @@ def run_offline_picker_ensemble(
         context = tempfile.TemporaryDirectory(prefix="ai-pal-picker-branches-")
 
     with context as individual_root:
-        pick_dirs = {
-            name: Path(individual_root) / "picks_{}".format(name)
-            for name in pickers
-        }
+        pick_dirs = {}
+        for index, name in enumerate(pickers, start=1):
+            spec = picker_specs[name]
+            group_name = spec.get("group", "POS_NEG").lower()
+            model_name = spec.get("model", name)
+            indexed_name = "1.1.{}_picks_{}_{}".format(
+                index, group_name, model_name
+            )
+            indexed_path = Path(individual_root) / indexed_name
+            legacy_path = Path(individual_root) / "picks_{}".format(name)
+            if (
+                cfg.save_individual_picker_outputs
+                and legacy_path.is_dir()
+                and not indexed_path.exists()
+            ):
+                legacy_path.replace(indexed_path)
+                print(
+                    "migrated legacy local picker directory: {} -> {}"
+                    .format(legacy_path, indexed_path),
+                    flush=True,
+                )
+            pick_dirs[name] = indexed_path
         for path in pick_dirs.values():
             path.mkdir(parents=True, exist_ok=True)
         group_root = Path(individual_root) / ".picker_group_consensus"

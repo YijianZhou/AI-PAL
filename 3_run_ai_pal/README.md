@@ -57,7 +57,7 @@ and `repicker_pos_group`, in `run_ai_pal_local/config_ai_pal_<case>.py`.
 Local workflows do not run a reference-picker branch. Continuous models must
 be subsets of their corresponding repicker groups; loaded objects are reused
 during postprocessing. Set either continuous group list to `[]` to disable it;
-the other non-empty group then supplies `picks_ENSEMBLE` by itself. POS is
+the other non-empty group then supplies `1.2_picks_AI-PAL-ENSEMBLE` by itself. POS is
 disabled for continuous picking by default but remains enabled for repicking.
 The launchers keep `PICKERS_POS_NEG` and `PICKERS_POS` as
 path/device registries. Pos+neg checkpoints use the latest `.ckpt` in each
@@ -96,10 +96,26 @@ After all models finish, daily picks are clustered inside POS_NEG and POS using
 `picker_pos_neg_group_min_picker_support` and
 `picker_pos_group_min_picker_support`. Accepted group products are then merged
 with equal group weight. The canonical result is
-written to `output/<CASE_CODE>/picks_ENSEMBLE/`. Set
+written to `output/<CASE_CODE>/1.2_picks_AI-PAL-ENSEMBLE/`. Set
 `save_individual_picker_outputs = False` to use temporary model branches and
-retain only the ensemble; `True` preserves POS_NEG `picks_<MODEL>/` and
-positive-only `picks_POS-<MODEL>/` branches as well.
+retain only the ensemble; `True` preserves indexed individual branches such as
+`1.1.1_picks_pos_neg_SAR/` and `1.1.2_picks_pos_PHN/` as well.
+
+Local output uses the preferred-branch subset of the realtime numbering:
+
+```text
+output/<CASE_CODE>/
+|-- 1.1.<N>_picks_pos_neg_<MODEL>/   optional individual POS_NEG picks
+|-- 1.1.<N>_picks_pos_<MODEL>/       optional individual POS picks
+|-- 1.2_picks_AI-PAL-ENSEMBLE/       canonical preferred picks
+|-- 2.1.0_phase_init_AI-PAL/         initial PAL association products
+`-- 3.1_phase_final_AI-PAL/          finalized postprocessed products
+```
+
+Local workflows do not create `1.3`, `2.2`, or `3.2` because those indexes are
+reserved for independent reference branches. On first use, legacy local output
+directories are renamed to their indexed equivalents when the destination does
+not already exist, preserving daily resume checks.
 
 Pick rows preserve the original first six fields and append uncertainty and
 provenance:
@@ -137,7 +153,7 @@ repicking is enabled, but continuous-picker inference is skipped. Set
 `OVERWRITE_PICKS = True` after changing checkpoints or picker settings.
 
 Run `run_ai_pal_local/2.2_run_pal_assoc_eg.py` after picking. It associates only
-the canonical `picks_ENSEMBLE` branch. The final station rows in the phase file
+the canonical `1.2_picks_AI-PAL-ENSEMBLE` branch. The final station rows in the phase file
 retain probabilities, all four ensemble standard deviations, picker support
 count, picker names, and per-picker sliding-window cluster sizes.
 
@@ -173,9 +189,9 @@ for different hours concurrently. Optional dual-group repicking/reassociation
 is serialized through the loaded event-model ensembles. The combined
 workflow writes halo-day pick files because they provide boundary context, but
 its final catalog and phase files include only dates in `TIME_RANGE`. Raw subnet
-results and status files are written below `phase_ENSEMBLE_PAL/hourly_assoc`.
+results and status files are written below `2.1.0_phase_init_AI-PAL/hourly_assoc`.
 Hourly origin-time-owned phase, catalog, and event-group files are written to
-`phase_ENSEMBLE_PAL_final`; daily and range-level concatenations are also kept
+`3.1_phase_final_AI-PAL`; daily and range-level concatenations are also kept
 there.
 
 Set `enable_post_process = True` to run event-based postprocessing after each
@@ -263,7 +279,7 @@ additional event products before retained waveform arrays are released.
 `2.1_run_ai_pal_pick_eg.py` uses one `FULL_STATION_FILE` containing every station to
 pick. It reads the configured adjacent-day waveform buffer but writes only P/S
 pairs whose P arrival belongs to the target UTC date. Its canonical output is
-`output/<CASE_CODE>/picks_ENSEMBLE`, matching the one-click workflow.
+`output/<CASE_CODE>/1.2_picks_AI-PAL-ENSEMBLE`, matching the one-click workflow.
 
 In `2.2_run_pal_assoc_eg.py`, leave `SUBNET_STATION_FILES` empty to
 associate that complete list once with the `full` parameters. Optional subnet
@@ -271,7 +287,7 @@ files map in order to the configured keys after `default` and `full` (`r1`,
 `r2`, ...), run independently, and are merged afterward.
 
 `2.3_run_ai_pal_repick_reassoc_eg.py` reads the daily initial detections from
-`phase_ENSEMBLE_PAL/daily_assoc/merged`. It performs the same dual repicker-group
+`2.1.0_phase_init_AI-PAL/daily_assoc/merged`. It performs the same dual repicker-group
 consensus, full-network PAL reassociation, candidate retention, and duplicate
 merge as the one-click local workflow. Raw data are read with ObsPy time bounds
 only for event-selected stations. When a requested span crosses midnight, the
@@ -289,7 +305,7 @@ The launcher reports range-wide initial-event progress every 1,000 completed
 events, including elapsed time, throughput, ETA, and `num_done/num_all`.
 
 The staged postprocessor writes only one final phase file per UTC day below
-`phase_ENSEMBLE_PAL_final`; it does not retain hourly, catalog, or range-level
+`3.1_phase_final_AI-PAL`; it does not retain hourly, catalog, or range-level
 phase products. Set `enable_event_waveform_plot` to publish
 final reassociated event plots in `event_waveform`. Set
 `save_filtered_event_waveforms` independently to write one directory per final

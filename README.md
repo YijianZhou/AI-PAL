@@ -164,7 +164,8 @@ label formats, resumable Zarr creation, and training commands.
 ### 4.3 Run AI-PAL
 
 Use `3_run_ai_pal/` for continuous waveform inference. The preferred picker
-groups produce a canonical `picks_ENSEMBLE` branch that PAL associates. The
+groups produce a canonical `1.2_picks_AI-PAL-ENSEMBLE` branch that PAL
+associates. The
 workflow can then repick detected events with POS_NEG and positive-only model
 groups, reassociate reliable phase pairs, supplement compatible single-group
 picks, and merge duplicate detections.
@@ -275,8 +276,10 @@ checkpoint and config versions together when publishing or deploying a model.
 
 ## 7. Outputs And Quality Control
 
-The realtime workflow separates preferred, reference, initial, postprocessed,
-and externally finalized products. Its principal branches are:
+Local and realtime workflows share the same indexed output vocabulary. Local
+uses the preferred-branch subset; realtime additionally separates reference,
+postprocessed source-segment, monitoring, and externally finalized products.
+The principal indexes are:
 
 ```text
 1.1.*_picks_*/                 individual preferred picker outputs
@@ -289,6 +292,9 @@ and externally finalized products. Its principal branches are:
 3.2.*_phase_final_ref_*/       finalized reference phases
 monitoring/                    timing, memory, heartbeat, and health products
 ```
+
+Local workflows create `1.1.*`, `1.2`, `2.1.0`, and `3.1`. Realtime also
+creates `2.1` plus the `1.3.*`, `2.2.*`, and `3.2.*` reference branches.
 
 Detailed row schemas and restart-completion rules are documented in
 [3_run_ai_pal/README.md](3_run_ai_pal/README.md).

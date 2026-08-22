@@ -25,10 +25,10 @@ CONFIG_AI_PAL = Path("config_ai_pal_%s.py" % CASE_CODE)
 
 CKPT_ROOT = Path("output/%s_ckpt" % CASE_CODE)
 RESULT_ROOT = Path("output/%s" % CASE_CODE)
-ENSEMBLE_PICK_DIR = RESULT_ROOT / "picks_ENSEMBLE"
-PHASE_ROOT = RESULT_ROOT / "phase_ENSEMBLE_PAL"
+ENSEMBLE_PICK_DIR = RESULT_ROOT / "1.2_picks_AI-PAL-ENSEMBLE"
+PHASE_ROOT = RESULT_ROOT / "2.1.0_phase_init_AI-PAL"
 ASSOC_ROOT = PHASE_ROOT / "hourly_assoc"
-FINAL_ROOT = RESULT_ROOT / "phase_ENSEMBLE_PAL_final"
+FINAL_ROOT = RESULT_ROOT / "3.1_phase_final_AI-PAL"
 OUTPUT_CATALOG = FINAL_ROOT / ("catalog_%s.dat" % TIME_RANGE)
 OUTPUT_PHASE = FINAL_ROOT / ("phase_%s.dat" % TIME_RANGE)
 
@@ -116,6 +116,17 @@ def latest_checkpoint(directory):
     return max(checkpoints, key=lambda path: (path.stat().st_mtime, path.name))
 
 
+def migrate_legacy_directory(legacy, current):
+    legacy = case_path(legacy)
+    current = case_path(current)
+    if legacy.is_dir() and not current.exists():
+        current.parent.mkdir(parents=True, exist_ok=True)
+        legacy.replace(current)
+        print("migrated legacy local output: {} -> {}".format(
+            legacy, current
+        ))
+
+
 shutil.copyfile(case_path(CONFIG_AI_PAL), PAL_SRC / "config_ai_pal.py")
 for source_path in (AI_PAL_ROOT, PAL_SRC):
     if str(source_path) not in sys.path:
@@ -128,6 +139,15 @@ from station_sets import association_station_file_mapping, build_station_union
 
 def main():
     workflow_cfg = cfg.Config()
+    migrate_legacy_directory(
+        RESULT_ROOT / "picks_ENSEMBLE", ENSEMBLE_PICK_DIR
+    )
+    migrate_legacy_directory(
+        RESULT_ROOT / "phase_ENSEMBLE_PAL", PHASE_ROOT
+    )
+    migrate_legacy_directory(
+        RESULT_ROOT / "phase_ENSEMBLE_PAL_final", FINAL_ROOT
+    )
     subnet_station_files = [case_path(path) for path in SUBNET_STATION_FILES]
     if FULL_STATION_FILE is None:
         full_station_file = build_station_union(

@@ -22,9 +22,9 @@ CONFIG_AI_PAL = Path("config_ai_pal_%s.py" % CASE_CODE)
 
 RESULT_ROOT = Path("output/%s" % CASE_CODE)
 INITIAL_PHASE_DIR = (
-    RESULT_ROOT / "phase_ENSEMBLE_PAL" / "daily_assoc" / "merged"
+    RESULT_ROOT / "2.1.0_phase_init_AI-PAL" / "daily_assoc" / "merged"
 )
-FINAL_ROOT = RESULT_ROOT / "phase_ENSEMBLE_PAL_final"
+FINAL_ROOT = RESULT_ROOT / "3.1_phase_final_AI-PAL"
 
 
 # ============================================================================
@@ -95,6 +95,17 @@ def latest_checkpoint(directory):
     return max(checkpoints, key=lambda path: (path.stat().st_mtime, path.name))
 
 
+def migrate_legacy_directory(legacy, current):
+    legacy = case_path(legacy)
+    current = case_path(current)
+    if legacy.is_dir() and not current.exists():
+        current.parent.mkdir(parents=True, exist_ok=True)
+        legacy.replace(current)
+        print("migrated legacy local output: {} -> {}".format(
+            legacy, current
+        ))
+
+
 shutil.copyfile(case_path(CONFIG_AI_PAL), PAL_SRC / "config_ai_pal.py")
 for source_path in (AI_PAL_ROOT, PAL_SRC):
     if str(source_path) not in sys.path:
@@ -106,6 +117,13 @@ from offline_event_postprocessor import run_offline_event_postprocessing
 
 def main():
     workflow_cfg = cfg.Config()
+    migrate_legacy_directory(
+        RESULT_ROOT / "phase_ENSEMBLE_PAL",
+        RESULT_ROOT / "2.1.0_phase_init_AI-PAL",
+    )
+    migrate_legacy_directory(
+        RESULT_ROOT / "phase_ENSEMBLE_PAL_final", FINAL_ROOT
+    )
     selected_pos_neg = list(dict.fromkeys(
         workflow_cfg.repicker_pos_neg_group
     ))
