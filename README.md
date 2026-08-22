@@ -16,22 +16,56 @@ training and continuous-data processing, followed by final event location.
 
 ## 1. Overview
 
-The complete workflow is:
+AI-PAL provides three execution workflows around one shared scientific chain:
 
 ```mermaid
-flowchart LR
-    A[Continuous waveform data] --> B[Shared preprocessing]
-    B --> C[AI phase pickers]
-    C --> D[Picker ensemble]
-    D --> E[PAL association]
-    E --> F[Subnet event merge]
-    F --> G[Repicking and reassociation]
-    G --> H[Final event location]
-    H --> I[Catalog and phase products]
+flowchart TB
+    A[Continuous waveforms and station metadata]
+
+    subgraph W[Execution workflows]
+        L[Local workstation<br/>PAL, training, and offline AI-PAL]
+        C[AWS jobs<br/>PAL and model training]
+        R[Realtime service<br/>Persistent AI-PAL inference]
+    end
+
+    A --> L
+    A --> C
+    A --> R
+
+    L -.-> P[1. Rule-based PAL labels<br/>and association rates]
+    C -.-> P
+    P -.-> T[2. Locally adapted AI picker training]
+    T --> D[Trained picker models]
+    Q[Packaged or external<br/>pre-trained models] --> D
+
+    L --> I[3. Initial detection<br/>Multi-picker ensemble and PAL association]
+    R --> I
+    D --> I
+
+    R -.-> X[Optional reference-picker branches]
+    I -.-> O[Optional postprocessing<br/>Repicking and reassociation]
+    I --> F[Final preferred phase detections]
+    O --> F
+    X --> Y[Reference phase detections]
+
+    F --> H[4. Final event location<br/>Retained Hypoinverse and HypoDD implementation]
+    H --> Z[Located catalog and phase products]
+
+    classDef optional stroke-dasharray: 6 4,fill:#f7f7f7;
+    classDef retained fill:#fff4cc,stroke:#8a6d1d;
+    class P,T,X,O optional;
+    class H retained;
 ```
 
-PAL can also run independently to generate self-supervised phase labels and
-association-rate inputs for training AI pickers.
+Dashed boxes are optional for a particular run. PAL label generation and local
+training may be skipped when suitable pre-trained models already exist, but
+they remain the central mechanism for adapting AI-PAL to a new region.
+Postprocessing and independent reference-picker branches are also configurable.
+
+Final event location is not optional for a completed AI-PAL catalog. Version
+7.x retains the existing `4_location/` Hypoinverse and HypoDD packages. This
+module is expected to receive implementation and interface updates in a future
+release, without changing its established theoretical basis.
 
 ## 2. Repository Structure
 
