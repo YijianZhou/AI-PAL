@@ -38,6 +38,31 @@ training workflows.
 
 The packaged training workflows default to `CASE_CODE = "eg"`, where `eg` means "example".
 
+## Workflow Overview
+
+```mermaid
+flowchart LR
+    A[PAL phase file] --> B[Phase rarity analysis]
+    B --> C[Phase-aware augmentation labels]
+    A --> C
+    D[PAL association-rate file] --> E[Positive and negative sample cutting]
+    C --> E
+    W[Continuous waveforms] --> E
+    E --> F[Shared NPY sample inventory]
+    F --> G[Shared waveform Zarr]
+    F --> H1[Frame targets for SAR and FT]
+    F --> H2[Sample targets for PHN and RUN]
+    G --> I1[Train SAR or FT]
+    H1 --> I1
+    G --> I2[Train PHN or RUN]
+    H2 --> I2
+    I1 --> J[Model config and checkpoint]
+    I2 --> J
+```
+
+Rarity-aware augmentation is the default positive-sample path; the original
+phase file can bypass that analysis when fixed augmentation is required.
+
 ## Local Training
 
 Run from `train_picker_local/` after editing shared paths, `ENABLED_MODELS`, and

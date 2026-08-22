@@ -14,6 +14,25 @@ SageMaker paths and job controls. Optional legacy PAL location examples are unde
 
 The packaged launchers default to `CASE_CODE = "eg"`, where `eg` means "example".
 
+## Workflow Overview
+
+```mermaid
+flowchart LR
+    A[Continuous waveforms] --> B[PAL waveform preparation]
+    S[Station metadata and gains] --> B
+    B --> C[Rule-based P and S picking]
+    C --> D[Daily PAL pick files]
+    C --> E[Station-date association rates]
+    D --> F[Full-network or subnet PAL association]
+    F --> G[Merge subnet detections]
+    G --> H[PAL phase labels]
+    H --> I[AI picker training inputs]
+    E --> I
+```
+
+The one-click and separated launchers execute the same scientific stages. The
+remaining sections describe waveform boundaries, configuration, and execution.
+
 ## Waveform Edges
 
 Local and AWS PAL picking read `data_buffer_sec` (default 60 s) from the

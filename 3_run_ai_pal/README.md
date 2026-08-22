@@ -12,6 +12,36 @@ Fixed positive-event and negative-event experiments belong to
 The packaged inference workflows default to `CASE_CODE = "eg"`, where `eg` means "example".
 Copied case launchers also expose `AI_PAL_ROOT`, defaulting to `~/software/AI-PAL`; set it to the installed package without moving source modules into the case workspace.
 
+## Workflow Overview
+
+```mermaid
+flowchart LR
+    A[Continuous waveforms] --> B[Shared waveform preparation]
+    B --> C1[POS_NEG continuous pickers]
+    B --> C2[Optional POS continuous pickers]
+    C1 --> D[Group consensus and preferred ensemble]
+    C2 --> D
+    D --> E[PAL association by full network or subnet]
+    E --> F[Subnet merge and initial detections]
+    F --> G[POS_NEG and POS event repicking]
+    G --> H[Both-group anchor phase pairs]
+    H --> I[Full-network PAL reassociation]
+    G --> J[Single-group candidate pairs]
+    I --> K[Updated origin and location]
+    J --> L[Residual-matched supplementation]
+    K --> L
+    L --> M[Duplicate merge and time ownership]
+    M --> N[Final AI-PAL phases]
+    B --> R[Realtime reference picker]
+    R --> S[Independent reference PAL association]
+    S --> T[Final reference phases]
+```
+
+The local one-click launcher executes the preferred path in one process. The
+`2.1`, `2.2`, and `2.3` launchers split it into picking, initial association,
+and postprocessing. Realtime adds persistent backfill, polling, corrected
+origin-time ownership, monitoring, and optional independent reference branches.
+
 ## Local Workflow
 
 Each inference launcher defines one `CASE_CODE`. Shared/model config paths,
