@@ -1,4 +1,4 @@
-"""NPY shard reader/writer helpers for SAR zarr generation."""
+"""SAR waveform preprocessing, NPY sharding, and Zarr dataset helpers."""
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -19,6 +19,61 @@ num_steps = getattr(cfg, "rnn_num_steps", 0)
 win_len = int(cfg.win_len * samp_rate)
 step_len = int(getattr(cfg, "rnn_step_len", cfg.p_context_sec) * samp_rate)
 step_stride = int(getattr(cfg, "rnn_step_stride", cfg.p_context_sec) * samp_rate)
+
+
+def preprocess(stream, sample_rate, freq_band, max_gap=5.0):
+    start_time = max(trace.stats.starttime for trace in stream)
+    end_time = min(trace.stats.endtime for trace in stream)
+    if start_time >= end_time:
+        print("bad data!")
+        return []
+    st = stream.slice(start_time, end_time)
+    for trace in st:
+        trace.data[np.isnan(trace.data)] = 0
+        trace.data[np.isinf(trace.data)] = 0
+    max_gap_npts = int(max_gap * sample_rate)
+    for trace in st:
+        npts = len(trace.data)
+        data_diff = np.diff(trace.data)
+        gap_idx = np.where(data_diff == 0)[0]
+        gap_list = np.split(gap_idx, np.where(np.diff(gap_idx) != 1)[0] + 1)
+        gap_list = [gap for gap in gap_list if len(gap) >= 3]
+        for index, gap in enumerate(gap_list):
+            idx0 = max(0, gap[0] - 1)
+            idx1 = min(npts - 1, gap[-1] + 1)
+            if index < len(gap_list) - 1:
+                idx2 = min(
+                    idx1 + (idx1 - idx0),
+                    idx1 + max_gap_npts,
+                    gap_list[index + 1][0],
+                )
+            else:
+                idx2 = min(idx1 + (idx1 - idx0), idx1 + max_gap_npts, npts - 1)
+            if idx1 == idx2:
+                continue
+            if idx2 == idx1 + (idx1 - idx0):
+                trace.data[idx0:idx1] = trace.data[idx1:idx2]
+            else:
+                num_tile = int(np.ceil((idx1 - idx0) / (idx2 - idx1)))
+                trace.data[idx0:idx1] = np.tile(
+                    trace.data[idx1:idx2], num_tile
+                )[:idx1 - idx0]
+    st = st.detrend("demean").detrend("linear").taper(
+        max_percentage=0.05, max_length=5.0
+    )
+    if st[0].stats.sampling_rate != sample_rate:
+        st.resample(sample_rate)
+    freq_min, freq_max = freq_band
+    if freq_min and freq_max:
+        return st.filter("bandpass", freqmin=freq_min, freqmax=freq_max)
+    if freq_min:
+        return st.filter("highpass", freq=freq_min)
+    if freq_max:
+        return st.filter("lowpass", freq=freq_max)
+    print("filter type not supported!")
+    return []
+
+
 
 def stream_to_sample(stream, tp_rel=-1.0, ts_rel=-1.0, win_npts=None):
     if win_npts is None:

@@ -5,8 +5,8 @@ import numpy as np
 import torch.multiprocessing as mp
 from torch.utils.data import Dataset, DataLoader
 from obspy import UTCDateTime
-from signal_lib import preprocess, sac_ch_time
-from sample_npy import (
+from dataset_npy import (
+    preprocess,
     stream_to_sample, write_split_shards, save_shard_index,
     write_cut_progress,
 )
@@ -62,7 +62,6 @@ def cut_event_window(day_stream, t0, t1):
     if min(amax_sec) > win_len/2:
         return None
     st = st.detrend('demean').normalize(global_max=global_max_norm)
-    st = sac_ch_time(st)
     for tr in st:
         tr.data[np.isnan(tr.data)] = 0
         tr.data[np.isinf(tr.data)] = 0
