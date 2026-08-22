@@ -16,7 +16,7 @@ class Config(object):
     self.pca_win    = 1.             # win_len for PCA filter
     self.pca_range  = [0.,2.]        # time range to apply PCA filter
     self.fd_thres   = 2.5            # min value of dominant frequency
-    self.amp_ratio_thres = [5,8,3]   # max amp ratio for Peak, P/P_tail, & P/S
+    self.amp_ratio_thres = [6,10,3]  # max amp ratio for Peak, P/P_tail, & P/S
     self.amp_win    = [1.,5.]        # time win to get S amplitude
     self.det_gap    = 5.             # time gap between detections
     self.to_prep    = True           # whether to preprocess the raw data
@@ -24,16 +24,21 @@ class Config(object):
     self.data_buffer_sec = 60.0      # adjacent-day waveform halo
     self.taper_max_length_sec = 10.0 # taper cap and unusable edge
     self.normalize_to_three_channels = True  # cycle/truncate available channels into E/N/Z
-    self.picker_vp   = 6.0
+    self.picker_vp   = 5.9
     self.picker_vs   = 3.45
     # 2. associator params
     self.subnet_assoc_params = {
         "default": {
             "min_sta": 4, "ot_dev": 1.4, "max_res": 1.2, "max_drop": 1,
             "xy_margin": 0.1, "xy_grid": 0.02,
-            "z_grids": np.arange(2, 25, 3), "vp": 6.0,
+            "z_grids": np.arange(2, 25, 3), "vp": 5.9,
         },
         "full": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
+        "r1": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
+        "r2": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
+        "r3": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
+        "r4": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
+        "r5": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
     }
     self.merge_origin_time_tol_sec = 2.5
     self.merge_epicenter_tol_km = 5.0

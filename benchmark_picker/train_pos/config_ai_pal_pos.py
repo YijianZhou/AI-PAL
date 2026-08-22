@@ -41,6 +41,7 @@ class Config(object):
     self.data_buffer_sec = 60.0
     self.taper_max_length_sec = 10.0
     self.normalize_to_three_channels = True  # cycle/truncate available channels into E/N/Z
+    self.location_priority = ["10", "20", "01", "00", ""]
 
     # Cross-picker P/S-pair consensus. A value of 1 keeps picks detected by
     # any enabled picker; increase to 2+ for stricter ensemble agreement.
@@ -63,7 +64,7 @@ class Config(object):
     self.amp_win = [1, 6]
     self.rm_glitch = True
     self.win_peak = 1
-    self.amp_ratio_thres = [5, 9, 3]
+    self.amp_ratio_thres = [6, 10, 3]
 
     # PAL association parameters. The full station list is always required for
     # picking. With no optional subnet files, associate it under the "full" key.
@@ -80,6 +81,11 @@ class Config(object):
             "vp": 5.9,
         },
         "full": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
+        "r1": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
+        "r2": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
+        "r3": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
+        "r4": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
+        "r5": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
     }
 
     # P/S velocity ratio used to estimate station origin times from picks.
@@ -87,7 +93,7 @@ class Config(object):
     self.vs = 3.5
     # Halo around offline association intervals. This is not the rule-based
     # PAL picker S-arrival search window (`s_win`).
-    self.association_buffer_sec = 30.0
+    self.association_buffer_sec = 20.0
 
     # Cross-subnetwork duplicate-event merging defaults. These values are kept
     # for consistent configs but are not used when association receives only

@@ -16,7 +16,7 @@ class Config(object):
     self.pca_win    = 1.
     self.pca_range  = [0.,2.]
     self.fd_thres   = 2.5
-    self.amp_ratio_thres = [5,8,3]
+    self.amp_ratio_thres = [6,10,3]
     self.amp_win    = [1.,5.]
     self.det_gap    = 5.
     self.to_prep    = True

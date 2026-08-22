@@ -18,6 +18,7 @@ class Config(object):
     self.data_buffer_sec = 60.0
     self.taper_max_length_sec = 10.0
     self.normalize_to_three_channels = True
+    self.location_priority = ["10", "20", "01", "00", ""]
 
     # 2. Continuous picking and picker ensemble
     self.picker_pos_neg_group = ["SAR", "PHN"]
@@ -33,7 +34,7 @@ class Config(object):
     self.amp_win = [1, 6]
     self.rm_glitch = True
     self.win_peak = 1
-    self.amp_ratio_thres = [5, 8, 3]
+    self.amp_ratio_thres = [6, 10, 3]
 
     # 3. Initial PAL association and subnet merge
     self.vp = 5.9
@@ -52,6 +53,11 @@ class Config(object):
             "vp": 5.9,
         },
         "full": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
+        "r1": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
+        "r2": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
+        "r3": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
+        "r4": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
+        "r5": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
     }
     self.merge_origin_time_tol_sec = 2.5
     self.merge_epicenter_tol_km = 5.0
@@ -61,7 +67,7 @@ class Config(object):
     self.merge_time_format_digits = 6
 
     # 4. Post-processing: event repicking and PAL reassociation
-    self.enable_post_process = False
+    self.enable_post_process = True
     self.repicker_pos_neg_group = ["SAR", "FT", "PHN", "RUN"]
     self.repicker_pos_group = ["SAR", "FT", "PHN", "RUN"]
     self.repick_phase_buffer_sec = 2.0
@@ -72,8 +78,8 @@ class Config(object):
     self.repick_group_min_picker_support = 2
 
     # 5. Final event products
-    self.enable_event_waveform_plot = False
-    self.enable_event_waveform_plot_ref = []
+    self.enable_event_waveform_plot = True
+    self.enable_event_waveform_plot_ref = [0]
     self.save_filtered_event_waveforms = False
 
     # 6. Training-sample construction
