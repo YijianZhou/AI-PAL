@@ -21,7 +21,6 @@ benchmark_picker/
   evaluate_pos_picker_predictions.py
   evaluate_noise_false_detections.py
   plot_picker_benchmark.py
-  backup/                     historical, duplicate, and PhaseNO workflows
 ```
 
 ## 1. Dataset Preprocessing
@@ -75,16 +74,16 @@ Only CEED is used for positive-only training in this workflow.
 
 1. Generate the base CEED phase file with
    `python preprocess/extract_ceed_phase.py`.
-2. Run `python train_pos/analyze_ceed_phase_feature_rarity.py` to calculate FMD,
+2. Run `python train_pos/0_analyze_ceed_phase_feature_rarity.py` to calculate FMD,
    spatiotemporal seismicity rate, hypocentral distance, station-level
    train/validation assignment, and `num_aug`. It also writes the feature and
    rarity figures.
-3. Run `python train_pos/cut_ceed_train_npy.py` to preprocess the raw CEED HDF5
+3. Run `python train_pos/1_cut_ceed_train_npy.py` to preprocess the raw CEED HDF5
    waveforms and write augmented 25 s NPY training shards.
-4. Run `python train_pos/build_pos_zarr.py` to create one shared Zarr containing
+4. Run `python train_pos/2_build_pos_zarr.py` to create one shared Zarr containing
    `positive_data`, `positive_target_frame`, and `positive_target_sample` for
    train and validation splits.
-5. Run `python train_pos/train_pos_pickers.py` to train any enabled subset of
+5. Run `python train_pos/3_train_pos_pickers.py` to train any enabled subset of
    SAR, FT, PHN, and RUN sequentially.
 
 Training parameters live in:
@@ -97,11 +96,13 @@ train_pos/config_phn_pos.py
 train_pos/config_run_pos.py
 ```
 
-I/O paths remain in the executable scripts. `ceed_waveform.py` is an import-only
-HDF5/SAC processing library used by `cut_ceed_train_npy.py`.
+I/O paths remain in the executable scripts. `ceed_data_pipeline.py` is the
+import-only HDF5 reading and preprocessing helper used by
+`1_cut_ceed_train_npy.py`. The active workflow writes NPY shards directly and
+does not create an intermediate SAC dataset.
 
-`build_pos_zarr.py` stages the selected model config into the installed source
-package and invokes its converter with positive-only mode. `train_pos_pickers.py`
+`2_build_pos_zarr.py` stages the selected model config into the installed source
+package and invokes its converter with positive-only mode. `3_train_pos_pickers.py`
 does the same before training. These are training operations; benchmark
 inference never modifies installed configs.
 
@@ -178,9 +179,3 @@ output/picker_eval_comparison/<comparison-marker>/
 
 The combined figures include per-dataset P/S residual KDEs, the 2x4 positive
 metric panel, and cross-dataset noise-stability metrics.
-
-## Backup
-
-`backup/` preserves all superseded one-model launchers, named experiment
-wrappers, old preprocessing paths, and the complete PhaseNO workflow. Nothing in
-that directory is part of the maintained execution sequence.
