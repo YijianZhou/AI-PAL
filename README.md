@@ -1,9 +1,18 @@
 # AI-PAL
 
-AI-PAL combines AI phase pickers with rule-based PAL association for
-generalized earthquake detection in continuous seismic data. The package
-supports picker training, offline and realtime inference, event
-postprocessing, and final earthquake location.
+AI-PAL is a self-supervised earthquake detection framework built around one
+central idea: use the rule-based Phase picking, Association, and Location (PAL)
+algorithm to generate locally adapted phase labels and training samples from
+continuous seismic data, then train AI phase pickers for that region and
+associate their picks with PAL.
+
+Version 7.x is a major update from v6.x. It reorganizes the package into shared
+source, model, and executable-workflow layers; extends continuous inference to
+multi-picker ensembles; and adds event-level repicking and reassociation as a
+new postprocessing stage. The established initial detection sequence of AI
+phase picking followed by PAL association is retained. The reorganized package
+supports local workstation, AWS, and persistent realtime workflows for model
+training and continuous-data processing, followed by final event location.
 
 ## 1. Overview
 
