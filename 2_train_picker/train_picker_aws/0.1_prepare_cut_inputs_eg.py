@@ -69,23 +69,6 @@ def require_daily_keys(keys, expected_names, label):
     return [by_name[name] for name in expected_names]
 
 
-def require_daily_paths(root, expected_names, label):
-    by_name = {
-        path.name: path for path in root.glob("*.csv") if path.is_file()
-    }
-    missing = sorted(set(expected_names) - set(by_name))
-    if missing:
-        preview = ", ".join(missing[:10])
-        if len(missing) > 10:
-            preview += ", ..."
-        raise FileNotFoundError(
-            "{} is missing {} daily file(s): {}".format(
-                label, len(missing), preview
-            )
-        )
-    return [by_name[name] for name in expected_names]
-
-
 def concatenate_phase_files(s3, resolved_bucket, keys, output_path):
     partial = output_path.with_suffix(output_path.suffix + ".partial")
     with partial.open("wb") as output:
@@ -95,6 +78,12 @@ def concatenate_phase_files(s3, resolved_bucket, keys, output_path):
             output.write(payload)
             if payload and not payload.endswith(b"\n"):
                 output.write(b"\n")
+    partial.replace(output_path)
+
+
+def download_object(s3, resolved_bucket, key, output_path):
+    partial = output_path.with_suffix(output_path.suffix + ".partial")
+    s3.download_file(resolved_bucket, key, str(partial))
     partial.replace(output_path)
 
 
@@ -151,14 +140,6 @@ def concatenate_s3_association_rates(
     return write_association_rates(payloads(), output_path)
 
 
-def concatenate_local_association_rates(paths, output_path):
-    def payloads():
-        for path in paths:
-            yield path, path.read_text(encoding="utf-8-sig")
-
-    return write_association_rates(payloads(), output_path)
-
-
 def count_csv_rows(path):
     with path.open(newline="", encoding="utf-8") as fp:
         return sum(1 for _ in csv.DictReader(fp))
@@ -202,59 +183,71 @@ def main():
         rate_file = year_dir / (
             "%s_assoc_%d_association_rates.csv" % (CASE_CODE, year)
         )
-        legacy_rate_dir = year_dir / "association_rates"
         year_dir.mkdir(parents=True, exist_ok=True)
 
         if overwrite or not phase_file.exists():
             s3, resolved_bucket = get_s3()
-            assoc_prefix = (
+            result_root = (
                 results_prefix
-                + "/%s-assoc-%d/output/assoc" % (CASE_CODE, year)
+                + "/%s-assoc-%d/output/%s" % (CASE_CODE, year, CASE_CODE)
             )
-            phase_prefix = (
-                assoc_prefix + "/merged/phase_{}-".format(year)
-            )
-            phase_keys = require_daily_keys(
-                list_keys(s3, resolved_bucket, phase_prefix),
-                phase_names,
-                "{} merged phases".format(year),
-            )
-            concatenate_phase_files(
-                s3, resolved_bucket, phase_keys, phase_file
-            )
-
-        if overwrite or not rate_file.exists():
-            if legacy_rate_dir.is_dir():
-                rate_paths = require_daily_paths(
-                    legacy_rate_dir,
-                    rate_names,
-                    "{} local association rates".format(year),
+            range_code = "{}0101-{}0101".format(year, year + 1)
+            direct_phase_key = result_root + "/phase_{}.dat".format(range_code)
+            if direct_phase_key in list_keys(
+                s3, resolved_bucket, direct_phase_key
+            ):
+                download_object(
+                    s3, resolved_bucket, direct_phase_key, phase_file
                 )
-                num_rate_rows = concatenate_local_association_rates(
-                    rate_paths, rate_file
-                )
-                rate_source = "existing daily CSVs"
             else:
-                s3, resolved_bucket = get_s3()
-                assoc_prefix = (
+                legacy_root = (
                     results_prefix
                     + "/%s-assoc-%d/output/assoc" % (CASE_CODE, year)
                 )
-                rate_prefix = (
-                    assoc_prefix
-                    + "/association_rates/association_rate_{}-".format(
-                        year
-                    )
+                phase_prefixes = (
+                    result_root + "/association/merged/phase_{}-".format(year),
+                    legacy_root + "/merged/phase_{}-".format(year),
                 )
-                rate_keys = require_daily_keys(
-                    list_keys(s3, resolved_bucket, rate_prefix),
-                    rate_names,
-                    "{} association rates".format(year),
+                phase_keys = []
+                for phase_prefix in phase_prefixes:
+                    phase_keys = list_keys(s3, resolved_bucket, phase_prefix)
+                    if phase_keys:
+                        break
+                phase_keys = require_daily_keys(
+                    phase_keys, phase_names, "{} merged phases".format(year)
                 )
-                num_rate_rows = concatenate_s3_association_rates(
-                    s3, resolved_bucket, rate_keys, rate_file
+                concatenate_phase_files(
+                    s3, resolved_bucket, phase_keys, phase_file
                 )
-                rate_source = "S3 daily CSVs"
+
+        if overwrite or not rate_file.exists():
+            s3, resolved_bucket = get_s3()
+            result_root = (
+                results_prefix
+                + "/%s-assoc-%d/output/%s" % (CASE_CODE, year, CASE_CODE)
+            )
+            legacy_root = (
+                results_prefix
+                + "/%s-assoc-%d/output/assoc" % (CASE_CODE, year)
+            )
+            rate_prefixes = (
+                result_root
+                + "/association/association_rates/association_rate_{}-".format(year),
+                legacy_root
+                + "/association_rates/association_rate_{}-".format(year),
+            )
+            rate_keys = []
+            for rate_prefix in rate_prefixes:
+                rate_keys = list_keys(s3, resolved_bucket, rate_prefix)
+                if rate_keys:
+                    break
+            rate_keys = require_daily_keys(
+                rate_keys, rate_names, "{} association rates".format(year)
+            )
+            num_rate_rows = concatenate_s3_association_rates(
+                s3, resolved_bucket, rate_keys, rate_file
+            )
+            rate_source = "S3 daily CSVs"
         else:
             num_rate_rows = count_csv_rows(rate_file)
             rate_source = "existing annual CSV"

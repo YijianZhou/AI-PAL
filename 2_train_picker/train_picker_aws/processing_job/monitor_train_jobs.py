@@ -21,7 +21,11 @@ from job_common import (
 CASE_CODE = "eg"  # Must match the AWS training submission scripts.
 region = "us-west-2"
 bucket = None
-TRAINING_RUN = "%s-2020-2025-v1" % CASE_CODE
+training_years = (2020, 2021, 2022, 2023, 2024, 2025)
+RUN_VERSION = "v1"
+TRAINING_RUN = "%s-%d-%d-rarity-%s" % (
+    CASE_CODE, training_years[0], training_years[-1], RUN_VERSION
+)
 enabled_models = ("SAR", "FT", "PHN", "RUN")
 artifact_prefix = "sagemaker/ai-pal/training/" + TRAINING_RUN
 
@@ -62,10 +66,35 @@ def main():
         )
         if modified is not None:
             print("  latest S3:  {}".format(modified.isoformat()))
+        storage_key = output_prefix + "/training_storage_status.json"
+        try:
+            response = s3.get_object(Bucket=resolved_bucket, Key=storage_key)
+            storage = json.loads(response["Body"].read())
+            storage_stale = bool(
+                latest and response["LastModified"] < latest["CreationTime"]
+            )
+        except s3.exceptions.NoSuchKey:
+            storage = None
+            storage_stale = False
+        if storage:
+            if storage_stale:
+                print("  stage:      waiting for current job (prior-job status is stale)")
+            else:
+                print("  stage:      {} (checked {})".format(
+                    storage.get("stage", "unknown"),
+                    storage.get("checked_utc", "unknown"),
+                ))
+                print("  job disk:   {:.2f} / {:.2f} GiB used; {:.2f} GiB free".format(
+                    float(storage["filesystem_used_gib"]),
+                    float(storage["filesystem_total_gib"]),
+                    float(storage["filesystem_free_gib"]),
+                ))
         manifest_key = output_prefix + "/training_manifest.json"
         try:
-            body = s3.get_object(Bucket=resolved_bucket, Key=manifest_key)["Body"].read()
-            manifest = json.loads(body)
+            response = s3.get_object(Bucket=resolved_bucket, Key=manifest_key)
+            manifest = json.loads(response["Body"].read())
+            if latest and response["LastModified"] < latest["CreationTime"]:
+                manifest = None
         except s3.exceptions.NoSuchKey:
             manifest = None
         except Exception as exc:
@@ -75,6 +104,18 @@ def main():
             print("  train time: {:.1f}s".format(float(manifest["training_sec"])))
         else:
             print("  manifest:   not available; job may still be running")
+        failure_key = output_prefix + "/training_failure.txt"
+        try:
+            response = s3.get_object(Bucket=resolved_bucket, Key=failure_key)
+            failure = response["Body"].read().decode("utf-8", errors="replace")
+            if latest and response["LastModified"] < latest["CreationTime"]:
+                failure = None
+        except s3.exceptions.NoSuchKey:
+            failure = None
+        if failure:
+            print("  container traceback:")
+            for line in failure.rstrip().splitlines():
+                print("    " + line)
         print("  output:     s3://{}/{}/\n".format(resolved_bucket, output_prefix))
 
 

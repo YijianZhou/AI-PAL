@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Stage inputs and submit one yearly SCEDC NPY sample-cutting job."""
+"""Submit independent yearly SCEDC NPY sample-cutting jobs."""
 
 import csv
+import json
 import shutil
 import tempfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import boto3
+from botocore.exceptions import ClientError
 from sagemaker.core.helper.session_helper import Session, get_execution_role
 from sagemaker.core.image_uris import retrieve
 from sagemaker.core.processing import ScriptProcessor
@@ -39,24 +41,20 @@ local_config = workflow_dir / "config_ai_pal_{}.py".format(CASE_CODE)
 training_adapter = AI_PAL_ROOT / "PAL_src" / "data_pipeline_training_aws.py"
 station_file = "station_scedc_aws_selected_20200101_20260701_pal.csv"
 
-# Submit one year at a time. Change only this field for the next yearly job.
-training_year = 2020
-year_input_dir = workflow_dir / "input" / str(training_year)
-phase_file = year_input_dir / (
-    "%s_assoc_%d_pal_rarity.pha" % (CASE_CODE, training_year)
-)
-association_rate_file = year_input_dir / (
-    "%s_assoc_%d_association_rates.csv" % (CASE_CODE, training_year)
-)
+# Each year is processed by an independent job. By default all selected jobs
+# are submitted asynchronously, after which the SageMaker Space may be stopped.
+training_years = (2020, 2021, 2022, 2023, 2024, 2025)
 station_path = workflow_dir / "input" / station_file
 
 # Reusable annual NPY sample-library identity and output location. Keep this
 # unchanged for every year that may be combined into a later Zarr dataset.
 region = "us-west-2"
-SAMPLE_RUN = "%s-2020-2025-v1" % CASE_CODE
-job_code = "ai-pal-cut-{}-{}".format(SAMPLE_RUN, training_year)
+SAMPLE_RUN = "%s-2020-2025-rarity-v1" % CASE_CODE
 artifact_prefix = "sagemaker/ai-pal/training/" + SAMPLE_RUN
 overwrite_existing_output = False
+skip_completed_years = True
+skip_active_years = True
+wait_for_each_year = False
 
 # SCEDC waveform access
 scedc_bucket = "scedc-pds"
@@ -103,7 +101,19 @@ def processing_input(name, uri, local_path):
     )
 
 
-def validate_year_inputs():
+def annual_input_paths(training_year):
+    year_input_dir = workflow_dir / "input" / str(training_year)
+    return (
+        year_input_dir / (
+            "%s_assoc_%d_pal_rarity.pha" % (CASE_CODE, training_year)
+        ),
+        year_input_dir / (
+            "%s_assoc_%d_association_rates.csv" % (CASE_CODE, training_year)
+        ),
+    )
+
+
+def validate_year_inputs(training_year, phase_file, association_rate_file):
     required = (
         local_config,
         training_adapter,
@@ -151,19 +161,39 @@ def validate_year_inputs():
         )
 
 
-def main():
-    validate_year_inputs()
-    processing_dir = Path(__file__).resolve().parent / "processing_job"
-    entry = processing_dir / "processing_entry_cut_samples.py"
-    requirements = processing_dir / "requirements.txt"
-    for path in (entry, requirements):
-        if not path.exists():
-            raise FileNotFoundError(path)
+def object_exists(s3, bucket, key):
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in (
+            "404", "NoSuchKey", "NotFound"
+        ):
+            return False
+        raise
 
-    session = Session(boto_session=boto3.Session(region_name=region))
-    role = get_execution_role()
-    bucket = session.default_bucket()
-    s3 = boto3.client("s3", region_name=region)
+
+def active_processing_job(sagemaker, job_code):
+    response = sagemaker.list_processing_jobs(
+        NameContains=job_code,
+        SortBy="CreationTime",
+        SortOrder="Descending",
+        MaxResults=20,
+    )
+    prefix = job_code + "-"
+    for summary in response.get("ProcessingJobSummaries", []):
+        if not summary["ProcessingJobName"].startswith(prefix):
+            continue
+        if summary["ProcessingJobStatus"] in ("InProgress", "Stopping"):
+            return summary
+    return None
+
+
+def submit_year(
+    training_year, phase_file, association_rate_file,
+    entry, requirements, session, role, bucket, s3, sagemaker,
+):
+    job_code = "ai-pal-cut-{}-{}".format(SAMPLE_RUN, training_year)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     job_name = job_code + "-" + timestamp
     stage_root = artifact_prefix + "/jobs/" + job_name
@@ -172,12 +202,45 @@ def main():
     output_prefix = artifact_prefix + "/01_npy/{}".format(training_year)
     output_uri = "s3://{}/{}/".format(bucket, output_prefix)
 
+    active_job = active_processing_job(sagemaker, job_code)
+    if active_job and skip_active_years:
+        print("skipping {}: {} is {}".format(
+            training_year,
+            active_job["ProcessingJobName"],
+            active_job["ProcessingJobStatus"],
+        ), flush=True)
+        return "skipped"
+
     output_exists = prefix_has_objects(s3, bucket, output_prefix)
+    manifest_exists = object_exists(
+        s3, bucket, output_prefix + "/cut_samples_manifest.json"
+    )
+    if manifest_exists and skip_completed_years:
+        manifest = json.loads(s3.get_object(
+            Bucket=bucket,
+            Key=output_prefix + "/cut_samples_manifest.json",
+        )["Body"].read())
+        if int(manifest.get("training_year", -1)) != training_year:
+            raise ValueError("{} manifest records the wrong year".format(output_uri))
+        if manifest.get("sample_run") != SAMPLE_RUN:
+            raise ValueError("{} manifest records the wrong sample run".format(output_uri))
+        missing_indexes = sorted(
+            set(("train_pos.npy", "valid_pos.npy", "train_neg.npy", "valid_neg.npy"))
+            - set(manifest.get("indexes", {}))
+        )
+        if missing_indexes:
+            raise ValueError("{} manifest is missing indexes: {}".format(
+                output_uri, ", ".join(missing_indexes)
+            ))
+        print("skipping {}: completed annual manifest exists at {}".format(
+            training_year, output_uri
+        ), flush=True)
+        return "skipped"
     if output_exists and not overwrite_existing_output:
         raise FileExistsError(
-            "annual output already exists at {}; remove it or set "
-            "overwrite_existing_output=True to delete and replace it".format(
-                output_uri
+            "annual output for {} is incomplete or already exists at {}; "
+            "inspect it before setting overwrite_existing_output=True".format(
+                training_year, output_uri
             )
         )
     if output_exists:
@@ -254,35 +317,96 @@ def main():
             "OMP_DYNAMIC": "FALSE",
         },
     )
-    processor.run(
-        code=str(entry),
-        inputs=[
-            processing_input(
-                "source", source_uri, "/opt/ml/processing/source"
-            ),
-            processing_input(
-                "year-input", input_uri, "/opt/ml/processing/input"
-            ),
-        ],
-        outputs=[
-            ProcessingOutput(
-                output_name="npy-samples",
-                s3_output=ProcessingS3Output(
-                    s3_uri=output_uri,
-                    local_path="/opt/ml/processing/output/npy",
-                    s3_upload_mode="Continuous",
+    mode = "and waiting" if wait_for_each_year else "asynchronously"
+    print("submitting {} {}".format(training_year, mode), flush=True)
+    try:
+        processor.run(
+            code=str(entry),
+            inputs=[
+                processing_input(
+                    "source", source_uri, "/opt/ml/processing/source"
                 ),
-            )
-        ],
-        job_name=job_name,
-        wait=False,
-        logs=False,
-    )
-    print("submitted: " + job_name)
+                processing_input(
+                    "year-input", input_uri, "/opt/ml/processing/input"
+                ),
+            ],
+            outputs=[
+                ProcessingOutput(
+                    output_name="npy-samples",
+                    s3_output=ProcessingS3Output(
+                        s3_uri=output_uri,
+                        local_path="/opt/ml/processing/output/npy",
+                        s3_upload_mode="Continuous",
+                    ),
+                )
+            ],
+            job_name=job_name,
+            wait=wait_for_each_year,
+            logs=False,
+        )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ResourceLimitExceeded":
+            raise
+        delete_s3_prefix(s3, bucket, stage_root)
+        print(
+            "deferred {}: the Processing instance quota is currently full".format(
+                training_year
+            ),
+            flush=True,
+        )
+        return "quota_full"
+    state = "completed" if wait_for_each_year else "submitted"
+    print(state + ": " + job_name)
     print("year:      {}".format(training_year))
     print("waveforms: s3://{}/{}/".format(scedc_bucket, scedc_root_prefix))
     print("output:    " + output_uri)
     print("monitor:   python processing_job/monitor_cut_samples_job.py")
+    return state
+
+
+def main():
+    if not training_years:
+        raise ValueError("training_years must contain at least one year")
+    if len(set(training_years)) != len(training_years):
+        raise ValueError("training_years contains duplicates")
+    if tuple(sorted(training_years)) != tuple(training_years):
+        raise ValueError("training_years must be in chronological order")
+
+    processing_dir = Path(__file__).resolve().parent / "processing_job"
+    entry = processing_dir / "processing_entry_cut_samples.py"
+    requirements = processing_dir / "requirements.txt"
+    for path in (entry, requirements):
+        if not path.exists():
+            raise FileNotFoundError(path)
+
+    annual_inputs = {}
+    for training_year in training_years:
+        phase_file, association_rate_file = annual_input_paths(training_year)
+        validate_year_inputs(
+            training_year, phase_file, association_rate_file
+        )
+        annual_inputs[training_year] = (phase_file, association_rate_file)
+
+    session = Session(boto_session=boto3.Session(region_name=region))
+    role = get_execution_role()
+    bucket = session.default_bucket()
+    s3 = boto3.client("s3", region_name=region)
+    sagemaker = boto3.client("sagemaker", region_name=region)
+    print("annual cutting jobs: {}".format(
+        ", ".join(map(str, training_years))
+    ))
+    for year_index, training_year in enumerate(training_years):
+        phase_file, association_rate_file = annual_inputs[training_year]
+        result = submit_year(
+            training_year, phase_file, association_rate_file,
+            entry, requirements, session, role, bucket, s3, sagemaker,
+        )
+        if result == "quota_full":
+            print("not submitted: {}".format(
+                ", ".join(map(str, training_years[year_index:]))
+            ))
+            print("rerun this command after one active cutting job finishes")
+            break
 
 
 if __name__ == "__main__":

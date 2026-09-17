@@ -1,4 +1,5 @@
-"""Build one shared waveform Zarr with the target families required by enabled models."""
+"""Convert one integrated NPY sample inventory into one Zarr dataset."""
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -10,7 +11,8 @@ import sys
 AI_PAL_ROOT = Path("~/software/AI-PAL").expanduser()  # Installed source package.
 CASE_CODE = "eg"  # "eg" is the packaged example; use e.g. "sc" for SoCal.
 NPY_ROOT = Path("/data/bigdata/%s_train-samples_npy" % CASE_CODE)
-OUT_ZARR = Path("/data/bigdata/%s_train-samples.zarr" % CASE_CODE)
+ZARR_PATH = Path("/data/bigdata/%s_train-samples.zarr" % CASE_CODE)
+OVERWRITE_EXISTING_ZARR = False
 ENABLED_MODELS = ["SAR", "FT", "PHN", "RUN"]
 NUM_WORKERS = 10
 CHUNK_SIZE = 256
@@ -27,6 +29,11 @@ shutil.copyfile(
     "config_ai_pal_{}.py".format(CASE_CODE),
     AI_PAL_ROOT / "PAL_src" / "config_ai_pal.py",
 )
+subprocess_env = os.environ.copy()
+subprocess_env["PYTHONPATH"] = os.pathsep.join(filter(None, (
+    str(AI_PAL_ROOT / "PAL_src"),
+    subprocess_env.get("PYTHONPATH"),
+)))
 
 # SAR and FT use integer frame labels. PHN and RUN use Gaussian soft labels at
 # waveform-sample resolution. One representative converter writes each required
@@ -79,8 +86,17 @@ print("enabled model target mapping: {}".format(
 ), flush=True)
 print("selected target builders: {}".format(target_builders), flush=True)
 
-# Build frame targets first. Each selected converter writes positive and
-# negative targets; later converters reuse compatible waveform arrays.
+if not NPY_ROOT.exists():
+    raise FileNotFoundError(NPY_ROOT)
+if ZARR_PATH.exists():
+    if not OVERWRITE_EXISTING_ZARR:
+        raise FileExistsError(
+            "{} already exists; enable OVERWRITE_EXISTING_ZARR to rebuild it"
+            .format(ZARR_PATH)
+        )
+    shutil.rmtree(ZARR_PATH)
+ZARR_PATH.parent.mkdir(parents=True, exist_ok=True)
+
 for target_type in ("frame", "sample"):
     model_name = target_builders.get(target_type)
     if model_name is None:
@@ -89,10 +105,14 @@ for target_type in ("frame", "sample"):
     src_dir = model["src"]
     converter_path = src_dir / model["converter"]
     shutil.copyfile(model["config"], src_dir / "config.py")
+    shutil.copyfile(
+        "config_ai_pal_{}.py".format(CASE_CODE),
+        src_dir / "config_ai_pal.py",
+    )
     command = [
         sys.executable, str(converter_path),
         "--npy_root", str(NPY_ROOT),
-        "--out_path", str(OUT_ZARR),
+        "--out_path", str(ZARR_PATH),
         "--num_workers", str(NUM_WORKERS),
         "--chunk_size", str(CHUNK_SIZE),
         "--prefetch_factor", str(PREFETCH_FACTOR),
@@ -102,6 +122,6 @@ for target_type in ("frame", "sample"):
     if model_name != "SAR":
         command.extend(["--write_batch_size", str(WRITE_BATCH_SIZE)])
     print("building {} targets with {} in {}".format(
-        target_type, model_name, OUT_ZARR
+        target_type, model_name, ZARR_PATH
     ), flush=True)
-    subprocess.check_call(command)
+    subprocess.check_call(command, env=subprocess_env)
