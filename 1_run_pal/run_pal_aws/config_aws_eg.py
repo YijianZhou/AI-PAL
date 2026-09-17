@@ -15,13 +15,15 @@ class Config(object):
     self.s_win      = 10.
     self.pca_win    = 1.
     self.pca_range  = [0.,2.]
-    self.fd_thres   = 2.5
     self.amp_ratio_thres = [6,10,3]
     self.amp_win    = [1.,5.]
     self.det_gap    = 5.
-    self.to_prep    = True
+    self.to_prep    = True  # required for raw SCEDC objects
+    self.to_filter  = True  # apply freq_band before PAL picking
     self.freq_band  = [1,20]
-    self.data_buffer_sec = 60.0
+    self.data_buffer_sec = 60.0  # rolling unfiltered edge context
+    self.station_log_interval = 50
+    self.picker_verbose = False
     self.taper_max_length_sec = 10.0
     self.picker_vp   = 5.9
     self.picker_vs   = 3.45
@@ -30,7 +32,8 @@ class Config(object):
     self.subnet_assoc_params = {
         "default": {
             "min_sta": 4, "ot_dev": 1.4, "max_res": 1.2, "max_drop": 1,
-            "xy_margin": 0.1, "xy_grid": 0.02,
+            "xy_margin": 0.1, "lat_range": None, "lon_range": None,
+            "xy_grid": 0.02,
             "z_grids": np.arange(2, 25, 3), "vp": 5.9,
         },
         "full": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
@@ -42,7 +45,7 @@ class Config(object):
         "r6": {"min_sta": 4, "ot_dev": 1.4, "max_res": 1.2},
     }
 
-    # Duplicate-event merge params across subnetworks and buffered days.
+    # Duplicate-event merge params across subnetworks and, when enabled, days.
     self.merge_origin_time_tol_sec = 2.5
     self.merge_epicenter_tol_km = 5.0
     self.merge_depth_tol_km = 10.0

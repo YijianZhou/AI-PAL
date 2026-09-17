@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Processing-container entry point for one buffered PAL association job."""
+"""Processing-container entry point for one daily PAL association job."""
 
 import importlib
 import json
@@ -54,7 +54,27 @@ def main():
         raise FileNotFoundError(
             "no .pick files under {}".format(PICK_INPUT_DIR)
         )
-    print("linked {} daily pick files".format(num_pick_files), flush=True)
+    num_trigger_files = 0
+    for source in sorted(PICK_INPUT_DIR.rglob("*.trigger_counts.csv")):
+        target = pick_dir / source.name
+        if target.exists():
+            raise RuntimeError(
+                "duplicate trigger-count date from Processing inputs: {}"
+                .format(source.name)
+            )
+        target.symlink_to(source.resolve())
+        num_trigger_files += 1
+    if num_trigger_files != num_pick_files:
+        raise FileNotFoundError(
+            "found {} daily pick files but {} STA/LTA trigger inventories"
+            .format(num_pick_files, num_trigger_files)
+        )
+    print(
+        "linked {} daily pick files and trigger inventories".format(
+            num_pick_files
+        ),
+        flush=True,
+    )
 
     sys.path.insert(0, str(PAL_DIR))
     sys.path.insert(0, str(WORK_DIR))
@@ -73,12 +93,21 @@ def main():
             for name, value in runtime["subnet_station_files"].items()
         },
         pick_dir=pick_dir,
-        assoc_root=output_dir,
+        assoc_root=output_dir / "association",
         time_range=runtime["time_range"],
         num_workers=int(runtime["num_workers"]),
         config_factory=config_module.Config,
         overwrite=bool(runtime["overwrite"]),
         retry_failed_days=bool(runtime["retry_failed_days"]),
+        association_buffer_enabled=bool(
+            runtime.get("association_buffer_enabled", True)
+        ),
+        output_catalog=output_dir / "catalog_{}.dat".format(
+            runtime["time_range"]
+        ),
+        output_phase=output_dir / "phase_{}.dat".format(
+            runtime["time_range"]
+        ),
     )
 
 

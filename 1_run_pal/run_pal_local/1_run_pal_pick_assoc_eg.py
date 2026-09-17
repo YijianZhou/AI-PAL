@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run local rule-based PAL picking followed by buffered association."""
+"""Run local independent-day PAL picking followed by association."""
 
 import importlib
 import os
@@ -19,7 +19,7 @@ TIME_RANGE = "20190704-20190707"  # Exclusive end date.
 # ============================================================================
 # USER SETTINGS: EXECUTION
 # ============================================================================
-NUM_PICK_WORKERS = 3
+NUM_PICK_WORKERS = 3  # Concurrent stations within the current picking day.
 NUM_ASSOC_WORKERS = 3
 OVERWRITE_PICKS = False
 OVERWRITE_ASSOC = False
@@ -57,7 +57,7 @@ def main():
         num_workers=NUM_PICK_WORKERS,
         config_factory=cfg.Config,
         overwrite=OVERWRITE_PICKS,
-        include_association_halo=True,
+        include_association_halo=False,
     )
     run_buffered_association(
         subnet_station_files={"full": station_file},
@@ -68,6 +68,9 @@ def main():
         config_factory=cfg.Config,
         overwrite=OVERWRITE_ASSOC,
         retry_failed_days=RETRY_FAILED_ASSOC_DAYS,
+        association_buffer_enabled=False,
+        output_catalog=out_root / "catalog_{}.dat".format(TIME_RANGE),
+        output_phase=out_root / "phase_{}.dat".format(TIME_RANGE),
     )
 
 

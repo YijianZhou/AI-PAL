@@ -215,8 +215,11 @@ def main():
 
     for job in jobs:
         job_code = job["job_code"]
-        output_prefix = results_prefix + "/" + job_code + "/output/assoc"
-        status_prefix = output_prefix + "/assoc_status/"
+        output_prefix = (
+            results_prefix + "/" + job_code + "/output/" + CASE_CODE
+        )
+        association_prefix = output_prefix + "/association"
+        status_prefix = association_prefix + "/assoc_status/"
         expected = expected_dates(job["start"], job["end"])
         done_keys, failed_keys = {}, {}
         paginator = s3.get_paginator("list_objects_v2")
@@ -254,10 +257,10 @@ def main():
             if value not in reports and value not in failed_dates
         ]
         raw_done_objects, raw_failed_objects = status_objects(
-            s3, output_prefix + "/raw_status/"
+            s3, association_prefix + "/raw_status/"
         )
         merge_done_objects, merge_failed_objects = status_objects(
-            s3, output_prefix + "/merge_status/"
+            s3, association_prefix + "/merge_status/"
         )
         raw_done, raw_failed = len(raw_done_objects), len(raw_failed_objects)
         raw_reports = load_json_objects(s3, raw_done_objects)
@@ -300,7 +303,7 @@ def main():
             row["duplicates"] += int(report.get("num_duplicate_events_removed", 0))
 
         print("  monthly screening:")
-        print("    month    days  total picks  associated  assoc %   events  subnet events  duplicates")
+        print("    month    days  STA/LTA trig  associated  assoc %   events  subnet events  duplicates")
         totals = {key: 0 for key in (
             "days", "picks", "associated", "events", "subnet_events", "duplicates"
         )}
@@ -332,8 +335,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
 
 

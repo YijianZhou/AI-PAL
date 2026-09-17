@@ -30,7 +30,7 @@ station_file = "station_scedc_aws_selected_20200101_20260701_pal.csv"
 time_range = "20200101-20210101"  # Exclusive end date.
 study_year = 2020
 
-num_workers = 10
+num_workers = 16  # Concurrent stations within the current picking day.
 overwrite = False
 retry_failed_dates = False
 
@@ -50,7 +50,7 @@ resume_existing_output = True
 
 instance_type = "ml.c5.9xlarge"
 instance_count = 1
-threads_per_worker = 4
+threads_per_worker = 2
 volume_size_gb = 50
 max_runtime_seconds = 432000
 
@@ -71,6 +71,8 @@ pal_files = (
     "pick_runner.py",
     "run_pick_aws.py",
     "picker_pal.py",
+    "rolling_waveform.py",
+    "trigger_counts.py",
 )
 
 
@@ -124,7 +126,7 @@ def main():
         "case_code": CASE_CODE,
         "station_file": "input/" + station_file,
         "pick_dir": "output/%s/picks" % CASE_CODE,
-        "log_dir": "output/%s/logs" % CASE_CODE,
+        "log_dir": "output/%s/pick_logs" % CASE_CODE,
         "time_range": time_range,
         "num_workers": num_workers,
         "overwrite": overwrite,

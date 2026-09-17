@@ -40,6 +40,7 @@ study_year = 2020
 num_workers = 6
 overwrite = False
 retry_failed_days = True
+association_buffer_enabled = False
 
 # ============================================================================
 # USER SETTINGS: AWS RESOURCES, PICK INPUTS, AND RESUME BEHAVIOR
@@ -49,12 +50,7 @@ results_s3_prefix = "sagemaker/scsn-pal/results"
 resume_existing_output = True
 
 primary_pick_job_code = "%s-pick-%d" % (CASE_CODE, study_year)
-boundary_pick_objects = (
-    (
-        "%s-pick-%d" % (CASE_CODE, study_year + 1),
-        "%d-01-01.pick" % (study_year + 1),
-    ),
-)
+boundary_pick_objects = ()
 
 instance_type = "ml.t3.2xlarge"
 instance_count = 1
@@ -77,9 +73,11 @@ job_code = "%s-assoc-%d" % (CASE_CODE, study_year)
 pal_files = (
     "associator_pal.py",
     "association_runner.py",
+    "runtime_console.py",
     "data_pipeline_aws.py",
     "phase_merge.py",
     "pick_ensemble.py",
+    "trigger_counts.py",
 )
 
 
@@ -95,13 +93,13 @@ def dates_in_range(value):
     ]
 
 
-def s3_pick_filenames(s3, bucket, prefix):
+def s3_filenames(s3, bucket, prefix, suffix):
     filenames = set()
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for item in page.get("Contents", []):
             key = item["Key"]
-            if key.endswith(".pick"):
+            if key.endswith(suffix):
                 filenames.add(key.rsplit("/", 1)[-1])
     return filenames
 
@@ -150,8 +148,8 @@ def main():
     expected_pick_names = {
         "{}.pick".format(value) for value in dates_in_range(time_range)
     }
-    available_pick_names = s3_pick_filenames(
-        s3, bucket, primary_pick_prefix
+    available_pick_names = s3_filenames(
+        s3, bucket, primary_pick_prefix, ".pick"
     )
     missing = sorted(expected_pick_names - available_pick_names)
     if missing:
@@ -160,6 +158,25 @@ def main():
             preview += ", ..."
         raise FileNotFoundError(
             "{} target pick files are missing under s3://{}/{}: {}".format(
+                len(missing), bucket, primary_pick_prefix, preview
+            )
+        )
+    expected_trigger_names = {
+        "{}.trigger_counts.csv".format(value)
+        for value in dates_in_range(time_range)
+    }
+    available_trigger_names = s3_filenames(
+        s3, bucket, primary_pick_prefix, ".trigger_counts.csv"
+    )
+    missing = sorted(expected_trigger_names - available_trigger_names)
+    if missing:
+        preview = ", ".join(missing[:10])
+        if len(missing) > 10:
+            preview += ", ..."
+        raise FileNotFoundError(
+            "{} STA/LTA trigger inventories are missing under "
+            "s3://{}/{}: {}. Re-run picking with the current source."
+            .format(
                 len(missing), bucket, primary_pick_prefix, preview
             )
         )
@@ -182,7 +199,7 @@ def main():
     source_prefix = stage_root + "/source"
     work_prefix = stage_root + "/work"
     output_prefix = (
-        results_s3_prefix + "/" + job_code + "/output/assoc"
+        results_s3_prefix + "/" + job_code + "/output/" + CASE_CODE
     )
     output_uri = "s3://{}/{}/".format(bucket, output_prefix)
 
@@ -193,11 +210,12 @@ def main():
             for name, filename in subnet_station_files.items()
         },
         "pick_dir": "output/%s/picks" % CASE_CODE,
-        "out_root": "output/%s_assoc" % CASE_CODE,
+        "out_root": "output/%s" % CASE_CODE,
         "time_range": time_range,
         "num_workers": num_workers,
         "overwrite": overwrite,
         "retry_failed_days": retry_failed_days,
+        "association_buffer_enabled": association_buffer_enabled,
     }
 
     with tempfile.TemporaryDirectory(prefix="pal-assoc-") as temp_dir:
@@ -293,7 +311,7 @@ def main():
                 output_name="association",
                 s3_output=ProcessingS3Output(
                     s3_uri=output_uri,
-                    local_path="/opt/ml/processing/work/output/%s_assoc"
+                    local_path="/opt/ml/processing/work/output/%s"
                     % CASE_CODE,
                     s3_upload_mode="Continuous",
                 ),

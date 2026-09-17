@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run buffered daily PAL association for previously generated local picks."""
+"""Run independent-day PAL association for existing local picks."""
 
 import importlib
 import os
@@ -16,7 +16,7 @@ SUBNET_STATION_FILES = {
     "full": Path("input/example_pal_format1.sta"),
 }
 PICK_DIR = Path("output/%s/picks" % CASE_CODE)
-OUT_ROOT = Path("output/%s_assoc" % CASE_CODE)
+OUT_ROOT = Path("output/%s" % CASE_CODE)
 TIME_RANGE = "20190704-20190707"  # Exclusive end date.
 
 # ============================================================================
@@ -45,17 +45,21 @@ def case_path(path):
 
 
 def main():
+    out_root = case_path(OUT_ROOT)
     run_buffered_association(
         subnet_station_files={
             name: case_path(path) for name, path in SUBNET_STATION_FILES.items()
         },
         pick_dir=case_path(PICK_DIR),
-        assoc_root=case_path(OUT_ROOT),
+        assoc_root=out_root / "association",
         time_range=TIME_RANGE,
         num_workers=NUM_WORKERS,
         config_factory=cfg.Config,
         overwrite=OVERWRITE,
         retry_failed_days=RETRY_FAILED_DAYS,
+        association_buffer_enabled=False,
+        output_catalog=out_root / "catalog_{}.dat".format(TIME_RANGE),
+        output_phase=out_root / "phase_{}.dat".format(TIME_RANGE),
     )
 
 

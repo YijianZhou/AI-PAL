@@ -153,11 +153,20 @@ def main():
         partial_failed = 0
         partial_day_rates = []
         failed_stations = set()
+        total_triggers = 0
+        total_accepted_picks = 0
+        trigger_report_dates = 0
         reasons = defaultdict(
             lambda: {"stations": 0, "dates": set(), "examples": []}
         )
 
         for observed_date, status_kind, report in reports:
+            if "num_stalta_triggers" in report:
+                total_triggers += int(report["num_stalta_triggers"])
+                total_accepted_picks += int(
+                    report.get("num_accepted_picks", 0)
+                )
+                trigger_report_dates += 1
             station_errors = report.get("station_errors", [])
             successful = int(report.get("stations_processed", 0))
             failed = len(station_errors)
@@ -246,6 +255,18 @@ def main():
         print("  clean dates: {}".format(len(done_dates)))
         print("  completed with station errors: {}".format(len(failed_dates)))
         print("  remaining:   {}".format(remaining_dates))
+        if trigger_report_dates:
+            acceptance = (
+                100.0 * total_accepted_picks / total_triggers
+                if total_triggers else 0.0
+            )
+            print(
+                "  STA/LTA:     {:,} triggers -> {:,} QC-accepted picks "
+                "({:.2f}%) across {} date(s)".format(
+                    total_triggers, total_accepted_picks, acceptance,
+                    trigger_report_dates,
+                )
+            )
         if status_objects:
             all_dates = set(status_objects)
             print("  date span:   {} to {}".format(min(all_dates), max(all_dates)))
