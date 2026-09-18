@@ -23,19 +23,21 @@ import numpy as np
 import torch
 from obspy import read, Stream, UTCDateTime
 
-from data_pipeline import select_gain_for_time
+from data_pipeline import is_acceleration_channel, select_gain_for_time
 from phase_merge import (
     _cluster_station_picks, event_both_group_pick_ratio,
     select_preferred_provenance_picks, write_phase_file,
 )
 from picker_stream import PreparedPickerStream
+import runtime_console
 from waveform_qc import displacement_amplitude, is_glitch
 
 
 PREFERRED_ENSEMBLE_BRANCH = "AI-PAL"
 from pick_ensemble import (
     format_pick_row, format_picker_cluster_sizes, merge_picker_cluster_sizes,
-    merge_picker_records,
+    format_picker_window_vote_ratios, merge_picker_records,
+    merge_picker_window_vote_ratios, repick_quality_code,
 )
 
 
@@ -106,7 +108,7 @@ def _initial_event_magnitude(event, station_dict):
 
 
 def qc_initial_phase_file(
-    phase_path, retained_waveforms, station_dict, cfg, cache=None,
+    phase_path, retained_waveforms, station_dict, cfg, cache=None, min_sta=None,
 ):
     """Measure associated picks only, reject glitches, and refresh magnitude."""
     events = read_phase_file(phase_path)
@@ -158,7 +160,7 @@ def qc_initial_phase_file(
 
     params = dict(getattr(cfg, "subnet_assoc_params", {}).get("default", {}))
     params.update(getattr(cfg, "subnet_assoc_params", {}).get("full", {}))
-    min_sta = int(params.get("min_sta", 4))
+    min_sta = int(params.get("min_sta", 4) if min_sta is None else min_sta)
     accepted = []
     for event in events:
         event["picks"] = [
@@ -505,7 +507,10 @@ def prepare_station_waveform(
     """Prepare one station without invoking a picker."""
     st = traces_for_station(st_all, sta_key, location_priority)
     if len(st) != 0:
-        st = normalize_station_stream(st, sta_key, sta_info)
+        if bool(getattr(preprocess_cfg, "to_prep", True)):
+            st = normalize_station_stream(st, sta_key, sta_info)
+        elif len(st) == 3:
+            st = apply_gain_and_units(st.copy(), sta_key, sta_info)
     if len(st) != 3:
         return None
     return PreparedPickerStream.from_raw_stream(st, preprocess_cfg)
@@ -521,7 +526,10 @@ def prepare_realtime_segment_waveforms(mseed_path, sta_dict, cfg):
     shutil.rmtree(waveform_spill_dir, ignore_errors=True)
     os.makedirs(waveform_spill_dir, exist_ok=True)
     st_all = read_realtime_mseed_timed(
-        mseed_path, timing, expected_sampling_rate=cfg.samp_rate
+        mseed_path,
+        timing,
+        expected_sampling_rate=cfg.samp_rate,
+        to_prep=bool(getattr(cfg, "to_prep", True)),
     )
     timing["rss_after_mseed_mb"] = process_rss_mb()
     station_keys = sorted(sta_dict)
@@ -693,16 +701,21 @@ def cleanup_sampling_rates(st, expected_sampling_rate=None, tolerance=0.01):
     return out, dropped
 
 
-def read_realtime_mseed(mseed_path, expected_sampling_rate=None):
+def read_realtime_mseed(mseed_path, expected_sampling_rate=None, to_prep=True):
     """Read and merge an all-station miniSEED segment."""
     print("reading realtime mseed: {}".format(mseed_path))
     st = read(mseed_path)
-    st, _ = cleanup_sampling_rates(st, expected_sampling_rate=expected_sampling_rate)
-    st.merge(fill_value=0)
+    if to_prep:
+        st, _ = cleanup_sampling_rates(
+            st, expected_sampling_rate=expected_sampling_rate
+        )
+        st.merge(fill_value=0)
     return st
 
 
-def read_realtime_mseed_timed(mseed_path, timing, expected_sampling_rate=None):
+def read_realtime_mseed_timed(
+    mseed_path, timing, expected_sampling_rate=None, to_prep=True,
+):
     """Read and merge an all-station miniSEED segment with timing."""
     print("reading realtime mseed: {}".format(mseed_path))
     t0 = time.perf_counter()
@@ -714,6 +727,20 @@ def read_realtime_mseed_timed(mseed_path, timing, expected_sampling_rate=None):
         ) from exc
     timing["data_read_sec"] = time.perf_counter() - t0
     timing["num_raw_traces"] = len(st)
+
+    if not to_prep:
+        timing["sampling_rate_cleanup_sec"] = 0.0
+        timing["num_bad_sampling_rate_traces"] = 0
+        timing["data_merge_sec"] = 0.0
+        timing["num_merged_traces"] = len(st)
+        if len(st):
+            timing["data_start"] = format_time(median_time([
+                tr.stats.starttime.datetime for tr in st
+            ]))
+            timing["data_end"] = format_time(median_time([
+                (tr.stats.endtime + tr.stats.delta).datetime for tr in st
+            ]))
+        return st
 
     t0 = time.perf_counter()
     try:
@@ -802,7 +829,7 @@ def apply_gain_and_units(stream, sta_key, sta_info):
         if gains[ii] == 0:
             raise ValueError("zero gain for {} component {}".format(sta_key, ii))
         tr.data = tr.data.astype(np.float32, copy=False) / gains[ii]
-        if tr.stats.channel.startswith("HN"):
+        if is_acceleration_channel(tr.stats.channel):
             tr.detrend("demean")
             tr.integrate()
     return stream
@@ -939,6 +966,7 @@ def pick_segment_timed(mseed_path, pickers, sta_dict, pick_dirs,
         mseed_path,
         timing,
         expected_sampling_rate=expected_sampling_rate,
+        to_prep=bool(getattr(preprocess_cfg, "to_prep", True)),
     )
     timing["rss_after_mseed_mb"] = process_rss_mb()
     if preprocess_cfg is None:
@@ -1072,11 +1100,12 @@ def pick_segment_timed(mseed_path, pickers, sta_dict, pick_dirs,
                     getattr(preprocess_cfg, "out_monitoring_dir", None),
                     segment, stations_completed, len(station_keys), rss_mb,
                 )
-                print(
-                    "station progress: {}/{} | RSS {:.1f} MB".format(
+                runtime_console.log(
+                    "progress",
+                    "segment={} | picking stations {}/{} | RSS {:.1f} MB".format(
+                        segment,
                         stations_completed, len(station_keys), rss_mb
                     ),
-                    flush=True,
                 )
     finally:
         if owns_station_executor:
@@ -1113,35 +1142,11 @@ def build_association_branch_picks(
             continue
 
         if branch_name == PREFERRED_ENSEMBLE_BRANCH:
-            group_records = {}
-            for group_name, group_members in (
-                cfg.continuous_picker_groups.items()
-            ):
-                if not group_members:
-                    continue
-                records, _ = merge_picker_records(
-                    {
-                        name: picks_by_picker[name]
-                        for name in group_members
-                    },
-                    cfg.tp_dev,
-                    cfg.ts_dev,
-                    min_support=(
-                        cfg.continuous_picker_group_min_support[group_name]
-                    ),
-                )
-                group_records[group_name] = records
-            # Each group has already passed its own stability threshold.
-            # The final preferred product is the union of accepted groups;
-            # matching group picks are combined with equal group weight.
             records, input_counts = merge_picker_records(
-                group_records, cfg.tp_dev, cfg.ts_dev, min_support=1
+                {name: picks_by_picker[name] for name in members},
+                cfg.tp_dev, cfg.ts_dev,
+                min_support=cfg.picker_pos_neg_group_min_picker_support,
             )
-            for record in records:
-                record["sources"] = sorted(
-                    record.get("picker_cluster_sizes", {})
-                )
-                record["num_support"] = len(record["sources"])
         else:
             records, input_counts = merge_picker_records(
                 {name: picks_by_picker[name] for name in members},
@@ -1271,13 +1276,15 @@ def process_segment(
     branch_picks, branch_pick_paths = build_association_branch_picks(
         picks_by_picker, pick_paths, segment, cfg, vp=cfg.vp, vs=cfg.vs
     )
+    timing["reference_branch_keys"] = json.dumps([
+        _timing_key(name) for name in branch_picks if name != PREFERRED_ENSEMBLE_BRANCH
+    ])
+    timing["reference_picker_keys"] = json.dumps([
+        _timing_key(name) for name in cfg.reference_picker_names
+    ])
     timing["picker_ensemble_sec"] = time.perf_counter() - t0
-    selected_reference_branches = list(getattr(
-        cfg, "event_waveform_plot_ref_branches", []
-    ))
-    branch_order = selected_reference_branches + [
-        name for name in branch_picks if name not in selected_reference_branches
-    ]
+    # Preferred repicking prunes shared waveforms; finish reference QC first.
+    branch_order = sorted(branch_picks, key=lambda name: name == PREFERRED_ENSEMBLE_BRANCH)
     for branch_name in branch_order:
         picks = branch_picks[branch_name]
         timing["num_picks_{}".format(_timing_key(branch_name))] = len(picks)
@@ -1291,7 +1298,8 @@ def process_segment(
     timing["num_final_events_written"] = 0
     initial_waveform_qc_cache = {}
 
-    for branch_name, picks in branch_picks.items():
+    for branch_name in branch_order:
+        picks = branch_picks[branch_name]
         branch = cfg.result_branches[branch_name]
         branch_key = _timing_key(branch_name)
         for out_dir in (
@@ -1350,6 +1358,7 @@ def process_segment(
                 min_shared_phase_stations=cfg.merge_min_shared_phase_stations,
                 phase_pick_time_tol_sec=cfg.merge_phase_pick_time_tol_sec,
                 time_format_digits=cfg.merge_time_format_digits,
+                cfg=cfg,
             )
         merge_sec = time.perf_counter() - t0
         timing["merge_{}_sec".format(branch_key)] = merge_sec
@@ -1368,6 +1377,7 @@ def process_segment(
             pick_sta_dict,
             cfg,
             cache=initial_waveform_qc_cache,
+            min_sta=branch.get("associator_config", {}).get("min_sta"),
         )
         initial_qc_sec = time.perf_counter() - t0
         timing["initial_waveform_qc_{}_sec".format(branch_key)] = initial_qc_sec
@@ -1584,9 +1594,13 @@ def process_segment(
             timing["event_waveform_final_plot_sec"] = timing.get(
                 "event_waveform_final_plot_sec", 0.0
             ) + float(final_plot_summary["plot_sec"])
-            timing["event_repick_plot_sec"] = timing.get(
-                "event_repick_plot_sec", 0.0
-            ) + float(final_plot_summary["plot_sec"])
+            timing["event_waveform_plot_{}_sec".format(branch_key)] = float(
+                final_plot_summary["plot_sec"]
+            )
+            if branch_name == PREFERRED_ENSEMBLE_BRANCH:
+                timing["event_repick_plot_sec"] = timing.get(
+                    "event_repick_plot_sec", 0.0
+                ) + float(final_plot_summary["plot_sec"])
             timing["num_event_waveform_plots"] = timing.get(
                 "num_event_waveform_plots", 0
             ) + int(final_plot_summary["num_plots"])
@@ -1705,52 +1719,55 @@ def read_phase_file(fpha):
                     raise ValueError("Pick row before event header in {}: {}".format(fpha, line))
                 if len(codes) < 4:
                     raise ValueError("Bad pick row in {}: {}".format(fpha, line))
+                is_new_schema = len(codes) == 19
+                is_old_extended_schema = len(codes) >= 22
+                offset = 1 if is_new_schema else 0
                 current["picks"].append(
                     {
                         "sta": codes[0],
                         "p": parse_time(codes[1]),
                         "s": parse_time(codes[2]),
                         "score": float(codes[3]),
-                        "p_prob": float(codes[4]) if len(codes) > 4 else -1,
-                        "s_prob": float(codes[5]) if len(codes) > 5 else -1,
-                        "tp_std": float(codes[6]) if len(codes) > 6 else 0.0,
-                        "ts_std": float(codes[7]) if len(codes) > 7 else 0.0,
-                        "p_prob_std": float(codes[8]) if len(codes) > 8 else 0.0,
-                        "s_prob_std": float(codes[9]) if len(codes) > 9 else 0.0,
-                        "num_support": int(codes[10]) if len(codes) > 10 else 1,
-                        "pickers": codes[11] if len(codes) > 11 else "",
-                        "sources": codes[11] if len(codes) > 11 else "",
+                        "quality": int(codes[4]) if is_new_schema else -1,
+                        "p_prob": float(codes[4 + offset]) if len(codes) > 4 + offset else -1,
+                        "s_prob": float(codes[5 + offset]) if len(codes) > 5 + offset else -1,
+                        "tp_std": float(codes[6 + offset]) if len(codes) > 6 + offset else 0.0,
+                        "ts_std": float(codes[7 + offset]) if len(codes) > 7 + offset else 0.0,
+                        "p_prob_std": float(codes[8 + offset]) if len(codes) > 8 + offset else 0.0,
+                        "s_prob_std": float(codes[9 + offset]) if len(codes) > 9 + offset else 0.0,
+                        "num_support": int(codes[10 + offset]) if len(codes) > 10 + offset else 1,
+                        "pickers": codes[11 + offset] if len(codes) > 11 + offset else "",
+                        "sources": codes[11 + offset] if len(codes) > 11 + offset else "",
                         "picker_cluster_sizes": (
-                            codes[12] if len(codes) > 12 else ""
+                            codes[12] if not is_new_schema and len(codes) > 12 else ""
+                        ),
+                        "picker_window_vote_ratios": (
+                            codes[13] if is_new_schema else ""
                         ),
                         "picker_uncertainties": (
-                            codes[13] if len(codes) > 13 else ""
+                            codes[14] if is_new_schema else (
+                                codes[13] if len(codes) > 13 else ""
+                            )
                         ),
                         "pick_provenance": (
-                            codes[14] if len(codes) > 14 else "initial"
-                        ),
-                        "repick_status": (
-                            codes[15] if len(codes) > 15 else "unknown"
-                        ),
-                        "repick_support": (
-                            int(codes[16])
-                            if len(codes) > 16 and codes[16] else -1
-                        ),
-                        "repick_sources": (
-                            codes[17] if len(codes) > 17 else ""
-                        ),
-                        "repick_required_support": (
-                            int(codes[18])
-                            if len(codes) > 18 and codes[18] else -1
+                            codes[15] if is_new_schema else (
+                                codes[14] if len(codes) > 14 else "initial"
+                            )
                         ),
                         "p_snr_e": (
-                            float(codes[19]) if len(codes) > 19 else -1.0
+                            float(codes[16]) if is_new_schema else (
+                                float(codes[19]) if is_old_extended_schema else -1.0
+                            )
                         ),
                         "p_snr_n": (
-                            float(codes[20]) if len(codes) > 20 else -1.0
+                            float(codes[17]) if is_new_schema else (
+                                float(codes[20]) if is_old_extended_schema else -1.0
+                            )
                         ),
                         "p_snr_z": (
-                            float(codes[21]) if len(codes) > 21 else -1.0
+                            float(codes[18]) if is_new_schema else (
+                                float(codes[21]) if is_old_extended_schema else -1.0
+                            )
                         ),
                     }
                 )
@@ -1820,23 +1837,27 @@ def enrich_phase_probabilities(fpha, picks, tolerance_sec=0.001):
                 out_lines.append(line)
                 continue
             p_prob, s_prob = probs
-            needs_fill = len(codes) < 6
+            p_prob_index, s_prob_index = (5, 6) if len(codes) == 19 else (4, 5)
+            needs_fill = len(codes) <= s_prob_index
             if not needs_fill:
                 try:
-                    needs_fill = float(codes[4]) < 0 or float(codes[5]) < 0
+                    needs_fill = (
+                        float(codes[p_prob_index]) < 0
+                        or float(codes[s_prob_index]) < 0
+                    )
                 except ValueError:
                     needs_fill = True
             if not needs_fill:
                 out_lines.append(line)
                 continue
-            if len(codes) < 5:
+            if len(codes) <= p_prob_index:
                 codes.append("{:.4f}".format(p_prob))
             else:
-                codes[4] = "{:.4f}".format(p_prob)
-            if len(codes) < 6:
+                codes[p_prob_index] = "{:.4f}".format(p_prob)
+            if len(codes) <= s_prob_index:
                 codes.append("{:.4f}".format(s_prob))
             else:
-                codes[5] = "{:.4f}".format(s_prob)
+                codes[s_prob_index] = "{:.4f}".format(s_prob)
             out_lines.append(",".join(codes) + "\n")
             num_filled += 1
 
@@ -1941,7 +1962,7 @@ def group_events(events, origin_time_tol_sec, epicenter_tol_km, depth_tol_km,
     return sorted(groups, key=lambda group: median_time([event["time"] for event in group["events"]]))
 
 
-def merge_group(group, phase_pick_time_tol_sec=1.0):
+def merge_group(group, phase_pick_time_tol_sec=1.0, cfg=None):
     events = group["events"]
     merged = {
         "time": median_time([event["time"] for event in events]),
@@ -1983,9 +2004,10 @@ def merge_group(group, phase_pick_time_tol_sec=1.0):
                     for picker in pick["pickers"].split("|")
                     if picker
                 })),
-                "picker_cluster_sizes": format_picker_cluster_sizes(
-                    merge_picker_cluster_sizes(
-                        pick["picker_cluster_sizes"] for pick in picks
+                "picker_window_vote_ratios": format_picker_window_vote_ratios(
+                    merge_picker_window_vote_ratios(
+                        pick.get("picker_window_vote_ratios", "")
+                        for pick in picks
                     )
                 ),
                 "picker_uncertainties": "|".join(sorted({
@@ -1995,24 +2017,6 @@ def merge_group(group, phase_pick_time_tol_sec=1.0):
                     if value
                 })),
                 "pick_provenance": provenance,
-                "repick_status": "|".join(sorted({
-                    value
-                    for pick in picks
-                    for value in pick.get("repick_status", "unknown").split("|")
-                    if value
-                })),
-                "repick_support": max(
-                    pick.get("repick_support", -1) for pick in picks
-                ),
-                "repick_sources": "|".join(sorted({
-                    source
-                    for pick in picks
-                    for source in pick.get("repick_sources", "").split("|")
-                    if source
-                })),
-                "repick_required_support": max(
-                    pick.get("repick_required_support", -1) for pick in picks
-                ),
                 "p_snr_e": median_valid([
                     pick.get("p_snr_e", -1.0) for pick in picks
                 ], default=-1, min_value=0),
@@ -2025,6 +2029,16 @@ def merge_group(group, phase_pick_time_tol_sec=1.0):
                 "num_picks": len(picks),
             }
         )
+        ratios = merged["picks"][-1]["picker_window_vote_ratios"]
+        merged["picks"][-1]["quality"] = (
+            repick_quality_code(provenance, ratios, cfg)
+            if provenance != "initial" and ratios else
+            min(
+                (pick.get("quality", -1) for pick in picks
+                 if pick.get("quality", -1) >= 0),
+                default=-1,
+            )
+        )
 
     return merged
 
@@ -2035,7 +2049,7 @@ def merge_phase_files(fpha_list, fpha_out, fmerge_log, origin_time_tol_sec=2.5,
                       event_time_end=None, exclude_phase_files=None,
                       min_shared_phase_stations=0,
                       phase_pick_time_tol_sec=1.0,
-                      min_both_group_ratio=None):
+                      min_both_group_ratio=None, cfg=None):
     events = []
     file_event_counts = {}
     for fpha in sorted(fpha_list):
@@ -2075,7 +2089,7 @@ def merge_phase_files(fpha_list, fpha_out, fmerge_log, origin_time_tol_sec=2.5,
     num_grouped_events = len(groups)
     merged_events = []
     for group in groups:
-        merged = merge_group(group, phase_pick_time_tol_sec)
+        merged = merge_group(group, phase_pick_time_tol_sec, cfg)
         # Assign a duplicate group to exactly one disjoint final interval by
         # its canonical merged origin. Using "any member in interval" can put
         # a boundary-straddling group in two final files and previously led to
@@ -2112,23 +2126,20 @@ def merge_phase_files(fpha_list, fpha_out, fmerge_log, origin_time_tol_sec=2.5,
             )
             for pick in event["picks"]:
                 fp.write(
-                    "{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},"
-                    "{:.4f},{:.4f},{},{},{},{},{},{},{},{},{},"
+                    "{},{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},"
+                    "{:.4f},{:.4f},{},{},{},{},{},"
                     "{:.4f},{:.4f},{:.4f}\n".format(
                         pick["sta"],
                         format_time(pick["p"], time_format_digits),
                         format_time(pick["s"], time_format_digits),
-                        pick["score"], pick["p_prob"], pick["s_prob"],
+                        pick["score"], pick.get("quality", -1),
+                        pick["p_prob"], pick["s_prob"],
                         pick["tp_std"], pick["ts_std"],
                         pick["p_prob_std"], pick["s_prob_std"],
                         pick["num_support"], pick["pickers"],
-                        pick["picker_cluster_sizes"],
+                        pick.get("picker_window_vote_ratios", ""),
                         pick.get("picker_uncertainties", ""),
                         pick.get("pick_provenance", "initial"),
-                        pick.get("repick_status", "unknown"),
-                        pick.get("repick_support", -1),
-                        pick.get("repick_sources", ""),
-                        pick.get("repick_required_support", -1),
                         pick.get("p_snr_e", -1.0),
                         pick.get("p_snr_n", -1.0),
                         pick.get("p_snr_z", -1.0),
@@ -2518,6 +2529,7 @@ def _publish_final_interval(previous, current, interval_start, interval_end, cfg
         min_shared_phase_stations=cfg.merge_min_shared_phase_stations,
         phase_pick_time_tol_sec=cfg.merge_phase_pick_time_tol_sec,
         time_format_digits=cfg.merge_time_format_digits,
+        cfg=cfg,
         event_time_start=interval_start,
         event_time_end=interval_end,
         # The both-repicker-group QC is applied to each reassociated candidate
@@ -2877,6 +2889,7 @@ def _merge_corrected_interval(source_paths, phase_path, merge_log_path,
         min_shared_phase_stations=cfg.merge_min_shared_phase_stations,
         phase_pick_time_tol_sec=cfg.merge_phase_pick_time_tol_sec,
         time_format_digits=cfg.merge_time_format_digits,
+        cfg=cfg,
         event_time_start=interval_start,
         event_time_end=interval_end,
         # EventRepicker already applies this QC to reassociated candidates.
@@ -3183,16 +3196,18 @@ def write_timing_report(out_dir, segment, timing):
         os.makedirs(out_dir)
     ftime = os.path.join(out_dir, "timing_{}.csv".format(segment))
     keys = sorted(timing)
-    with open(ftime, "w") as fp:
-        fp.write(",".join(keys) + "\n")
-        fp.write(",".join(str(timing[key]) for key in keys) + "\n")
+    with open(ftime, "w", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=keys)
+        writer.writeheader()
+        writer.writerow(timing)
 
     fall = os.path.join(out_dir, "timing_all_multi_picker.csv")
     write_header = not os.path.exists(fall)
-    with open(fall, "a") as fp:
+    with open(fall, "a", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=keys)
         if write_header:
-            fp.write(",".join(keys) + "\n")
-        fp.write(",".join(str(timing.get(key, "")) for key in keys) + "\n")
+            writer.writeheader()
+        writer.writerow(timing)
     return ftime
 
 
@@ -3441,7 +3456,7 @@ def realtime_loop(
     print("loaded {} bad file records".format(len(bad_records)))
     print(
         "enabled continuous picker groups: {} | references: {}".format(
-            cfg.continuous_picker_groups, cfg.picker_ref_group
+            cfg.continuous_picker_groups, cfg.reference_picker_names
         )
     )
     last_wait_report = 0.0
@@ -3489,9 +3504,10 @@ def realtime_loop(
             )
             last_heartbeat = now
         if not files and time.time() - last_wait_report >= 60.0:
-            print(
-                "waiting for input: {} files present, {} complete for current "
-                "pipeline, {} marked bad; polling every {}s".format(
+            runtime_console.log(
+                "status",
+                "waiting for input | {} present | {} complete | "
+                "{} marked bad | polling every {}s".format(
                     len(all_files), len(current_done_records),
                     len(current_unresolved_bad),
                     cfg.poll_interval_sec,
@@ -3500,13 +3516,18 @@ def realtime_loop(
             )
             last_wait_report = time.time()
         elif files:
-            print("found {} pending MiniSEED files".format(len(files)), flush=True)
+            runtime_console.log(
+                "status", "{} pending MiniSEED files".format(len(files))
+            )
 
         for mseed_path in files:
             if not os.path.exists(mseed_path):
                 continue
-            print("=" * 60)
-            print("processing {}".format(mseed_path))
+            runtime_console.log(
+                "segment", "{} start | {}".format(
+                    segment_code(mseed_path), mseed_path
+                )
+            )
             segment_error = None
             try:
                 pick_paths, phase_paths, picks_by_picker, timing = process_segment(
@@ -3600,10 +3621,43 @@ def realtime_loop(
                 ))
             print("recorded completed input: {}".format(done_record))
 
+            segment_name = timing["segment"]
+            event_counts = ", ".join(
+                "{}={}".format(
+                    branch_name,
+                    int(timing.get(
+                        "final_events_{}".format(_timing_key(branch_name)), 0
+                    )),
+                )
+                for branch_name in cfg.association_branches
+            )
+            preferred_pick_count = int(timing.get(
+                "num_picks_{}".format(_timing_key(PREFERRED_ENSEMBLE_BRANCH)),
+                0,
+            ))
+            segment_total_sec = float(timing.get("total_sec", 0.0))
+            preferred_phase_path = phase_paths.get(
+                PREFERRED_ENSEMBLE_BRANCH, ""
+            )
+
             # Do not let the polling loop keep the last segment's result
             # arrays alive through an arbitrary idle period.
             del pick_paths, phase_paths, picks_by_picker, timing
             idle_rss_mb = release_transient_memory()
+            runtime_console.log(
+                "complete",
+                "segment={} | {:.1f}s | preferred_picks={} | final_events: {} | "
+                "idle_RSS={:.1f} MB".format(
+                    segment_name, segment_total_sec, preferred_pick_count,
+                    event_counts, idle_rss_mb,
+                ),
+            )
+            runtime_console.log(
+                "output",
+                "segment={} | preferred_phase={} | monitoring={}".format(
+                    segment_name, preferred_phase_path, timing_csv
+                ),
+            )
             print(
                 "segment memory released; idle RSS {:.1f} MB".format(
                     idle_rss_mb

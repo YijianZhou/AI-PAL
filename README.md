@@ -72,7 +72,7 @@ release, without changing its established theoretical basis.
 | Path | Purpose |
 | --- | --- |
 | `PAL_src/` | Shared waveform pipeline, PAL algorithms, configuration, orchestration, merging, and postprocessing. |
-| `preprocess/` | Shared waveform-download and preprocessing examples. |
+| [`preprocess/`](preprocess/README.md) | Example workflow for station metadata, waveform download, validated daily merging, continuity checks, and station maps. |
 | `picker_SAR/`, `picker_FT/`, `picker_PHN/`, `picker_RUN/` | Peer AI picker packages. Each includes preprocessing and sample construction, model and dataset definitions, training, and continuous/positive inference. |
 | `1_run_pal/` | Executable rule-based PAL workflows for label generation and association. |
 | `2_train_picker/` | Shared training-data preparation and picker-training workflows. |
@@ -113,6 +113,7 @@ The main runtime requires:
 - Matplotlib for diagnostics
 - TensorBoardX for training logs
 - SeisBench for the packaged reference PhaseNet branch
+- `GMMA==1.2.12` with `scikit-learn==1.6.1` for the optional realtime GaMMA reference associator
 
 Use a PyTorch build compatible with the deployment CUDA runtime when GPU
 inference or training is required. Individual models can run on CPU by setting
@@ -132,6 +133,26 @@ Configuration is divided into two layers:
   and inference thresholds.
 
 The standalone rule-based PAL workflow uses `PAL_src/config_pal.py`.
+
+Active `config_ai_pal*.py` templates are consistent **within each workflow
+type**: local, AWS, and realtime. Local training and inference share the same
+config structure, as do AWS training and inference (with explicit backend
+differences). Realtime has its own config containing reference picker/associator
+selections, reference plotting, and service controls; these are not included in
+offline configs. When copying within a workflow, rename the file to match the
+destination launcher's `CASE_CODE`. Keep matching model-specific configs and
+checkpoint paths in that launcher.
+
+When copying, check `waveform_backend`: `"local"` for local/realtime data,
+`"scedc"` for AWS continuous inference, or `"scedc_training"` for AWS
+training-window extraction. Also review `to_prep` and plotting options.
+When switching workflow types, start from the destination template and transfer
+the relevant scientific parameter values. The package's `PAL_src` must be on
+the import path, as arranged by the maintained launchers.
+
+The rule-based PAL stage and location tools retain their own configuration
+interfaces; `config_ai_pal` does not replace their stage-specific configs.
+Archived configs under `backup/` are not maintained templates.
 
 ## 4. End-To-End Workflow
 
@@ -191,6 +212,15 @@ location stage for final AI detections is not.
 See [4_location/README.md](4_location/README.md) for the currently packaged
 location workflows.
 
+### 4.5 Use AI-PAL Events As MFT Templates
+
+The companion PALM workflow can use either rule-based PAL detections or the
+enhanced AI-PAL detections as matched-filter templates. A common progression is
+PAL label generation, AI-PAL training, AI-PAL continuous detection and final
+location, then MFT with the located AI-PAL events as the template bank. This
+preserves PAL's self-supervised role while allowing the expanded AI-PAL catalog
+to seed more MFT templates. See the PALM `2_run_mft/` template-source setting.
+
 ## 5. Core Data Contracts
 
 ### 5.1 Waveforms And Stations
@@ -220,12 +250,12 @@ prepared once. Native models reuse one tensor per assigned device.
 
 AI-PAL distinguishes:
 
-- `picker_pos_neg_group`: models trained with positive and negative windows.
-- `picker_pos_group`: positive-only models optionally used during continuous
-  picking.
+- `picker_pos_neg_group`: continuous pickers trained with positive and negative windows.
 - `repicker_pos_neg_group` and `repicker_pos_group`: models used after an
   initial detection.
-- `picker_ref_group`: independent reference branches used for comparison.
+- `reference_workflows`: explicit realtime picker/associator combinations;
+  the defaults share PHN-SB picks between PAL and GaMMA. GaMMA settings live in
+  `3_run_ai_pal/run_ai_pal_realtime/config_ref_gamma_eg.py`.
 
 Each model first consolidates repeated detections across sliding windows.
 Configured group support is then applied before accepted picks are merged into
@@ -242,9 +272,9 @@ duplicate groups, including events detected by more than two subnets.
 Postprocessing uses repicker phase pairs detected by both POS_NEG and positive
 groups as PAL reassociation anchors. Compatible POS_NEG-only or positive-only
 pairs can be supplemented after the event origin and location are updated.
-Final phase rows retain picker support, uncertainty, provenance, displacement
-amplitude, and per-component P-wave energy SNR for downstream quality control
-and location weighting.
+Final phase rows retain picker support ratios, uncertainty, provenance,
+displacement amplitude, per-component P-wave energy SNR, and a four-level
+Hypoinverse quality code for downstream location weighting.
 
 ### 5.5 Realtime Event Ownership
 

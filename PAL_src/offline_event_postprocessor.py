@@ -11,11 +11,15 @@ from pathlib import Path
 import numpy as np
 from obspy import UTCDateTime
 
-from association_runner import merge_canonical_interval, parse_date_range
+from association_runner import (
+    load_station_geometry, merge_canonical_interval, parse_date_range,
+    processing_day_bounds,
+)
 from event_repicker import EVENT_REPICK_VERSION, EventRepicker
 from phase_merge import group_events, is_event_header, read_phase_file
 from picker_stream import RetainedStationWaveform, configure_torch_backends
 from data_pipeline import preprocess_picker_stream
+import runtime_console
 
 
 PROGRESS_EVERY_EVENTS = 1000
@@ -44,8 +48,9 @@ def _print_progress(num_done, num_all, started, final=False):
     remaining = max(0, num_all - num_done)
     eta = remaining / rate if rate > 0 else 0.0
     label = "final" if final else "checkpoint"
-    print(
-        "postprocess progress [{}]: {}/{} initial events | elapsed {} | "
+    runtime_console.log(
+        "progress",
+        "postprocess {} | {}/{} initial events | elapsed {} | "
         "{:.2f} events/s | ETA {}".format(
             label,
             num_done,
@@ -54,7 +59,6 @@ def _print_progress(num_done, num_all, started, final=False):
             rate,
             _format_duration(eta),
         ),
-        flush=True,
     )
 
 
@@ -97,6 +101,13 @@ def _read_preprocessed_station(
         normalize_to_three_channels=bool(getattr(
             cfg, "normalize_to_three_channels", True
         )),
+        to_prep=bool(getattr(cfg, "to_prep", True)),
+        location_priority=getattr(
+            cfg, "location_priority", ("10", "20", "01", "02", "00", "")
+        ),
+        channel_priority=getattr(
+            cfg, "channel_priority", ("HH", "BH", "EH", "HN", "EN", "SH")
+        ),
     )
     if not stream:
         return station, None
@@ -107,6 +118,8 @@ def _read_preprocessed_station(
         min_length_sec=float(cfg.win_len),
         frequency_band=cfg.freq_band,
         taper_max_length_sec=taper_sec,
+        to_filter=bool(getattr(cfg, "to_filter", True)),
+        retain_raw=False,
     )
     if len(filtered) != int(cfg.num_chn):
         return station, None
@@ -184,9 +197,10 @@ def run_offline_event_postprocessing(
     ai_pal_root, cfg, repicker_pos_neg_specs, repicker_pos_specs,
     data_dir, station_file,
     initial_phase_dir, final_root, time_range, num_workers=1,
-    overwrite=False,
+    overwrite=False, day_complete_callback=None,
 ):
     """Repick/reassociate initial detections one event at a time."""
+    runtime_console.configure(cfg)
     if not bool(getattr(cfg, "enable_post_process", False)):
         raise ValueError(
             "2.3 postprocessing requires enable_post_process=True"
@@ -208,22 +222,17 @@ def run_offline_event_postprocessing(
         path.mkdir(parents=True, exist_ok=True)
     cfg.out_root = str(final_root)
 
-    repicker = EventRepicker(
-        ai_pal_root, cfg, repicker_pos_neg_specs, station_file,
-        repicker_pos_specs=repicker_pos_specs,
-    )
-    repicker.load_pickers()
-    # read_data identifies local files by NET.STA. Add aliases when a station
-    # selector includes a channel family (NET.STA.CHN).
-    stations = dict(repicker.stations)
-    for selector, metadata in list(repicker.stations.items()):
-        stations.setdefault(".".join(selector.split(".")[:2]), metadata)
-
     start_date, end_date = parse_date_range(time_range)
     target_dates = [
         start_date + timedelta(days=index)
         for index in range((end_date - start_date).days)
     ]
+    repicker = EventRepicker(
+        ai_pal_root, cfg, repicker_pos_neg_specs, station_file,
+        station_dict=load_station_geometry(cfg, station_file, start_date),
+        repicker_pos_specs=repicker_pos_specs,
+    )
+    repicker.load_pickers()
     initial_phase_paths = {
         date: initial_phase_dir / "phase_{}.dat".format(date.isoformat())
         for date in target_dates
@@ -235,6 +244,12 @@ def run_offline_event_postprocessing(
         raise FileNotFoundError(missing_initial[0])
     num_all_events = sum(
         _count_phase_events(path) for path in initial_phase_paths.values()
+    )
+    runtime_console.log(
+        "AI-PAL",
+        "offline postprocess | days={} | initial_events={} | workers={}".format(
+            len(target_dates), num_all_events, max(1, int(num_workers))
+        ),
     )
     num_done_events = 0
     next_progress_event = PROGRESS_EVERY_EVENTS
@@ -248,10 +263,20 @@ def run_offline_event_postprocessing(
     unreleased_snapshots = []
     try:
         for current_date in target_dates:
+            current_stations = load_station_geometry(
+                cfg, station_file, current_date
+            )
+            repicker.set_station_geometry(current_stations)
+            # Local files may use NET.STA while static station dictionaries
+            # use NET.STA.BAND. The AWS dictionary is already NET.STA.
+            stations = dict(current_stations)
+            for selector, metadata in list(current_stations.items()):
+                stations.setdefault(
+                    ".".join(selector.split(".")[:2]), metadata
+                )
             initial_phase = initial_phase_paths[current_date]
             initial_events = read_phase_file(initial_phase)
-            day_start = UTCDateTime(str(current_date))
-            day_end = day_start + 86400
+            day_start, day_end = processing_day_bounds(cfg, current_date)
             daily_phase = final_root / (
                 "phase_{}.dat".format(current_date.isoformat())
             )
@@ -264,6 +289,12 @@ def run_offline_event_postprocessing(
                     current_date, len(initial_events)
                 ),
                 flush=True,
+            )
+            runtime_console.log(
+                "day",
+                "{} postprocess start | {} initial events".format(
+                    current_date, len(initial_events)
+                ),
             )
             completed_version = None
             if status_path.exists():
@@ -421,6 +452,10 @@ def run_offline_event_postprocessing(
                 encoding="utf-8",
             )
             partial.replace(status_path)
+            if day_complete_callback is not None:
+                day_complete_callback(
+                    current_date, daily_phase, status_path, day_summary
+                )
             print(
                 "daily postprocess complete: {} | {} initial -> {} final "
                 "events | {}".format(
@@ -430,6 +465,14 @@ def run_offline_event_postprocessing(
                     daily_phase,
                 ),
                 flush=True,
+            )
+            runtime_console.log(
+                "day",
+                "day={} | {} initial events -> {} final events".format(
+                    current_date,
+                    len(initial_events),
+                    day_summary["num_final_events"],
+                ),
             )
     finally:
         _release_snapshots(unreleased_snapshots)
@@ -442,5 +485,11 @@ def run_offline_event_postprocessing(
     print(
         "daily postprocessed phase files: {}".format(len(daily_phase_paths)),
         flush=True,
+    )
+    runtime_console.log(
+        "output",
+        "postprocess complete | {} daily phase files | {}".format(
+            len(daily_phase_paths), final_root
+        ),
     )
     return daily_phase_paths

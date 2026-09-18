@@ -1,4 +1,4 @@
-"""Train SAR with both positive and negative raw-window samples."""
+"""Train SAR with positive-only or positive-and-negative samples."""
 import os, time
 import argparse
 import torch
@@ -6,12 +6,30 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Sampler
 import torch.multiprocessing as mp
-from dataset import Positive_Negative
+from dataset import Positive_Negative, PositiveOnly
 from models import SAR
 import config
 from tensorboardX import SummaryWriter
+from training_monitor import TrainingMonitor
+from torch_backends import configure_torch_backends
+
+# Also runs when spawned DataLoader workers import this module.
+configure_torch_backends(config.Config())
 import warnings
 warnings.filterwarnings("ignore")
+
+
+def prune_numbered_checkpoints(ckpt_dir, keep):
+    keep = int(keep)
+    if keep < 1:
+        raise ValueError('max_checkpoints must be at least 1')
+    checkpoints = []
+    for name in os.listdir(ckpt_dir):
+        step = name.split('_', 1)[0]
+        if step.isdigit() and name.endswith('.ckpt'):
+            checkpoints.append((int(step), name))
+    for _, name in sorted(checkpoints)[:-keep]:
+        os.remove(os.path.join(ckpt_dir, name))
 
 
 class ChunkBatchSampler(Sampler):
@@ -67,21 +85,33 @@ def main():
     lr = cfg.lr
     num_epochs = cfg.num_epochs
     summary_step = cfg.summary_step
-    ckpt_step = cfg.ckpt_step
+    valid_step_interval = cfg.valid_step
+    max_checkpoints = int(getattr(cfg, 'max_checkpoints', 20))
     batch_size = cfg.batch_size
-    train_set = Positive_Negative(args.zarr_path, 'train')
-    valid_set = Positive_Negative(args.zarr_path, 'valid')
+    dataset_class = PositiveOnly if args.positive_only else Positive_Negative
+    train_set = dataset_class(args.zarr_path, 'train')
+    valid_set = dataset_class(args.zarr_path, 'valid')
     train_loader = make_loader(train_set, batch_size, True)
     valid_loader = make_loader(valid_set, batch_size, False)
-    neg_ratio = train_set.neg_ratio
-    effective_neg = min(batch_size, max(1, int(batch_size * neg_ratio)))
-    print(
-        'training mix: {} positive + {} negative windows/batch | '
-        'stored neg/pos {:.3f} | Zarr chunk {}'.format(
-            batch_size, effective_neg, neg_ratio, train_set.chunk_size()
-        ),
-        flush=True,
+    stored_neg_ratio = None if args.positive_only else train_set.neg_ratio
+    neg_reduction_ratio = float(getattr(cfg, 'neg_reduction_ratio', 1.0))
+    if not 0.0 < neg_reduction_ratio <= 1.0:
+        raise ValueError('neg_reduction_ratio must be in (0, 1]')
+    neg_ratio = (
+        None if stored_neg_ratio is None
+        else stored_neg_ratio * neg_reduction_ratio
     )
+    if neg_ratio is not None:
+        effective_neg = min(batch_size, max(1, int(batch_size * neg_ratio)))
+        print(
+            'training mix: {} positive + {} negative windows/batch | '
+            'stored neg/pos {:.3f} | reduction {:.3f} | '
+            'effective neg/pos {:.3f} | Zarr chunk {}'.format(
+                batch_size, effective_neg, stored_neg_ratio,
+                neg_reduction_ratio, neg_ratio, train_set.chunk_size()
+            ),
+            flush=True,
+        )
     num_batch = len(train_loader)
     model = SAR()
     device = torch.device("cuda:%s" % args.gpu_idx if torch.cuda.is_available() else "cpu")
@@ -90,39 +120,80 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=lr)
     t = time.time()
     writer = SummaryWriter(log_dir=args.ckpt_dir)
+    monitor = TrainingMonitor(args.ckpt_dir, 'SAR')
+    best_valid_loss = float('inf')
     try:
         for epoch_idx in range(num_epochs):
           for iter_idx, (data, target) in enumerate(train_loader):
             global_step = num_batch * epoch_idx + iter_idx
             data = data.to(device, non_blocking=True).float()
             target = target.to(device, non_blocking=True).long()
-            data, target = _reshape_data_target(data, target)
+            if args.positive_only:
+                num_pos = data.size(0)
+            else:
+                data, target, num_pos = reshape_paired_batch(data, target)
             data = unfold_sar_batch(data, cfg)
-            train_acc_list, train_loss = train_step(model, data, target, neg_ratio, criterion, optimizer)
-            if global_step % ckpt_step == 0:
-                torch.save(model.state_dict(), os.path.join(args.ckpt_dir, '%s_%s-%s.ckpt' % (global_step, epoch_idx, iter_idx)))
-            if global_step % summary_step != 0:
+            train_acc_list, train_loss = train_step(
+                model, data, target, num_pos, neg_ratio, criterion, optimizer
+            )
+            if global_step % summary_step == 0:
+                print('step {} ({}/{}) | train loss {:.2f} | {:.2f}s'.format(
+                    global_step, iter_idx, epoch_idx, train_loss, time.time()-t))
+                metric_text = '   frame acc. {:.2f}% | pos acc. {:.2f}%'.format(
+                    100*train_acc_list[0], 100*train_acc_list[1]
+                )
+                if not args.positive_only:
+                    metric_text += ' | neg acc. {:.2f}%'.format(100*train_acc_list[2])
+                print(metric_text, flush=True)
+                writer.add_scalar('loss/train_loss', train_loss, global_step)
+                writer.add_scalar('frame_acc/train_acc_frame', 100*train_acc_list[0], global_step)
+                writer.add_scalar('pos_acc/train_acc_pos', 100*train_acc_list[1], global_step)
+                if not args.positive_only:
+                    writer.add_scalar('neg_acc/train_acc_neg', 100*train_acc_list[2], global_step)
+                monitor.update(global_step, {
+                    'loss/train_loss': train_loss,
+                    'frame_acc/train_acc_frame': 100*train_acc_list[0],
+                    'pos_acc/train_acc_pos': 100*train_acc_list[1],
+                    'neg_acc/train_acc_neg': (
+                        None if args.positive_only else 100*train_acc_list[2]
+                    ),
+                })
+            if global_step % valid_step_interval != 0:
                 continue
-            for (data, target) in valid_loader:
-                data = data.to(device, non_blocking=True).float()
-                target = target.to(device, non_blocking=True).long()
-                data, target = _reshape_data_target(data, target)
-                data = unfold_sar_batch(data, cfg)
-                valid_acc_list, valid_loss = valid_step(model, data, target, criterion)
-                break
-            print('step {} ({}/{}) | train loss {:.2f} | valid loss {:.2f} | {:.2f}s'.format(global_step, iter_idx, epoch_idx, train_loss, valid_loss, time.time()-t))
-            acc_to_print = ''
-            for ii in range(3):
-                acc_to_print += ' {} acc. {:.2f}% {:.2f}% |'.format(['frame','pos','neg'][ii], 100*train_acc_list[ii], 100*valid_acc_list[ii])
-            print('   %s' % acc_to_print[:-2])
-            sum_loss = {'train_loss': train_loss, 'valid_loss': valid_loss}
-            sum_acc_frame = {'train_acc_frame': 100*train_acc_list[0], 'valid_acc_frame': 100*valid_acc_list[0]}
-            sum_acc_pos = {'train_acc_pos': 100*train_acc_list[1], 'valid_acc_pos': 100*valid_acc_list[1]}
-            sum_acc_neg = {'train_acc_neg': 100*train_acc_list[2], 'valid_acc_neg': 100*valid_acc_list[2]}
-            writer.add_scalars('loss', sum_loss, global_step)
-            writer.add_scalars('frame_acc', sum_acc_frame, global_step)
-            writer.add_scalars('pos_acc', sum_acc_pos, global_step)
-            writer.add_scalars('neg_acc', sum_acc_neg, global_step)
+            valid_acc_list, valid_loss = validate_full(
+                model, valid_loader, device, cfg, criterion, args.positive_only
+            )
+            print('validation step {} | full-set loss {:.4f}'.format(
+                global_step, valid_loss), flush=True)
+            metric_text = '   frame acc. {:.2f}% | pos acc. {:.2f}%'.format(
+                100*valid_acc_list[0], 100*valid_acc_list[1]
+            )
+            if not args.positive_only:
+                metric_text += ' | neg acc. {:.2f}%'.format(100*valid_acc_list[2])
+            print(metric_text, flush=True)
+            writer.add_scalar('loss/valid_loss', valid_loss, global_step)
+            writer.add_scalar('frame_acc/valid_acc_frame', 100*valid_acc_list[0], global_step)
+            writer.add_scalar('pos_acc/valid_acc_pos', 100*valid_acc_list[1], global_step)
+            if not args.positive_only:
+                writer.add_scalar('neg_acc/valid_acc_neg', 100*valid_acc_list[2], global_step)
+            monitor.update(global_step, {
+                'loss/valid_loss': valid_loss,
+                'frame_acc/valid_acc_frame': 100*valid_acc_list[0],
+                'pos_acc/valid_acc_pos': 100*valid_acc_list[1],
+                'neg_acc/valid_acc_neg': (
+                    None if args.positive_only else 100*valid_acc_list[2]
+                ),
+            })
+            checkpoint = os.path.join(
+                args.ckpt_dir, '%s_%s-%s.ckpt' % (global_step, epoch_idx, iter_idx)
+            )
+            torch.save(model.state_dict(), checkpoint)
+            prune_numbered_checkpoints(args.ckpt_dir, max_checkpoints)
+            if valid_loss < best_valid_loss:
+                best_valid_loss = valid_loss
+                torch.save(model.state_dict(), os.path.join(args.ckpt_dir, 'best.ckpt'))
+                print('   new best checkpoint: {} (loss {:.4f})'.format(
+                    checkpoint, valid_loss), flush=True)
     finally:
         writer.close()
 
@@ -139,74 +210,107 @@ def unfold_sar_batch(data, cfg):
     return data_seq.contiguous()
 
 
-def train_step(model, data, target, neg_ratio, criterion, optimizer):
+def detection_metrics(pred_class, target, num_pos):
+    frame_acc = pred_class.eq(target).float().mean().item()
+    detected = (pred_class == 1).any(dim=1) & (pred_class == 2).any(dim=1)
+    pos_acc = detected[:num_pos].float().mean().item()
+    num_neg = pred_class.size(0) - num_pos
+    neg_acc = None
+    if num_neg:
+        neg_acc = (~detected[num_pos:]).float().mean().item()
+    return [frame_acc, pos_acc, neg_acc]
+
+
+def train_step(model, data, target, num_pos, neg_ratio, criterion, optimizer):
     model.train()
-    bs = int(target.size(0)/2)
-    num_pos, num_neg = bs, int(bs*neg_ratio)
-    if num_neg == 0:
-        num_neg = 1
-    data = data[0:num_pos+num_neg]
-    target = target[0:num_pos+num_neg]
+    available_neg = data.size(0) - num_pos
+    num_neg = available_neg
+    if neg_ratio is not None:
+        num_neg = min(available_neg, max(1, int(num_pos * neg_ratio)))
+        data = data[:num_pos + num_neg]
+        target = target[:num_pos + num_neg]
     pred_logits = model(data)
     pred_class = torch.argmax(pred_logits, 2)
     loss = criterion(pred_logits.reshape(-1, 3), target.reshape(-1))
-    acc_list = []
-    for ii in range(2):
-        pred_i = pred_class[ii*bs : (ii+1)*bs]
-        num_pos_pred = sum((pred_i == 1).any(dim=1) * (pred_i == 2).any(dim=1))
-        tar_pos = target[ii*bs : (ii+1)*bs].reshape(-1)
-        acc_frame = pred_i.reshape(-1).eq(tar_pos).sum() / float(tar_pos.size(0))
-        if ii == 0:
-            acc_list += [acc_frame, num_pos_pred/float(num_pos)]
-        if ii == 1:
-            acc_list += [1 - num_pos_pred/float(num_neg)]
+    acc_list = detection_metrics(pred_class, target, num_pos)
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
-    return [acc.item() for acc in acc_list], loss.item()
+    return acc_list, loss.item()
 
 
-def valid_step(model, data, target, criterion):
+def valid_step(model, data, target, num_pos, criterion):
     model.eval()
-    bs = int(target.size(0)/2)
     with torch.no_grad():
         pred_logits = model(data)
         pred_class = torch.argmax(pred_logits, 2)
         loss = criterion(pred_logits.reshape(-1, 3), target.reshape(-1))
-        acc_list = []
-        for ii in range(2):
-            pred_i = pred_class[ii*bs : (ii+1)*bs]
-            num_pos_pred = sum((pred_i == 1).any(dim=1) * (pred_i == 2).any(dim=1))
-            tar_pos = target[ii*bs : (ii+1)*bs].reshape(-1)
-            acc_frame = pred_i.reshape(-1).eq(tar_pos).sum() / float(tar_pos.size(0))
-            if ii == 0:
-                acc_list += [acc_frame, num_pos_pred/float(bs)]
-            if ii == 1:
-                acc_list += [1 - num_pos_pred/float(bs)]
-    return [acc.item() for acc in acc_list], loss.item()
+        acc_list = detection_metrics(pred_class, target, num_pos)
+    return acc_list, loss.item()
 
 
-def _reshape_data_target(data, target):
+def validate_full(model, valid_loader, device, cfg, criterion, positive_only):
+    frame_sum = 0.0
+    pos_sum = 0.0
+    neg_sum = 0.0
+    weighted_loss = 0.0
+    total_samples = 0
+    total_pos = 0
+    total_neg = 0
+    for data, target in valid_loader:
+        data = data.to(device, non_blocking=True).float()
+        target = target.to(device, non_blocking=True).long()
+        if positive_only:
+            num_pos = data.size(0)
+        else:
+            data, target, num_pos = reshape_paired_batch(data, target)
+        data = unfold_sar_batch(data, cfg)
+        acc_list, loss = valid_step(model, data, target, num_pos, criterion)
+        batch_samples = target.size(0)
+        num_neg = batch_samples - num_pos
+        total_samples += batch_samples
+        total_pos += num_pos
+        total_neg += num_neg
+        weighted_loss += loss * batch_samples
+        frame_sum += acc_list[0] * batch_samples
+        pos_sum += acc_list[1] * num_pos
+        if num_neg:
+            neg_sum += acc_list[2] * num_neg
+    if total_samples == 0:
+        raise ValueError('validation set is empty')
+    return (
+        [
+            frame_sum / total_samples,
+            pos_sum / total_pos,
+            None if total_neg == 0 else neg_sum / total_neg,
+        ],
+        weighted_loss / total_samples,
+    )
+
+
+def reshape_paired_batch(data, target):
+    num_pos = data.size(0)
     data = data.transpose(0, 1)
     target = target.transpose(0, 1)
     data = data.reshape(data.size(0)*data.size(1), *data.shape[2:])
     target = target.reshape(target.size(0)*target.size(1), *target.shape[2:])
-    return data, target
+    return data, target, num_pos
 
 
 if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)
     parser = argparse.ArgumentParser()
     parser.add_argument('--gpu_idx', type=int, default=0)
-    parser.add_argument('--num_workers', type=int)
+    parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--prefetch_factor', type=int, default=2)
     parser.add_argument(
         '--chunk_shuffle',
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument('--zarr_path', type=str)
-    parser.add_argument('--ckpt_dir', type=str)
+    parser.add_argument('--zarr_path', type=str, required=True)
+    parser.add_argument('--ckpt_dir', type=str, required=True)
+    parser.add_argument('--positive_only', action='store_true')
     args = parser.parse_args()
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu_idx)

@@ -87,15 +87,15 @@ class ResUNet1D(nn.Module):
 
         self.stage_channels = list(cfg_value('run_stage_channels', [16, 32, 64, 128, 256]))
         self.stage_kernels = list(cfg_value('run_stage_kernels', [9, 9, 7, 5, 3]))
-        self.stage_blocks = list(cfg_value('run_stage_blocks', [2, 2, 2, 2, 2]))
+        self.stage_blocks = list(cfg_value('run_stage_blocks', [1, 1, 1, 1, 1]))
         self.down_channels = list(cfg_value('run_down_channels', [32, 64, 128, 256, 256]))
         self.up_channels = list(cfg_value('run_up_channels', [256, 128, 64, 32, 16]))
         self.decoder_kernels = list(cfg_value('run_decoder_kernels', [3, 5, 7, 9, 9]))
-        self.decoder_blocks = list(cfg_value('run_decoder_blocks', [2, 2, 2, 2, 2]))
+        self.decoder_blocks = list(cfg_value('run_decoder_blocks', [1, 1, 1, 1, 1]))
         self.up_output_padding = list(cfg_value('run_up_output_padding', [0, 0, 0, 1, 1]))
         self.bottleneck_channels = int(cfg_value('run_bottleneck_channels', 256))
         self.bottleneck_kernel = int(cfg_value('run_bottleneck_kernel', 3))
-        self.bottleneck_blocks = int(cfg_value('run_bottleneck_blocks', 2))
+        self.bottleneck_blocks = int(cfg_value('run_bottleneck_blocks', 1))
 
         self.down_kernel = int(cfg_value('run_down_kernel', 5))
         self.down_stride = int(cfg_value('run_down_stride', 2))
@@ -260,10 +260,10 @@ def model_summary():
     return {
         'stage_channels': list(cfg_value('run_stage_channels', [16, 32, 64, 128, 256])),
         'stage_kernels': list(cfg_value('run_stage_kernels', [9, 9, 7, 5, 3])),
-        'stage_blocks': list(cfg_value('run_stage_blocks', [2, 2, 2, 2, 2])),
+        'stage_blocks': list(cfg_value('run_stage_blocks', [1, 1, 1, 1, 1])),
         'down_channels': list(cfg_value('run_down_channels', [32, 64, 128, 256, 256])),
         'up_channels': list(cfg_value('run_up_channels', [256, 128, 64, 32, 16])),
         'decoder_kernels': list(cfg_value('run_decoder_kernels', [3, 5, 7, 9, 9])),
-        'decoder_blocks': list(cfg_value('run_decoder_blocks', [2, 2, 2, 2, 2])),
+        'decoder_blocks': list(cfg_value('run_decoder_blocks', [1, 1, 1, 1, 1])),
         'up_output_padding': list(cfg_value('run_up_output_padding', [0, 0, 0, 1, 1])),
     }

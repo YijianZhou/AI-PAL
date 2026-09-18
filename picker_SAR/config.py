@@ -17,7 +17,7 @@ class Config(AIPALConfig):
   def __init__(self):
     super().__init__()
     # Model structure.
-    self.rnn_hidden_size = 256
+    self.rnn_hidden_size = 128
     self.rnn_num_layers = 2
     self.rnn_step_len = 0.5
     self.rnn_step_stride = 0.1
@@ -27,8 +27,10 @@ class Config(AIPALConfig):
     # Training.
     self.num_epochs = 20
     self.batch_size = 128
+    self.neg_reduction_ratio = 1.0
     self.lr = 1e-4
-    self.ckpt_step = 500
+    self.valid_step = 5000
+    self.max_checkpoints = 20
     self.summary_step = 100
 
     # Continuous inference.

@@ -13,6 +13,7 @@ from association_runner import (
     associate_subnet_picks,
     buffered_pick_interval_arrays,
     get_association_buffer_sec,
+    load_station_geometry,
     merge_buffered_interval_candidates,
     merge_canonical_interval,
     parse_date_range,
@@ -21,6 +22,7 @@ from association_runner import (
 )
 from offline_picker_runner import run_offline_picker_ensemble
 from phase_merge import read_phase_file
+import runtime_console
 
 
 def _range_text(start, end):
@@ -59,6 +61,9 @@ class RollingHourlyAssociator(object):
         self.target_start, self.target_end = parse_date_range(target_time_range)
         self.num_hour_workers = max(1, int(num_workers))
         self.buffer_seconds = get_association_buffer_sec(cfg)
+        self.day_shift_seconds = float(getattr(cfg, "data_buffer_sec", 0.0))
+        if self.day_shift_seconds < 0:
+            raise ValueError("data_buffer_sec must be nonnegative")
         self.interval_seconds = float(
             getattr(cfg, "association_interval_sec", 3600.0)
         )
@@ -101,14 +106,19 @@ class RollingHourlyAssociator(object):
         return self.target_start <= observed_date < self.target_end
 
     def _intervals(self, observed_date):
-        day_start = utc_day(observed_date)
+        day_start = utc_day(observed_date) - self.day_shift_seconds
         for index in range(self.intervals_per_day):
             start = day_start + index * self.interval_seconds
             yield start, start + self.interval_seconds
 
     def _required_dates(self, interval_start, interval_end):
-        first = (interval_start - self.buffer_seconds).date
-        last = (interval_end + self.buffer_seconds - 1.0e-6).date
+        first = (
+            interval_start - self.buffer_seconds + self.day_shift_seconds
+        ).date
+        last = (
+            interval_end + self.buffer_seconds + self.day_shift_seconds
+            - 1.0e-6
+        ).date
         dates = []
         value = first
         while value <= last:
@@ -143,7 +153,7 @@ class RollingHourlyAssociator(object):
             subnet, interval_start, interval_end
         )
         summary = associate_subnet_picks(
-            interval_start.date,
+            (interval_start + self.day_shift_seconds).date,
             subnet,
             self.subnet_station_files[subnet],
             buffered_picks,
@@ -267,13 +277,13 @@ class RollingHourlyAssociator(object):
                 final_event_count = post_merge.get(
                     "num_merged_events", final_event_count
                 )
-        print(
-            "hourly association complete: {} -- {} | {} events".format(
+        runtime_console.log(
+            "hour",
+            "{} -- {} | {} final events".format(
                 interval_start,
                 interval_end,
                 final_event_count,
             ),
-            flush=True,
         )
 
     def _day_is_complete(self, observed_date):
@@ -316,13 +326,20 @@ class RollingHourlyAssociator(object):
             "association_rate_" + observed_date.isoformat() + ".csv"
         )
         write_association_rate_from_picks(
-            observed_date, picks, phase_paths, rate_path
+            observed_date, picks, phase_paths, rate_path,
+            interval_start=utc_day(observed_date) - self.day_shift_seconds,
+            interval_end=(
+                utc_day(observed_date) + 86400 - self.day_shift_seconds
+            ),
         )
         self.rate_dates.add(observed_date)
         self.completed_dates.add(observed_date)
-        print("finalized {} from {} hourly intervals".format(
-            observed_date, len(intervals)
-        ), flush=True)
+        runtime_console.log(
+            "day",
+            "day={} | {} hourly intervals finalized".format(
+                observed_date, len(intervals)
+            ),
+        )
 
     def _process_ready_intervals(self, observed_date):
         candidate_dates = [observed_date - timedelta(days=1), observed_date]
@@ -369,7 +386,9 @@ class RollingHourlyAssociator(object):
                 self._finalize_day(candidate_date)
 
     def _retain_only_final_hour(self, observed_date):
-        day_end = utc_day(observed_date) + 86400
+        day_end = (
+            utc_day(observed_date) + 86400 - self.day_shift_seconds
+        )
         keep_start = day_end - self.interval_seconds
         keep_end = day_end + self.buffer_seconds
         waveforms = self.waveform_cache.get(observed_date, {})
@@ -432,11 +451,19 @@ def run_offline_pick_assoc(
     subnet_station_files, target_time_range, individual_pick_root,
     ensemble_pick_dir, assoc_root, final_root, output_catalog, output_phase,
     num_pick_workers=1, num_assoc_workers=1,
-    station_complete_callback=None, hour_complete_callback=None,
+    station_complete_callback=None, day_complete_callback=None,
+    hour_complete_callback=None,
     repicker_pos_neg_specs=None, repicker_pos_specs=None,
     overwrite_picks=False,
 ):
     """Load models once, pick buffered days, and finalize buffered hours."""
+    runtime_console.configure(cfg)
+    runtime_console.log(
+        "AI-PAL",
+        "combined local workflow | target={} | workers={}".format(
+            target_time_range, max(1, int(num_pick_workers))
+        ),
+    )
     target_start, target_end = parse_date_range(target_time_range)
     pick_time_range = _range_text(
         target_start - timedelta(days=1), target_end + timedelta(days=1)
@@ -454,6 +481,9 @@ def run_offline_pick_assoc(
             cfg,
             repicker_pos_neg_specs,
             full_station_file,
+            station_dict=load_station_geometry(
+                cfg, full_station_file, target_start
+            ),
             repicker_pos_specs=repicker_pos_specs,
         )
 
@@ -462,6 +492,12 @@ def run_offline_pick_assoc(
                 interval_start, interval_end, phase_path, catalog_path,
                 waveform_context, _summary,
             ) = args
+            owner_date = (
+                interval_start + float(getattr(cfg, "data_buffer_sec", 0.0))
+            ).date
+            event_repicker.set_station_geometry(load_station_geometry(
+                cfg, full_station_file, owner_date
+            ))
             initial_qc = event_repicker.qc_initial_events(
                 phase_path, waveform_context, catalog_path
             )
@@ -557,6 +593,7 @@ def run_offline_pick_assoc(
         ensemble_pick_dir=ensemble_pick_dir,
         num_workers=num_pick_workers,
         station_complete_callback=station_complete_callback,
+        day_complete_callback=day_complete_callback,
         day_waveforms_complete_callback=rolling.accept_day,
         pickers_loaded_callback=(
             event_repicker.bind_continuous_pickers
@@ -567,4 +604,10 @@ def run_offline_pick_assoc(
     rolling.finish(output_catalog, output_phase)
     if bool(getattr(cfg, "enable_post_process", False)):
         event_repicker.close()
+    runtime_console.log(
+        "output",
+        "combined workflow complete | catalog={} | phase={}".format(
+            output_catalog, output_phase
+        ),
+    )
     return summaries

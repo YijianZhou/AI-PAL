@@ -55,8 +55,17 @@ class RUN_Picker(object):
         ckpt_path = ckpt_dir
     else:
         if int(ckpt_idx)==-1:
-            ckpt_idx = max([int(os.path.basename(ckpt).split('_')[0]) for ckpt in glob.glob(os.path.join(ckpt_dir, '*.ckpt'))])
-        ckpt_path = sorted(glob.glob(os.path.join(ckpt_dir, '%s_*.ckpt'%ckpt_idx)))[0]
+            best_path = os.path.join(ckpt_dir, 'best.ckpt')
+            if os.path.isfile(best_path):
+                ckpt_path = best_path
+            else:
+                numbered = glob.glob(os.path.join(ckpt_dir, '[0-9]*_*.ckpt'))
+                if not numbered:
+                    raise FileNotFoundError('No .ckpt files found in {}'.format(ckpt_dir))
+                ckpt_idx = max(int(os.path.basename(path).split('_')[0]) for path in numbered)
+                ckpt_path = sorted(glob.glob(os.path.join(ckpt_dir, '%s_*.ckpt'%ckpt_idx)))[0]
+        else:
+            ckpt_path = sorted(glob.glob(os.path.join(ckpt_dir, '%s_*.ckpt'%ckpt_idx)))[0]
     print('RUN checkpoint: %s'%ckpt_path)
     # load model
     gpu_idx = int(gpu_idx)

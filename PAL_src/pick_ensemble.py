@@ -55,6 +55,75 @@ def merge_picker_cluster_sizes(values):
             merged[name] = max(merged.get(name, 0), count)
     return merged
 
+
+def parse_picker_window_vote_ratios(value):
+    """Return ``GROUP:MODEL:ratio`` provenance as a normalized dictionary."""
+    if isinstance(value, dict):
+        items = value.items()
+    else:
+        items = []
+        for token in str(value or "").split("|"):
+            if not token or ":" not in token:
+                continue
+            name, ratio = token.rsplit(":", 1)
+            items.append((name, ratio))
+    parsed = {}
+    for name, ratio in items:
+        name = str(name).strip()
+        if not name:
+            continue
+        try:
+            ratio = float(ratio)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(ratio) and ratio >= 0.0:
+            parsed[name] = max(parsed.get(name, 0.0), min(ratio, 1.0))
+    return parsed
+
+
+def format_picker_window_vote_ratios(value):
+    """Serialize per-model randomized-window support ratios."""
+    values = parse_picker_window_vote_ratios(value)
+    names = sorted(values, key=lambda name: (
+        _PICKER_ORDER.get(name.rsplit(":", 1)[-1], 1000), name,
+    ))
+    return "|".join("{}:{:.4f}".format(name, values[name]) for name in names)
+
+
+def merge_picker_window_vote_ratios(values):
+    """Merge duplicate ratio provenance without double-counting copies."""
+    merged = {}
+    for value in values:
+        for name, ratio in parse_picker_window_vote_ratios(value).items():
+            merged[name] = max(merged.get(name, 0.0), ratio)
+    return merged
+
+
+def repick_quality_code(provenance, vote_ratios, cfg=None):
+    """Map dual-group provenance and model vote ratios to quality 0-3."""
+    both_code = getattr(cfg, "pick_quality_both_groups_code", 0)
+    threshold = getattr(cfg, "pick_quality_strong_vote_ratio", 0.5)
+    code1_min = getattr(cfg, "pick_quality_code1_min_pickers", 2)
+    code2_min = getattr(cfg, "pick_quality_code2_min_pickers", 1)
+    if isinstance(both_code, bool) or both_code not in (0, 1, 2, 3):
+        raise ValueError("pick_quality_both_groups_code must be 0, 1, 2, or 3")
+    if not isinstance(threshold, (int, float)) or not math.isfinite(threshold) or not 0 <= threshold <= 1:
+        raise ValueError("pick_quality_strong_vote_ratio must be between 0 and 1")
+    if any(isinstance(value, bool) or not isinstance(value, int)
+           for value in (code1_min, code2_min)) or not code1_min > code2_min >= 1:
+        raise ValueError("pick quality counts must satisfy code1_min > code2_min >= 1")
+    if str(provenance).strip().lower() == "both_groups":
+        return int(both_code)
+    strong_pickers = sum(
+        ratio > threshold
+        for ratio in parse_picker_window_vote_ratios(vote_ratios).values()
+    )
+    if strong_pickers >= code1_min:
+        return 1
+    if strong_pickers >= code2_min:
+        return 2
+    return 3
+
 def to_epoch(value):
     """Convert UTCDateTime, datetime, numeric, or ISO text to Unix seconds."""
     if isinstance(value, datetime):

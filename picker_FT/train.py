@@ -12,11 +12,31 @@ import torch
 import torch.nn.functional as F
 import torch.multiprocessing as mp
 from tensorboardX import SummaryWriter
+from training_monitor import TrainingMonitor
+from torch_backends import configure_torch_backends
+
 from torch.utils.data import DataLoader, Sampler
 
 import config
 from dataset import Positive_Negative, PositiveOnly
 from models import FrameTransformerPicker, count_trainable_parameters
+
+
+# Also runs when spawned DataLoader workers import this module.
+configure_torch_backends(config.Config())
+
+
+def prune_numbered_checkpoints(ckpt_dir, keep):
+    keep = int(keep)
+    if keep < 1:
+        raise ValueError('max_checkpoints must be at least 1')
+    checkpoints = []
+    for name in os.listdir(ckpt_dir):
+        step = name.split('_', 1)[0]
+        if step.isdigit() and name.endswith('.ckpt'):
+            checkpoints.append((int(step), name))
+    for _, name in sorted(checkpoints)[:-keep]:
+        os.remove(os.path.join(ckpt_dir, name))
 
 
 class ChunkBatchSampler(Sampler):
@@ -65,14 +85,6 @@ def make_loader(dataset, batch_size, shuffle, args):
             **kwargs
         )
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, **kwargs)
-
-
-def next_valid_batch(valid_loader, valid_iter):
-    try:
-        return next(valid_iter), valid_iter
-    except StopIteration:
-        valid_iter = iter(valid_loader)
-        return next(valid_iter), valid_iter
 
 
 def build_optimizer(model, cfg):
@@ -211,16 +223,24 @@ def main(args):
     valid_set = dataset_class(args.zarr_path, 'valid')
     train_loader = make_loader(train_set, cfg.batch_size, True, args)
     valid_loader = make_loader(valid_set, cfg.batch_size, False, args)
-    valid_iter = iter(valid_loader)
-    neg_ratio = None if args.positive_only else train_set.neg_ratio
+    stored_neg_ratio = None if args.positive_only else train_set.neg_ratio
+    neg_reduction_ratio = float(getattr(cfg, 'neg_reduction_ratio', 1.0))
+    if not 0.0 < neg_reduction_ratio <= 1.0:
+        raise ValueError('neg_reduction_ratio must be in (0, 1]')
+    neg_ratio = (
+        None if stored_neg_ratio is None
+        else stored_neg_ratio * neg_reduction_ratio
+    )
     if neg_ratio is not None:
         effective_neg = min(
             int(cfg.batch_size), max(1, int(cfg.batch_size * neg_ratio))
         )
         print(
             'training mix: {} positive + {} negative windows/batch | '
-            'stored neg/pos {:.3f} | Zarr chunk {}'.format(
-                cfg.batch_size, effective_neg, neg_ratio, train_set.chunk_size()
+            'stored neg/pos {:.3f} | reduction {:.3f} | effective neg/pos {:.3f} | '
+            'Zarr chunk {}'.format(
+                cfg.batch_size, effective_neg, stored_neg_ratio,
+                neg_reduction_ratio, neg_ratio, train_set.chunk_size()
             ),
             flush=True,
         )
@@ -248,7 +268,10 @@ def main(args):
     ), flush=True)
     grad_clip_norm = float(cfg.grad_clip_norm)
     writer = SummaryWriter(log_dir=args.ckpt_dir)
+    monitor = TrainingMonitor(args.ckpt_dir, 'FT')
     start_time = time.time()
+    best_valid_loss = float('inf')
+    max_checkpoints = int(getattr(cfg, 'max_checkpoints', 20))
 
     try:
         for epoch_idx in range(int(cfg.num_epochs)):
@@ -279,96 +302,123 @@ def main(args):
                     neg_ratio=neg_ratio,
                 )
 
-                if global_step % int(cfg.ckpt_step) == 0:
-                    checkpoint = os.path.join(
-                        args.ckpt_dir,
-                        '{}_{}-{}.ckpt'.format(global_step, epoch_idx, iter_idx),
+                if global_step % int(cfg.summary_step) == 0:
+                    print(
+                        'step {} ({}/{}) | lr {:.2e} | train loss {:.4f} | {:.2f}s'.format(
+                            global_step, iter_idx, epoch_idx, learning_rate,
+                            train_loss, time.time() - start_time,
+                        ),
+                        flush=True,
                     )
-                    torch.save(model.state_dict(), checkpoint)
-                if global_step % int(cfg.summary_step) != 0:
+                    metric_text = '   frame acc. {:.2f}% | pos acc. {:.2f}%'.format(
+                        100 * train_frame_acc, 100 * train_pos_acc
+                    )
+                    if not args.positive_only:
+                        metric_text += ' | neg acc. {:.2f}%'.format(100 * train_neg_acc)
+                    print(metric_text, flush=True)
+                    writer.add_scalar('loss/train_loss', train_loss, global_step)
+                    writer.add_scalar('frame_acc/train_frame_acc', 100 * train_frame_acc, global_step)
+                    writer.add_scalar('pos_acc/train_pos_acc', 100 * train_pos_acc, global_step)
+                    if not args.positive_only:
+                        writer.add_scalar('neg_acc/train_neg_acc', 100 * train_neg_acc, global_step)
+                    writer.add_scalar('learning_rate', learning_rate, global_step)
+                    monitor.update(global_step, {
+                        'loss/train_loss': train_loss,
+                        'frame_acc/train_frame_acc': 100 * train_frame_acc,
+                        'pos_acc/train_pos_acc': 100 * train_pos_acc,
+                        'neg_acc/train_neg_acc': (
+                            None if args.positive_only else 100 * train_neg_acc
+                        ),
+                        'learning_rate': learning_rate,
+                    })
+                if global_step % int(cfg.valid_step) != 0:
                     continue
 
-                (valid_data, valid_target), valid_iter = next_valid_batch(valid_loader, valid_iter)
-                valid_data = valid_data.to(device, non_blocking=True).float()
-                valid_target = valid_target.to(device, non_blocking=True).long()
-                if args.positive_only:
-                    valid_num_pos = valid_data.size(0)
-                else:
-                    valid_data, valid_target, valid_num_pos = reshape_paired_batch(
-                        valid_data, valid_target
-                    )
-                valid_frame_acc, valid_pos_acc, valid_neg_acc, valid_loss = run_step(
-                    model,
-                    valid_data,
-                    valid_target,
-                    optimizer,
-                    scaler,
-                    device,
-                    amp_enabled,
-                    amp_dtype,
-                    grad_clip_norm,
-                    training=False,
-                    num_pos=valid_num_pos,
-                    neg_ratio=1.0,
+                valid_frame_acc, valid_pos_acc, valid_neg_acc, valid_loss = validate_full(
+                    model, valid_loader, optimizer, scaler, device,
+                    amp_enabled, amp_dtype, grad_clip_norm, args.positive_only,
                 )
                 print(
-                    'step {} ({}/{}) | lr {:.2e} | train loss {:.4f} | '
-                    'valid loss {:.4f} | {:.2f}s'.format(
-                        global_step,
-                        iter_idx,
-                        epoch_idx,
-                        learning_rate,
-                        train_loss,
-                        valid_loss,
-                        time.time() - start_time,
+                    'validation step {} | full-set loss {:.4f}'.format(
+                        global_step, valid_loss
                     ),
                     flush=True,
                 )
-                metric_text = (
-                    '   frame acc. {:.2f}% {:.2f}% | pos acc. {:.2f}% {:.2f}%'
-                    .format(
-                        100 * train_frame_acc, 100 * valid_frame_acc,
-                        100 * train_pos_acc, 100 * valid_pos_acc,
-                    )
+                metric_text = '   frame acc. {:.2f}% | pos acc. {:.2f}%'.format(
+                    100 * valid_frame_acc, 100 * valid_pos_acc
                 )
                 if not args.positive_only:
-                    metric_text += ' | neg acc. {:.2f}% {:.2f}%'.format(
-                        100 * train_neg_acc, 100 * valid_neg_acc
-                    )
+                    metric_text += ' | neg acc. {:.2f}%'.format(100 * valid_neg_acc)
                 print(metric_text, flush=True)
-                writer.add_scalars(
-                    'loss',
-                    {'train_loss': train_loss, 'valid_loss': valid_loss},
-                    global_step,
-                )
-                writer.add_scalars(
-                    'frame_acc',
-                    {
-                        'train_frame_acc': 100 * train_frame_acc,
-                        'valid_frame_acc': 100 * valid_frame_acc,
-                    },
-                    global_step,
-                )
-                writer.add_scalars(
-                    'pos_acc',
-                    {
-                        'train_pos_acc': 100 * train_pos_acc,
-                        'valid_pos_acc': 100 * valid_pos_acc,
-                    },
-                    global_step,
-                )
+                writer.add_scalar('loss/valid_loss', valid_loss, global_step)
+                writer.add_scalar('frame_acc/valid_frame_acc', 100 * valid_frame_acc, global_step)
+                writer.add_scalar('pos_acc/valid_pos_acc', 100 * valid_pos_acc, global_step)
                 if not args.positive_only:
-                    writer.add_scalars(
-                        'neg_acc',
-                        {
-                            'train_neg_acc': 100 * train_neg_acc,
-                            'valid_neg_acc': 100 * valid_neg_acc,
-                        },
-                        global_step,
-                    )
-                writer.add_scalar('learning_rate', learning_rate, global_step)
+                    writer.add_scalar('neg_acc/valid_neg_acc', 100 * valid_neg_acc, global_step)
+                monitor.update(global_step, {
+                    'loss/valid_loss': valid_loss,
+                    'frame_acc/valid_frame_acc': 100 * valid_frame_acc,
+                    'pos_acc/valid_pos_acc': 100 * valid_pos_acc,
+                    'neg_acc/valid_neg_acc': (
+                        None if args.positive_only else 100 * valid_neg_acc
+                    ),
+                })
+                checkpoint = os.path.join(
+                    args.ckpt_dir,
+                    '{}_{}-{}.ckpt'.format(global_step, epoch_idx, iter_idx),
+                )
+                torch.save(model.state_dict(), checkpoint)
+                prune_numbered_checkpoints(args.ckpt_dir, max_checkpoints)
+                if valid_loss < best_valid_loss:
+                    best_valid_loss = valid_loss
+                    torch.save(model.state_dict(), os.path.join(args.ckpt_dir, 'best.ckpt'))
+                    print('   new best checkpoint: {} (loss {:.4f})'.format(
+                        checkpoint, valid_loss), flush=True)
     finally:
         writer.close()
+
+
+def validate_full(
+    model, valid_loader, optimizer, scaler, device, amp_enabled, amp_dtype,
+    grad_clip_norm, positive_only,
+):
+    frame_sum = 0.0
+    pos_sum = 0.0
+    neg_sum = 0.0
+    loss_sum = 0.0
+    total_samples = 0
+    total_pos = 0
+    total_neg = 0
+    for data, target in valid_loader:
+        data = data.to(device, non_blocking=True).float()
+        target = target.to(device, non_blocking=True).long()
+        if positive_only:
+            num_pos = data.size(0)
+        else:
+            data, target, num_pos = reshape_paired_batch(data, target)
+        num_neg = data.size(0) - num_pos
+        frame_acc, pos_acc, neg_acc, loss = run_step(
+            model, data, target, optimizer, scaler, device, amp_enabled,
+            amp_dtype, grad_clip_norm, training=False, num_pos=num_pos,
+            neg_ratio=1.0,
+        )
+        batch_samples = data.size(0)
+        total_samples += batch_samples
+        total_pos += num_pos
+        total_neg += num_neg
+        loss_sum += loss * batch_samples
+        frame_sum += frame_acc * num_pos
+        pos_sum += pos_acc * num_pos
+        if num_neg:
+            neg_sum += neg_acc * num_neg
+    if total_samples == 0:
+        raise ValueError('validation set is empty')
+    return (
+        frame_sum / total_pos,
+        pos_sum / total_pos,
+        None if total_neg == 0 else neg_sum / total_neg,
+        loss_sum / total_samples,
+    )
 
 
 if __name__ == '__main__':

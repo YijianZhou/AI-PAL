@@ -151,8 +151,6 @@ def preprocess(stream, sample_rate, freq_band, max_gap=5.0):
 def get_phase_target(tp, ts):
     target_seq = np.zeros([3, win_len], dtype=np.float32)
     target_seq[0, :] = 1.
-    if tp < 0 or ts < 0:
-        return target_seq
     half_wid = label_wid // 2
     pick_lab = np.exp(-((np.arange(-half_wid, half_wid + 1))**2) / (2*(label_wid/5)**2)).astype(np.float32)
 
@@ -168,8 +166,10 @@ def get_phase_target(tp, ts):
         src1 = src0 + (out1 - out0)
         target_seq[phase_idx, out0:out1] = pick_lab[src0:src1]
 
-    put_pick(1, tp)
-    put_pick(2, ts)
+    if tp >= 0:
+        put_pick(1, tp)
+    if ts >= 0:
+        put_pick(2, ts)
     target_seq[0, :] = np.maximum(0., 1. - target_seq[1, :] - target_seq[2, :])
     return target_seq
 
@@ -198,4 +198,3 @@ class NpyWindowShards(Dataset):
         for ii in range(count):
             target[ii] = get_phase_target(float(tp[ii]), float(ts[ii]))
         return data, target
-

@@ -5,8 +5,9 @@ import ctypes
 import gc
 import importlib
 import importlib.util
+import inspect
+import json
 from pathlib import Path
-import shutil
 import sys
 import tempfile
 from threading import Lock
@@ -15,9 +16,15 @@ import torch
 from obspy import UTCDateTime
 
 from pick_ensemble import (
-    format_pick_row, merge_picker_pick_files, read_pick_file,
+    format_pick_row, merge_picker_pick_files,
 )
 from picker_stream import PreparedPickerStream, configure_torch_backends
+import runtime_console
+from rolling_waveform import (
+    merge_cached_tail as _merge_cached_tail,
+    processing_bounds as _processing_bounds,
+    raw_tail as _raw_tail,
+)
 
 
 NATIVE_PICKER_REGISTRY = {
@@ -26,6 +33,7 @@ NATIVE_PICKER_REGISTRY = {
     "PHN": ("picker_PHN", "PHN_Picker"),
     "RUN": ("picker_RUN", "RUN_Picker"),
 }
+PICK_OWNERSHIP_VERSION = 1
 
 
 def _trim_cpu_allocator():
@@ -64,13 +72,13 @@ def _validate_inputs(ai_pal_root, picker_specs, data_dir, station_file):
         ):
             if not required_path.exists():
                 raise FileNotFoundError(required_path)
-        checkpoint = Path(spec.get("ckpt", spec.get("ckpt_dir", "")))
-        if checkpoint.is_dir() and any(checkpoint.glob("*.ckpt")):
-            continue
+        if not spec.get("ckpt"):
+            raise ValueError("{} requires an explicit ckpt file path, not ckpt_dir".format(runtime_name))
+        checkpoint = Path(spec["ckpt"])
         if checkpoint.is_file():
             continue
         raise FileNotFoundError(
-            "{} checkpoint file/directory was not found or is empty: {}"
+            "{} checkpoint must be an existing file: {}"
             .format(runtime_name, checkpoint)
         )
 
@@ -165,10 +173,10 @@ def _load_pickers(ai_pal_root, picker_specs):
         )
         print("loading {} on {} from {}".format(
             runtime_name, device,
-            spec.get("ckpt", spec.get("ckpt_dir")),
+            spec["ckpt"],
         ), flush=True)
         pickers[runtime_name] = picker_class(
-            str(spec.get("ckpt", spec.get("ckpt_dir"))),
+            str(spec["ckpt"]),
             -1,
             spec["gpu_idx"],
         )
@@ -183,6 +191,13 @@ def _group_by_device(pickers):
         device: [name for name, _ in members]
         for device, members in groups.items()
     }), flush=True)
+    runtime_console.log(
+        "startup",
+        "picker devices={}".format({
+            device: [name for name, _ in members]
+            for device, members in groups.items()
+        }),
+    )
     return groups
 
 
@@ -206,35 +221,59 @@ def _run_device_group(
     return results
 
 
+def _read_current_station_stream(
+    net_sta, data_paths, cfg, stations, start_time, end_time,
+):
+    normalize_to_three_channels = getattr(
+        cfg, "normalize_to_three_channels", True
+    )
+    return cfg.read_data(
+        data_paths,
+        stations,
+        start_time=start_time,
+        end_time=end_time,
+        normalize_to_three_channels=normalize_to_three_channels,
+        to_prep=bool(getattr(cfg, "to_prep", True)),
+        location_priority=getattr(
+            cfg, "location_priority", ("10", "20", "01", "02", "00", "")
+        ),
+        channel_priority=getattr(
+            cfg, "channel_priority", ("HH", "BH", "EH", "HN", "EN", "SH")
+        ),
+    )
+
+
 def _prepare_and_pick_station(
     net_sta, data_paths, cfg, pickers, device_groups, device_locks,
     stations, day_start, day_end, buffer_sec, station_complete_callback=None,
-    retain_waveform=False,
+    retain_waveform=False, previous_raw_tail=None,
 ):
     print("-" * 60)
     print("reading and preprocessing {} {} once".format(
         net_sta, day_start.date
     ))
-    normalize_to_three_channels = getattr(
-        cfg, "normalize_to_three_channels", True
+    current = _read_current_station_stream(
+        net_sta, data_paths, cfg, stations, day_start, day_end
     )
-    stream = cfg.read_data(
-        data_paths,
-        stations,
-        start_time=day_start - buffer_sec,
-        end_time=day_end + buffer_sec,
-        normalize_to_three_channels=normalize_to_three_channels,
+    next_raw_tail = _raw_tail(current, day_end, buffer_sec)
+    stream = _merge_cached_tail(
+        current,
+        previous_raw_tail,
+        day_start - 2.0 * buffer_sec,
+        day_end,
     )
+    current = None
     prepared = PreparedPickerStream.from_raw_stream(stream, cfg)
     # Preprocessing has transferred the usable arrays into `prepared`.
     # Do not keep the original read stream alive during model inference.
     stream = None
     if prepared is None:
         print("skip {}: unusable waveform after preprocessing".format(net_sta))
-        return net_sta, {}, None
+        return net_sta, {}, None, next_raw_tail
 
     try:
         station_results = {}
+        pick_start, pick_end = _processing_bounds(day_start, buffer_sec)
         if device_groups:
             with ThreadPoolExecutor(max_workers=len(device_groups)) as executor:
                 futures = [
@@ -243,8 +282,8 @@ def _prepare_and_pick_station(
                         members,
                         prepared,
                         device_locks[device],
-                        day_start,
-                        day_end,
+                        pick_start,
+                        pick_end,
                         retain_waveform,
                     )
                     for device, members in device_groups.items()
@@ -256,7 +295,7 @@ def _prepare_and_pick_station(
                 day_start, net_sta, prepared, station_results
             )
         retained = prepared.retained_waveform() if retain_waveform else None
-        return net_sta, station_results, retained
+        return net_sta, station_results, retained, next_raw_tail
     finally:
         # Pick-only runs release the station-day stream and every device copy
         # here. Combined runs transfer the filtered stream to `retained` first.
@@ -266,17 +305,17 @@ def _prepare_and_pick_station(
 def _pick_one_day(
     date, cfg, pickers, device_groups, device_locks, data_dir, stations,
     pick_dirs, num_workers, station_complete_callback=None,
-    retain_waveforms=False,
+    retain_waveforms=False, previous_raw_tails=None,
 ):
     buffer_sec = float(cfg.data_buffer_sec)
     day_start, day_end = date, date + 86400
     normalize_to_three_channels = getattr(cfg, "normalize_to_three_channels", True)
-    data_dict = cfg.get_buffered_data_dict(
+    data_dict = cfg.get_data_dict(
         date,
         str(data_dir),
-        buffer_sec,
         normalize_to_three_channels=normalize_to_three_channels,
     )
+    previous_raw_tails = previous_raw_tails or {}
     pick_paths = {
         name: pick_dirs[name] / "{}.pick".format(date.date)
         for name in pickers
@@ -302,6 +341,7 @@ def _pick_one_day(
                 stations, day_start, day_end, buffer_sec,
                 station_complete_callback,
                 retain_waveforms,
+                previous_raw_tails.get(item[0]),
             )
 
         if num_workers > 1:
@@ -313,12 +353,15 @@ def _pick_one_day(
 
         try:
             retained_waveforms = {}
-            for net_sta, station_results, retained in result_iter:
+            next_raw_tails = {}
+            for net_sta, station_results, retained, next_raw_tail in result_iter:
                 for name, picks in station_results.items():
                     for pick in picks:
                         outputs[name].write(format_pick_row(pick))
                 if retained is not None:
                     retained_waveforms[net_sta] = retained
+                if next_raw_tail:
+                    next_raw_tails[net_sta] = next_raw_tail
         finally:
             if executor is not None:
                 executor.shutdown()
@@ -333,7 +376,11 @@ def _pick_one_day(
             output.close()
         for name, path in pick_paths.items():
             partial_paths[name].replace(path)
-    return pick_paths, retained_waveforms if retain_waveforms else None
+    return (
+        pick_paths,
+        retained_waveforms if retain_waveforms else None,
+        next_raw_tails,
+    )
 
 
 def _date_list(time_range):
@@ -344,16 +391,26 @@ def _date_list(time_range):
     ]
 
 
+def _load_station_selectors(cfg, station_file, dates):
+    """Load static station metadata or the union of date-aware epochs."""
+    get_sta_dict = cfg.get_sta_dict
+    if len(inspect.signature(get_sta_dict).parameters) < 2:
+        return get_sta_dict(str(station_file))
+    stations = {}
+    for date in dates:
+        stations.update(get_sta_dict(str(station_file), date))
+    return stations
+
+
 def _prepare_day_waveforms(
-    date, cfg, data_dir, stations, num_workers,
+    date, cfg, data_dir, stations, num_workers, previous_raw_tails,
 ):
     """Rebuild filtered context for downstream repicking without inference."""
     buffer_sec = float(cfg.data_buffer_sec)
     day_start, day_end = date, date + 86400
-    data_dict = cfg.get_buffered_data_dict(
+    data_dict = cfg.get_data_dict(
         date,
         str(data_dir),
-        buffer_sec,
         normalize_to_three_channels=bool(getattr(
             cfg, "normalize_to_three_channels", True
         )),
@@ -368,6 +425,7 @@ def _prepare_day_waveforms(
         return _prepare_and_pick_station(
             item[0], item[1], cfg, {}, {}, {}, stations,
             day_start, day_end, buffer_sec, retain_waveform=True,
+            previous_raw_tail=previous_raw_tails.get(item[0]),
         )
 
     if num_workers > 1 and len(station_items) > 1:
@@ -375,18 +433,64 @@ def _prepare_day_waveforms(
             max_workers=min(num_workers, len(station_items))
         ) as executor:
             results = executor.map(process, station_items)
-            retained = {
-                net_sta: waveform
-                for net_sta, _, waveform in results
-                if waveform is not None
-            }
+            retained = {}
+            next_raw_tails = {}
+            for net_sta, _, waveform, next_raw_tail in results:
+                if waveform is not None:
+                    retained[net_sta] = waveform
+                if next_raw_tail:
+                    next_raw_tails[net_sta] = next_raw_tail
     else:
         retained = {}
+        next_raw_tails = {}
         for item in station_items:
-            net_sta, _, waveform = process(item)
+            net_sta, _, waveform, next_raw_tail = process(item)
             if waveform is not None:
                 retained[net_sta] = waveform
-    return retained
+            if next_raw_tail:
+                next_raw_tails[net_sta] = next_raw_tail
+    return retained, next_raw_tails
+
+
+def _load_raw_tail_cache(date, cfg, data_dir, stations, num_workers):
+    """Load only one day's final raw tail, used to seed or advance a resumed run."""
+    buffer_sec = float(cfg.data_buffer_sec)
+    if buffer_sec <= 0:
+        return {}
+    day_end = date + 86400
+    data_dict = cfg.get_data_dict(
+        date,
+        str(data_dir),
+        normalize_to_three_channels=bool(getattr(
+            cfg, "normalize_to_three_channels", True
+        )),
+    )
+    station_items = [
+        (net_sta, data_paths)
+        for net_sta, data_paths in sorted(data_dict.items())
+        if net_sta in stations
+    ]
+
+    def process(item):
+        stream = _read_current_station_stream(
+            item[0], item[1], cfg, stations,
+            day_end - 2.0 * buffer_sec, day_end,
+        )
+        return item[0], _raw_tail(stream, day_end, buffer_sec)
+
+    if num_workers > 1 and len(station_items) > 1:
+        with ThreadPoolExecutor(
+            max_workers=min(num_workers, len(station_items))
+        ) as executor:
+            results = executor.map(process, station_items)
+            return {
+                net_sta: tail for net_sta, tail in results if tail
+            }
+    return {
+        net_sta: tail
+        for net_sta, tail in map(process, station_items)
+        if tail
+    }
 
 
 def _existing_pick_summary(path):
@@ -400,40 +504,36 @@ def _existing_pick_summary(path):
     }
 
 
-def _merge_grouped_picker_file(
-    pick_dirs, picker_groups, group_support, group_root, ensemble_path,
-    filename, tp_dev, ts_dev,
-):
-    """Apply per-group consensus, then merge accepted groups equally."""
-    group_files = {}
-    for group_name, members in picker_groups.items():
-        group_path = Path(group_root) / group_name / filename
-        merge_picker_pick_files(
-            {name: pick_dirs[name] / filename for name in members},
-            group_path,
-            tp_dev,
-            ts_dev,
-            min_support=group_support[group_name],
+def _ownership_path(ensemble_path):
+    return Path(str(ensemble_path) + ".ownership.json")
+
+
+def _has_current_ownership(ensemble_path, buffer_sec):
+    path = _ownership_path(ensemble_path)
+    if not path.exists():
+        return False
+    try:
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+        return (
+            int(metadata.get("version", -1)) == PICK_OWNERSHIP_VERSION
+            and float(metadata.get("data_buffer_sec")) == float(buffer_sec)
+            and metadata.get("interval")
+            == "[D-data_buffer_sec,D+1day-data_buffer_sec)"
         )
-        group_files[group_name] = group_path
-    summary = merge_picker_pick_files(
-        group_files,
-        ensemble_path,
-        tp_dev,
-        ts_dev,
-        min_support=1,
-    )
-    # Group names are voting identities, while model names are the useful
-    # provenance exposed to association and phase products.
-    records = read_pick_file(ensemble_path)
-    partial = Path(str(ensemble_path) + ".partial")
-    with partial.open("w", encoding="utf-8") as fp:
-        for record in records:
-            record["sources"] = sorted(record["picker_cluster_sizes"])
-            record["num_support"] = len(record["sources"])
-            fp.write(format_pick_row(record))
-    partial.replace(ensemble_path)
-    return summary
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _write_ownership(ensemble_path, buffer_sec):
+    path = _ownership_path(ensemble_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_suffix(path.suffix + ".partial")
+    partial.write_text(json.dumps({
+        "version": PICK_OWNERSHIP_VERSION,
+        "data_buffer_sec": float(buffer_sec),
+        "interval": "[D-data_buffer_sec,D+1day-data_buffer_sec)",
+    }, indent=2) + "\n", encoding="utf-8")
+    partial.replace(path)
 
 
 def run_offline_picker_ensemble(
@@ -445,36 +545,30 @@ def run_offline_picker_ensemble(
     overwrite=False,
 ):
     """Run configured native pickers and write individual/ensemble daily picks."""
+    runtime_console.configure(cfg)
     configure_torch_backends(cfg)
     _validate_inputs(
         ai_pal_root, picker_specs, data_dir, station_file
     )
-    picker_groups = {}
-    for runtime_name, spec in picker_specs.items():
-        picker_groups.setdefault(spec.get("group", "POS_NEG"), []).append(
-            runtime_name
-        )
-    group_support = {
-        "POS_NEG": int(cfg.picker_pos_neg_group_min_picker_support),
-        "POS": int(cfg.picker_pos_group_min_picker_support),
-    }
-    for group_name, members in picker_groups.items():
-        required = group_support[group_name]
-        if required <= 0 or required > len(members):
-            raise ValueError(
-                "{} continuous picker support {} is invalid for {} models"
-                .format(group_name, required, len(members))
-            )
+    if any(spec.get("group", "POS_NEG") != "POS_NEG" for spec in picker_specs.values()):
+        raise ValueError("continuous picking only supports POS_NEG models")
+    required = int(cfg.picker_pos_neg_group_min_picker_support)
+    if required <= 0 or required > len(picker_specs):
+        raise ValueError("POS_NEG continuous picker support {} is invalid for {} models".format(
+            required, len(picker_specs)))
     dates = _date_list(time_range)
+    runtime_console.log(
+        "AI-PAL",
+        "local picking | days={} | models={} | workers={}".format(
+            len(dates), ",".join(picker_specs), max(1, int(num_workers))
+        ),
+    )
     pickers = _load_pickers(ai_pal_root, picker_specs)
     if pickers_loaded_callback is not None:
-        grouped_pickers = {}
-        for runtime_name, picker in pickers.items():
-            spec = picker_specs[runtime_name]
-            grouped_pickers.setdefault(
-                spec.get("group", "POS_NEG"), {}
-            )[spec.get("model", runtime_name)] = picker
-        pickers_loaded_callback(grouped_pickers)
+        pickers_loaded_callback({"POS_NEG": {
+            picker_specs[name].get("model", name): picker
+            for name, picker in pickers.items()
+        }})
     device_groups = _group_by_device(pickers)
     num_workers = max(1, int(num_workers))
     device_locks = {device: Lock() for device in device_groups}
@@ -484,10 +578,24 @@ def run_offline_picker_ensemble(
         ),
         flush=True,
     )
-    stations = cfg.get_sta_dict(str(station_file))
+    stations = _load_station_selectors(cfg, station_file, dates)
     print("full station file: {} | {} selectors".format(
         station_file, len(stations)
     ))
+    buffer_sec = float(cfg.data_buffer_sec)
+    if buffer_sec < 0:
+        raise ValueError("data_buffer_sec must be nonnegative")
+    taper_sec = float(getattr(cfg, "taper_max_length_sec", 0.0))
+    if buffer_sec and buffer_sec < taper_sec:
+        raise ValueError(
+            "data_buffer_sec must be at least taper_max_length_sec"
+        )
+    if dates and buffer_sec:
+        previous_raw_tails = _load_raw_tail_cache(
+            dates[0] - 86400, cfg, data_dir, stations, num_workers
+        )
+    else:
+        previous_raw_tails = {}
 
     if cfg.save_individual_picker_outputs:
         context = nullcontext(Path(individual_pick_root))
@@ -498,10 +606,9 @@ def run_offline_picker_ensemble(
         pick_dirs = {}
         for index, name in enumerate(pickers, start=1):
             spec = picker_specs[name]
-            group_name = spec.get("group", "POS_NEG").lower()
             model_name = spec.get("model", name)
-            indexed_name = "1.1.{}_picks_{}_{}".format(
-                index, group_name, model_name
+            indexed_name = "1.1.{}_picks_pos_neg_{}".format(
+                index, model_name
             )
             indexed_path = Path(individual_root) / indexed_name
             legacy_path = Path(individual_root) / "picks_{}".format(name)
@@ -519,7 +626,6 @@ def run_offline_picker_ensemble(
             pick_dirs[name] = indexed_path
         for path in pick_dirs.values():
             path.mkdir(parents=True, exist_ok=True)
-        group_root = Path(individual_root) / ".picker_group_consensus"
         summaries = []
         need_retained_waveforms = (
             day_waveforms_complete_callback is not None
@@ -528,6 +634,12 @@ def run_offline_picker_ensemble(
         for index, date in enumerate(dates, start=1):
             filename = "{}.pick".format(date.date)
             ensemble_path = Path(ensemble_pick_dir) / filename
+            runtime_console.log(
+                "day",
+                "{} picking start | {}/{}".format(
+                    date.date, index, len(dates)
+                ),
+            )
             individual_complete = all(
                 (directory / filename).exists()
                 for directory in pick_dirs.values()
@@ -535,8 +647,9 @@ def run_offline_picker_ensemble(
             complete = not overwrite and ensemble_path.exists() and (
                 not cfg.save_individual_picker_outputs
                 or individual_complete
-            )
+            ) and _has_current_ownership(ensemble_path, buffer_sec)
             retained_waveforms = {}
+            next_raw_tails = {}
             if complete:
                 day_summaries = [
                     _existing_pick_summary(ensemble_path)
@@ -549,20 +662,35 @@ def run_offline_picker_ensemble(
                         ),
                         flush=True,
                     )
-                    retained_waveforms = _prepare_day_waveforms(
+                    retained_waveforms, next_raw_tails = _prepare_day_waveforms(
+                        date, cfg, data_dir, stations, num_workers,
+                        previous_raw_tails,
+                    )
+                else:
+                    next_raw_tails = _load_raw_tail_cache(
                         date, cfg, data_dir, stations, num_workers
                     )
                 print(
                     "skip completed daily picking: {}".format(ensemble_path),
                     flush=True,
                 )
-            elif not overwrite and individual_complete:
-                day_summaries = [_merge_grouped_picker_file(
-                    pick_dirs, picker_groups, group_support, group_root,
-                    ensemble_path, filename, cfg.tp_dev, cfg.ts_dev,
+            elif (
+                not overwrite
+                and individual_complete
+                and _has_current_ownership(ensemble_path, buffer_sec)
+            ):
+                day_summaries = [merge_picker_pick_files(
+                    {name: path / filename for name, path in pick_dirs.items()},
+                    ensemble_path, cfg.tp_dev, cfg.ts_dev, min_support=required,
                 )]
+                _write_ownership(ensemble_path, buffer_sec)
                 if need_retained_waveforms:
-                    retained_waveforms = _prepare_day_waveforms(
+                    retained_waveforms, next_raw_tails = _prepare_day_waveforms(
+                        date, cfg, data_dir, stations, num_workers,
+                        previous_raw_tails,
+                    )
+                else:
+                    next_raw_tails = _load_raw_tail_cache(
                         date, cfg, data_dir, stations, num_workers
                     )
                 print(
@@ -571,17 +699,32 @@ def run_offline_picker_ensemble(
                     flush=True,
                 )
             else:
-                paths, retained_waveforms = _pick_one_day(
+                _ownership_path(ensemble_path).unlink(missing_ok=True)
+                paths, retained_waveforms, next_raw_tails = _pick_one_day(
                     date, cfg, pickers, device_groups, device_locks, data_dir,
                     stations, pick_dirs, num_workers,
                     station_complete_callback,
                     retain_waveforms=need_retained_waveforms,
+                    previous_raw_tails=previous_raw_tails,
                 )
-                day_summaries = [_merge_grouped_picker_file(
-                    pick_dirs, picker_groups, group_support, group_root,
-                    ensemble_path, filename, cfg.tp_dev, cfg.ts_dev,
+                # Mark the finalized individual files before ensemble merging,
+                # so a merge-only retry can distinguish them from legacy picks.
+                _write_ownership(ensemble_path, buffer_sec)
+                day_summaries = [merge_picker_pick_files(
+                    {name: path / filename for name, path in pick_dirs.items()},
+                    ensemble_path, cfg.tp_dev, cfg.ts_dev, min_support=required,
                 )]
+                _write_ownership(ensemble_path, buffer_sec)
             summaries.extend(day_summaries)
+            runtime_console.log(
+                "day",
+                "day={} | picks={} | progress={}/{}".format(
+                    date.date,
+                    int(day_summaries[0].get("num_merged_picks", 0)),
+                    index,
+                    len(dates),
+                ),
+            )
             print("{} / {} days complete: {}".format(
                 index, len(dates), ensemble_path
             ), flush=True)
@@ -598,14 +741,20 @@ def run_offline_picker_ensemble(
                     day_summaries[0],
                     retained_waveforms,
                 )
+            previous_raw_tails = next_raw_tails
             _trim_cpu_allocator()
-        shutil.rmtree(group_root, ignore_errors=True)
     num_input = sum(sum(item["input_counts"].values()) for item in summaries)
     num_output = sum(item["num_merged_picks"] for item in summaries)
     print("picker ensemble: {} input picks -> {} consensus picks in {} files".format(
         num_input, num_output, len(summaries)
     ), flush=True)
     print("ensemble pick directory: {}".format(ensemble_pick_dir), flush=True)
+    runtime_console.log(
+        "output",
+        "picking complete | days={} | consensus_picks={} | {}".format(
+            len(summaries), num_output, ensemble_pick_dir
+        ),
+    )
     if not cfg.save_individual_picker_outputs:
         print("temporary individual picker outputs removed", flush=True)
     return summaries

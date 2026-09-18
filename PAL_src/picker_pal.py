@@ -1,5 +1,4 @@
 import numpy as np
-from scipy.stats import kurtosis
 
 class STA_LTA_Kurtosis(object):
   """ STA/LTA & kurtosis-based P&S Picker
@@ -15,10 +14,9 @@ class STA_LTA_Kurtosis(object):
     pca_range: time range for pca filter
     win_kurt: win for calc kurtosis
     amp_ratio_thres: max value of amp ratio, peak_rm, P/P_tail, & P/S
-    fd_trhes: min value of dominant frequency
     amp_win: time win to get S amplitude
     det_gap: time gap between detections
-    to_prep: whether preprocess stream
+    to_filter: whether apply the configured frequency filter
     freq_band: frequency band for phase picking
     *note: all time-related params are in sec
   Outputs
@@ -37,15 +35,15 @@ class STA_LTA_Kurtosis(object):
                pca_win         = 1.,
                pca_range       = [0., 2],
                win_kurt        = [5.,1.],
-               fd_thres        = 2.5, 
                amp_ratio_thres = [6,10,2], 
                amp_win         = [1.,5.],
                det_gap         = 5.,
-               to_prep         = True,
+               to_filter       = True,
                freq_band       = [1., 40],
                taper_max_length_sec = 10.0,
                vp              = 6.0,
-               vs              = 3.45):
+               vs              = 3.45,
+               verbose         = False):
     self.win_sta = win_sta
     self.win_lta = win_lta
     self.trig_thres = trig_thres
@@ -54,34 +52,54 @@ class STA_LTA_Kurtosis(object):
     self.pca_win = pca_win
     self.pca_range = pca_range
     self.win_kurt = win_kurt
-    self.fd_thres = fd_thres
     self.amp_ratio_thres = amp_ratio_thres
     self.amp_win = amp_win
     self.det_gap = det_gap
-    self.to_prep = to_prep
+    self.to_filter = bool(to_filter)
     self.freq_band = freq_band
     self.taper_max_length_sec = float(taper_max_length_sec)
     self.vp = vp
     self.vs = vs
+    self.verbose = bool(verbose)
 
-  def pick(self, stream, out_file=None, pick_start_time=None, pick_end_time=None):
+  def _log(self, message):
+    if self.verbose:
+      print(message)
+
+  @staticmethod
+  def get_s_sta_search_start_npts(dt_peak_npts, pca_end_npts):
+    """Return the S STA/LTA search start offset relative to the P pick."""
+    return min(int(pca_end_npts), int(dt_peak_npts)//2)
+
+  def pick(self, stream, out_file=None, pick_start_time=None, pick_end_time=None,
+           return_trigger_count=False):
     # set output format for picks
     dtype = [('net_sta','O'),
              ('sta_ot','O'),
              ('tp','O'),
              ('ts','O'),
              ('s_amp','O')]
+    def result(rows, trigger_count):
+      picks_array = np.array(rows, dtype=dtype)
+      if return_trigger_count:
+        return picks_array, trigger_count
+      return picks_array
+
     # preprocess & extract data
-    if len(stream)!=3: return np.array([], dtype=dtype)
-    if self.to_prep: stream = self.preprocess(stream, self.freq_band)
+    if len(stream)!=3: return result([], 0)
+    stream = self.preprocess(stream, self.freq_band, to_filter=self.to_filter)
     if len(stream)==3:
       usable_start = stream[0].stats.starttime + self.taper_max_length_sec
       usable_end = stream[0].stats.endtime - self.taper_max_length_sec
-      if usable_end <= usable_start: return np.array([], dtype=dtype)
-      stream = stream.slice(usable_start, usable_end, nearest_sample=True)
-    if len(stream)!=3: return np.array([], dtype=dtype)
+      if usable_end <= usable_start: return result([], 0)
+      stream.trim(usable_start, usable_end, nearest_sample=True)
+    if len(stream)!=3: return result([], 0)
     min_npts = min([len(trace) for trace in stream])
     st_data = np.array([trace.data[0:min_npts] for trace in stream])
+    # PAL needs both matrix operations and ObsPy time slices. Point the traces
+    # at the matrix rows so those two interfaces share one station waveform.
+    for channel_index, trace in enumerate(stream):
+      trace.data = st_data[channel_index]
     # get header
     head = stream[0].stats
     net_sta = '.'.join([head.network, head.station])
@@ -100,12 +118,15 @@ class STA_LTA_Kurtosis(object):
     # pick P and S
     picks = []
     # 1. trig picker
-    print('1. triggering phase picker')
+    self._log('1. triggering phase picker')
     cf_trig = self.calc_sta_lta(st_data[2]**2, win_lta_npts[0], win_sta_npts[0])
     trig_index = np.where(cf_trig > self.trig_thres)[0]
     slide_idx = 0
+    # trig_index contains every above-threshold sample. Count only candidates
+    # selected by the picker's det_gap progression, before waveform QC.
+    num_triggers = 0
     # 2. phase picking
-    print('2. picking phase:')
+    self._log('2. picking phase:')
     for _ in trig_index:
         trig_idx = trig_index[slide_idx]
         if trig_idx < p_win_npts[0] + max(win_lta_npts):
@@ -119,6 +140,12 @@ class STA_LTA_Kurtosis(object):
         # refine initial pick on waveform
         tp_idx = tp0_idx - self.find_second_peak(data_p[0:tp0_idx-p_idx0][::-1])
         tp = start_time + tp_idx/samp_rate
+        trigger_time = start_time + trig_idx/samp_rate
+        if (
+            (pick_start_time is None or trigger_time >= pick_start_time)
+            and (pick_end_time is None or trigger_time < pick_end_time)
+        ):
+            num_triggers += 1
         # 2.2 pick S 
         # 2.2.1 pca for amp_peak
         if len(st_data[0]) < tp_idx + s_win_npts: break
@@ -128,44 +155,63 @@ class STA_LTA_Kurtosis(object):
         pca_filter = self.calc_pca_filter(st_data, tp_idx, pca_range_npts, pca_win_npts)
         data_s[0:len(pca_filter)] *= pca_filter
         dt_peak = max(np.argmax(data_s)+1, pca_win_npts+1)
-        # 2.2.2 long_win kurt --> t_max
-        s_idx0 = tp_idx + dt_peak//2 - win_kurt_npts[0]
+        # 2.2.2 S STA/LTA --> earliest S boundary. Search from the
+        # earlier of the PCA interval end and half the P-to-S-peak time.
+        sta_search_start = self.get_s_sta_search_start_npts(
+            dt_peak, pca_range_npts[1]
+        )
+        sta_search_span = dt_peak - sta_search_start
+        s_idx0 = tp_idx + sta_search_start - win_lta_npts[2]
+        s_idx1 = tp_idx + dt_peak + win_sta_npts[2]
+        data_s_sta = np.sum(st_data[0:2, s_idx0:s_idx1]**2, axis=0)
+        cf_s = self.calc_sta_lta(
+            data_s_sta, win_lta_npts[2], win_sta_npts[2]
+        )[win_lta_npts[2]:win_lta_npts[2]+sta_search_span+1]
+        dt_min_relative = np.argmax(cf_s)
+        dt_min = sta_search_start + dt_min_relative
+
+        # 2.2.3 Long-window kurtosis --> latest S boundary. Its output is
+        # calculated only from the STA/LTA peak through the S-amplitude peak.
+        s_idx0 = tp_idx + dt_min - win_kurt_npts[0]
         s_idx1 = tp_idx + dt_peak
         data_s = np.sum(st_data[0:2, s_idx0:s_idx1]**2, axis=0)
         data_s /= np.amax(data_s)
         kurt_long = self.calc_kurtosis(data_s, win_kurt_npts[0])
-        # 2.2.3 STA/LTA --> t_min
-        s_idx0 = tp_idx + dt_peak//2 - win_lta_npts[2]
-        s_idx1 = tp_idx + dt_peak + win_sta_npts[2]
-        data_s = np.sum(st_data[0:2, s_idx0:s_idx1]**2, axis=0)
-        cf_s = self.calc_sta_lta(data_s, win_lta_npts[2], win_sta_npts[2])[win_lta_npts[2]:]
-        # 2.2.4 pick S on short_win kurt
-        dt_max = np.argmax(kurt_long) # relative to (tp_idx + dt_peak//2)
-        dt_max -= self.find_first_peak(kurt_long[0:dt_max+1][::-1])
-        dt_min = np.argmax(cf_s) # relative to (tp_idx + dt_peak//2)
+        dt_max_relative = np.argmax(kurt_long)
+        dt_max_relative -= self.find_first_peak(
+            kurt_long[0:dt_max_relative+1][::-1]
+        )
+        dt_max = dt_min + dt_max_relative
+
+        # 2.2.4 Pick S on short-window kurtosis.
         # if kurt_long not stable, use STA/LTA
         if dt_min>=dt_max: 
-            ts0_idx = tp_idx + dt_peak//2 + dt_min
-            ts_idx = ts0_idx - self.find_second_peak(data_s[0:dt_min+win_lta_npts[2]][::-1])
+            ts0_idx = tp_idx + dt_min
+            sta_candidate_end = win_lta_npts[2] + dt_min_relative
+            ts_idx = ts0_idx - self.find_second_peak(
+                data_s_sta[0:sta_candidate_end][::-1]
+            )
         # else, pick peak of kurt_short
         else:
-            s_idx0 = tp_idx + dt_peak//2 + dt_min - win_kurt_npts[1]
-            s_idx1 = tp_idx + dt_peak//2 + dt_max
+            s_idx0 = tp_idx + dt_min - win_kurt_npts[1]
+            s_idx1 = tp_idx + dt_max
             data_s = np.sum(st_data[0:2, s_idx0:s_idx1]**2, axis=0)
             data_s /= np.amax(data_s)
             kurt_short = self.calc_kurtosis(data_s, win_kurt_npts[1])
-            kurt_max = np.argmax(kurt_short) if np.argmax(kurt_short)>0 else dt_max-dt_min
-            ts0_idx = tp_idx + dt_peak//2 + dt_min + kurt_max
-            ts_idx = ts0_idx - self.find_second_peak(data_s[0:s_idx0+win_kurt_npts[1]+kurt_max][::-1])
+            kurt_max = np.argmax(kurt_short)
+            if kurt_max == 0:
+                kurt_max = dt_max-dt_min
+            ts0_idx = tp_idx + dt_min + kurt_max
+            ts_idx = ts0_idx - self.find_second_peak(
+                data_s[0:win_kurt_npts[1]+kurt_max][::-1]
+            )
         ts = start_time + ts_idx/samp_rate if ts_idx>tp_idx else start_time + ts0_idx/samp_rate
         # 3. get related S amplitude
         data_amp = st_data[:, tp_idx-amp_win_npts[0] : ts_idx+amp_win_npts[1]].copy()
         s_amp = self.get_s_amp(data_amp, samp_rate)
         # 4. get p_snr
         p_snr = np.amax(cf_trig[p_idx0:p_idx1])
-        # 5. quality control with dominant freq & amp ratio
-        st = stream.slice(tp, max(tp+(ts-tp)/2, tp+self.pca_win)).copy()
-        fd = max([self.calc_freq_dom(tr.data, samp_rate) for tr in st])
+        # 5. quality control with amplitude ratios
         p_amp_ratio = self.calc_peak_amp_ratio(stream.slice(tp, tp+self.pca_win*3), pca_win_npts)
         s_amp_ratio = self.calc_peak_amp_ratio(stream.slice(ts, ts+self.pca_win*3), pca_win_npts)
         amp_ratio = max(min(p_amp_ratio), min(s_amp_ratio))
@@ -179,25 +225,27 @@ class STA_LTA_Kurtosis(object):
             (pick_start_time is None or tp >= pick_start_time)
             and (pick_end_time is None or tp < pick_end_time)
         )
-        if in_target_day and fd>self.fd_thres and amp_ratio<self.amp_ratio_thres[0] and A12<self.amp_ratio_thres[1] and A13<self.amp_ratio_thres[2]:
-            print('{}, {}, {}'.format(net_sta, tp, ts))
+        if in_target_day and amp_ratio<self.amp_ratio_thres[0] and A12<self.amp_ratio_thres[1] and A13<self.amp_ratio_thres[2]:
+            self._log('{}, {}, {}'.format(net_sta, tp, ts))
             sta_ot = self.calc_ot(tp, ts)
             picks.append((net_sta, sta_ot, tp, ts, s_amp))
-            if out_file: 
-                qual_code = '{:.1f},{:.1f},{:.1f},{:.1f},{:.1f}'.format(p_snr, fd, amp_ratio, A12, A13)
-                out_file.write('{},{},{},{},{},{}\n'.format(net_sta, sta_ot, tp, ts, s_amp, qual_code))
+            if out_file:
+                qual_code = '{:.1f},{:.1f},{:.1f},{:.1f}'.format(p_snr, amp_ratio, A12, A13)
+                out_file.write('{},{},{},{},{}\n'.format(
+                    net_sta, tp, ts, s_amp, qual_code
+                ))
         # next detected phase
         rest_det = np.where(trig_index > max(trig_idx,ts_idx,tp_idx) + det_gap_npts)[0]
         if len(rest_det)==0: break
         slide_idx = rest_det[0]
     # convert to structed np.array
-    return np.array(picks, dtype=dtype)
+    return result(picks, num_triggers)
 
   # calc STA/LTA for a trace of data (abs or square)
   def calc_sta_lta(self, data, win_lta_npts, win_sta_npts):
     npts = len(data)
     if npts < win_lta_npts + win_sta_npts:
-        print('input data too short!')
+        self._log('input data too short!')
         return np.zeros(1)
     sta = np.zeros(npts)
     lta = np.ones(npts)
@@ -206,11 +254,12 @@ class STA_LTA_Kurtosis(object):
     sta /= win_sta_npts
     lta[win_lta_npts:]  = data_cum[win_lta_npts:] - data_cum[:-win_lta_npts]
     lta /= win_lta_npts
-    sta_lta = sta/lta
-    sta_lta[0:win_lta_npts] = 0.
-    sta_lta[np.isinf(sta_lta)] = 0.
-    sta_lta[np.isnan(sta_lta)] = 0.
-    return sta_lta
+    valid = np.isfinite(lta) & (lta != 0.0)
+    np.divide(sta, lta, out=sta, where=valid)
+    sta[~valid] = 0.0
+    sta[0:win_lta_npts] = 0.0
+    sta[~np.isfinite(sta)] = 0.0
+    return sta
 
   # calc P wave filter
   def calc_pca_filter(self, data, idx_p, pca_range_npts, pca_win_npts):
@@ -251,21 +300,46 @@ class STA_LTA_Kurtosis(object):
     disp /= samp_rate
     return np.amax(abs(np.sum(disp**2, axis=0)))**0.5
 
-  # calc dominant frequency
-  def calc_freq_dom(self, data, samp_rate):
-    npts = len(data)
-    if npts//2==0: return 0
-    data -= np.mean(data)
-    psd = abs(np.fft.fft(data))**2
-    psd = psd[:npts//2]
-    return np.argmax(psd) * samp_rate / npts
-
   # calc kurtosis trace
   def calc_kurtosis(self, data, win_kurt_npts):
+    data = np.asarray(data, dtype=np.float64)
+    win_kurt_npts = int(win_kurt_npts)
+    if win_kurt_npts <= 0:
+      raise ValueError('win_kurt_npts must be positive')
+
     npts = len(data) - win_kurt_npts + 1
-    kurt = np.zeros(npts)
-    for i in range(npts):
-        kurt[i] = kurtosis(data[i:i+win_kurt_npts])
+    if npts <= 0:
+      return np.zeros(0, dtype=np.float64)
+
+    # Compute every rolling window from cumulative raw moments. Centering the
+    # full trace first improves stability without changing window kurtosis.
+    data = data - np.mean(data)
+
+    def rolling_sum(values):
+      cumulative = np.concatenate((
+          np.zeros(1, dtype=np.float64),
+          np.cumsum(values, dtype=np.float64),
+      ))
+      return cumulative[win_kurt_npts:] - cumulative[:-win_kurt_npts]
+
+    count = float(win_kurt_npts)
+    sum1 = rolling_sum(data)
+    squared = data * data
+    sum2 = rolling_sum(squared)
+    sum3 = rolling_sum(squared * data)
+    sum4 = rolling_sum(squared * squared)
+    mean = sum1 / count
+    moment2 = sum2 / count - mean * mean
+    moment4 = (
+        sum4 / count
+        - 4.0 * mean * sum3 / count
+        + 6.0 * mean * mean * sum2 / count
+        - 3.0 * mean**4
+    )
+
+    kurt = np.full(npts, np.nan, dtype=np.float64)
+    valid = moment2 > 0.0
+    kurt[valid] = moment4[valid] / moment2[valid]**2 - 3.0
     return kurt
 
   def calc_peak_amp_ratio(self, st, win_peak_npts):
@@ -292,6 +366,7 @@ class STA_LTA_Kurtosis(object):
     if min(delta_d)>=0 or max(delta_d)<=0: return 0
     neg_idx = np.where(delta_d<0)[0]
     pos_idx = np.where(delta_d>=0)[0]
+    if len(neg_idx)==0 or len(pos_idx)==0: return 0
     return max(neg_idx[0], pos_idx[0])
 
   def find_second_peak(self, data):
@@ -308,12 +383,12 @@ class STA_LTA_Kurtosis(object):
     if len(neg_peak)==0 or len(pos_peak)==0: return first_peak
     return max(neg_peak[0], pos_peak[0])
 
-  def preprocess(self, stream, freq_band, max_gap=5.):
+  def preprocess(self, stream, freq_band, max_gap=5., to_filter=True):
     # time alignment
     start_time = max([trace.stats.starttime for trace in stream])
     end_time = min([trace.stats.endtime for trace in stream])
     if start_time > end_time: return []
-    stream = stream.slice(start_time, end_time, nearest_sample=True)
+    stream.trim(start_time, end_time, nearest_sample=True)
     # remove nan & inf
     for trace in stream:
         trace.data[np.isnan(trace.data)] = 0
@@ -343,8 +418,10 @@ class STA_LTA_Kurtosis(object):
                 num_tile = int(np.ceil((idx1-idx0)/(idx2-idx1)))
                 data[idx0:idx1] = np.tile(data[idx1:idx2], num_tile)[0:idx1-idx0]
         trace.data = data
-    # filter
+    # Signal conditioning remains required even when the input is pre-filtered.
     stream.detrend('demean').detrend('linear').taper(max_percentage=0.05, max_length=self.taper_max_length_sec)
+    if not to_filter:
+        return stream
     freq_min, freq_max = freq_band
     nyquist = 0.5 * min(float(trace.stats.sampling_rate) for trace in stream)
     if freq_min and float(freq_min) >= nyquist:
@@ -357,7 +434,7 @@ class STA_LTA_Kurtosis(object):
     if freq_max:
         safe_freq_max = min(float(freq_max), nyquist * 0.95)
         if safe_freq_max < float(freq_max):
-            print(
+            self._log(
                 "adjust filter upper corner from {} to {:.6g} Hz for "
                 "Nyquist {:.6g} Hz".format(freq_max, safe_freq_max, nyquist)
             )
@@ -370,5 +447,4 @@ class STA_LTA_Kurtosis(object):
     elif not freq_min and safe_freq_max:
         return stream.filter('lowpass', freq=safe_freq_max)
     else:
-        print('filter type not supported!'); return []
-
+        self._log('filter type not supported!'); return []

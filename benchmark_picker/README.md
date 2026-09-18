@@ -86,6 +86,41 @@ Only CEED is used for positive-only training in this workflow.
 5. Run `python train_pos/3_train_pos_pickers.py` to train any enabled subset of
    SAR, FT, PHN, and RUN sequentially.
 
+With the integrated dataset already built, start directly at step 5:
+
+```bash
+cd ~/software/AI-PAL/benchmark_picker
+python train_pos/3_train_pos_pickers.py
+```
+
+The launcher reads `/data1/zhouyj/CEED_train_pos.zarr` and writes to
+`/nas/zhouyj/AI_ckpt/ceed_pos/<MODEL>/`. Both `train/` and `valid/` must contain
+nonempty `positive_data` arrays shaped `[N, 3, 2500]`, frame targets shaped
+`[N, 246]` for SAR/FT, and sample targets shaped `[N, 3, 2500]` for PHN/RUN.
+The FT/RUN architecture reductions do not change these target layouts.
+
+All four models use batch size 128 and full validation every 5000 steps.
+FT uses width 256, four heads, five layers, and FFN width 512; RUN uses one
+residual block per encoder, bottleneck, and decoder stage. Training starts
+from scratch, not from existing checkpoints: select empty output directories.
+The launcher checks every enabled output before modifying installed configs.
+After a partially completed multi-model run, select only the unfinished models
+and use an empty directory for any model that must restart. Do not launch this
+config-staging workflow concurrently with other jobs using the same source tree.
+
+The enabled benchmark entries point to these models' `best.ckpt` files and use
+new `*_v7` markers to avoid reusing old prediction results. If OUT_CKPT_ROOT is
+changed, update their paths in `benchmark_runs.py` too. Benchmark inference and
+evaluation still read fixed-window NPY shards under `/nas/zhouyj/AI_datasets`,
+not the training Zarr; run them from `benchmark_picker/` so their relative
+`output/` paths agree. These Linux dataset paths must exist on the workstation.
+
+Each model checkpoint directory contains TensorBoard logs,
+`<model>_training_metrics.csv`, a live positive/negative accuracy figure in
+`<model>_training_progress.png`, and loss plus frame accuracy (SAR/FT) or sample
+accuracy (PHN/RUN) in `<model>_training_diagnostics.png`. Both figures include
+full-range and 5th-95th percentile zoom panels.
+
 Training parameters live in:
 
 ```text
@@ -120,8 +155,8 @@ Edit `benchmark_runs.py`. Each entry requires:
 }
 ```
 
-- A checkpoint directory selects its latest checkpoint through the installed
-  picker logic.
+- A checkpoint directory prefers `best.ckpt`; otherwise the installed picker
+  selects a numbered checkpoint.
 - A checkpoint file selects that exact model.
 - `marker` must be unique and filesystem-safe. It propagates to predictions,
   evaluation directories, CSV outputs, and plots.

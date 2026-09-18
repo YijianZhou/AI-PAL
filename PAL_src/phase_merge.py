@@ -7,7 +7,8 @@ from pathlib import Path
 from statistics import median
 
 from pick_ensemble import (
-    format_picker_cluster_sizes, merge_picker_cluster_sizes,
+    format_picker_window_vote_ratios, merge_picker_window_vote_ratios,
+    repick_quality_code,
 )
 
 
@@ -123,42 +124,50 @@ def read_phase_file(path, source=None):
                 continue
             if current is None or len(codes) < 4:
                 raise ValueError("bad phase row {}:{}: {}".format(path, line_number, text))
-            current["picks"].append({
+            is_new_schema = len(codes) == 19
+            is_old_extended_schema = len(codes) >= 22
+            offset = 1 if is_new_schema else 0
+            pick = {
                 "sta": codes[0],
                 "p": parse_time(codes[1]),
                 "s": parse_time(codes[2]),
                 "score": float(codes[3]),
-                "p_prob": float(codes[4]) if len(codes) > 4 else -1.0,
-                "s_prob": float(codes[5]) if len(codes) > 5 else -1.0,
-                "tp_std": float(codes[6]) if len(codes) > 6 else 0.0,
-                "ts_std": float(codes[7]) if len(codes) > 7 else 0.0,
-                "p_prob_std": float(codes[8]) if len(codes) > 8 else 0.0,
-                "s_prob_std": float(codes[9]) if len(codes) > 9 else 0.0,
-                "num_support": int(codes[10]) if len(codes) > 10 else 1,
-                "sources": codes[11] if len(codes) > 11 else "",
+                "quality": int(codes[4]) if is_new_schema else -1,
+                "p_prob": float(codes[4 + offset]) if len(codes) > 4 + offset else -1.0,
+                "s_prob": float(codes[5 + offset]) if len(codes) > 5 + offset else -1.0,
+                "tp_std": float(codes[6 + offset]) if len(codes) > 6 + offset else 0.0,
+                "ts_std": float(codes[7 + offset]) if len(codes) > 7 + offset else 0.0,
+                "p_prob_std": float(codes[8 + offset]) if len(codes) > 8 + offset else 0.0,
+                "s_prob_std": float(codes[9 + offset]) if len(codes) > 9 + offset else 0.0,
+                "num_support": int(codes[10 + offset]) if len(codes) > 10 + offset else 1,
+                "sources": codes[11 + offset] if len(codes) > 11 + offset else "",
                 "picker_cluster_sizes": (
-                    codes[12] if len(codes) > 12 else ""
+                    codes[12] if not is_new_schema and len(codes) > 12 else ""
+                ),
+                "picker_window_vote_ratios": (
+                    codes[13] if is_new_schema else ""
                 ),
                 "picker_uncertainties": (
-                    codes[13] if len(codes) > 13 else ""
+                    codes[14] if is_new_schema else (
+                        codes[13] if len(codes) > 13 else ""
+                    )
                 ),
                 "pick_provenance": (
-                    codes[14] if len(codes) > 14 else "initial"
+                    codes[15] if is_new_schema else (
+                        codes[14] if len(codes) > 14 else "initial"
+                    )
                 ),
-                "repick_status": (
-                    codes[15] if len(codes) > 15 else "unknown"
+                "p_snr_e": float(codes[16]) if is_new_schema else (
+                    float(codes[19]) if is_old_extended_schema else -1.0
                 ),
-                "repick_support": (
-                    int(codes[16]) if len(codes) > 16 and codes[16] else -1
+                "p_snr_n": float(codes[17]) if is_new_schema else (
+                    float(codes[20]) if is_old_extended_schema else -1.0
                 ),
-                "repick_sources": codes[17] if len(codes) > 17 else "",
-                "repick_required_support": (
-                    int(codes[18]) if len(codes) > 18 and codes[18] else -1
+                "p_snr_z": float(codes[18]) if is_new_schema else (
+                    float(codes[21]) if is_old_extended_schema else -1.0
                 ),
-                "p_snr_e": float(codes[19]) if len(codes) > 19 else -1.0,
-                "p_snr_n": float(codes[20]) if len(codes) > 20 else -1.0,
-                "p_snr_z": float(codes[21]) if len(codes) > 21 else -1.0,
-            })
+            }
+            current["picks"].append(pick)
     if current is not None:
         events.append(current)
     return events
@@ -189,13 +198,14 @@ def write_phase_file(path, events, time_format_digits=6, catalog_path=None):
                     catalog_fp.write(header)
                 for pick in sorted(event["picks"], key=lambda item: item["sta"]):
                     phase_fp.write(
-                        "{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},"
-                        "{:.4f},{:.4f},{},{},{},{},{},{},{},{},{},"
+                        "{},{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},"
+                        "{:.4f},{:.4f},{},{},{},{},{},"
                         "{:.4f},{:.4f},{:.4f}\n".format(
                             pick["sta"],
                             format_time(pick["p"], time_format_digits),
                             format_time(pick["s"], time_format_digits),
                             pick.get("score", -1.0),
+                            pick.get("quality", -1),
                             pick.get("p_prob", -1.0),
                             pick.get("s_prob", -1.0),
                             pick.get("tp_std", 0.0),
@@ -204,13 +214,9 @@ def write_phase_file(path, events, time_format_digits=6, catalog_path=None):
                             pick.get("s_prob_std", 0.0),
                             pick.get("num_support", 1),
                             pick.get("sources", ""),
-                            pick.get("picker_cluster_sizes", ""),
+                            pick.get("picker_window_vote_ratios", ""),
                             pick.get("picker_uncertainties", ""),
                             pick.get("pick_provenance", "initial"),
-                            pick.get("repick_status", "unknown"),
-                            pick.get("repick_support", -1),
-                            pick.get("repick_sources", ""),
-                            pick.get("repick_required_support", -1),
                             pick.get("p_snr_e", -1.0),
                             pick.get("p_snr_n", -1.0),
                             pick.get("p_snr_z", -1.0),
@@ -320,7 +326,7 @@ def _cluster_station_picks(picks, tolerance_sec):
     return groups
 
 
-def merge_group(events, phase_pick_tol=1.0):
+def merge_group(events, phase_pick_tol=1.0, cfg=None):
     picks_by_station = {}
     for event in events:
         for pick in event["picks"]:
@@ -352,9 +358,10 @@ def merge_group(events, phase_pick_tol=1.0):
                 for source in pick["sources"].split("|")
                 if source
             })),
-            "picker_cluster_sizes": format_picker_cluster_sizes(
-                merge_picker_cluster_sizes(
-                    pick["picker_cluster_sizes"] for pick in station_picks
+            "picker_window_vote_ratios": format_picker_window_vote_ratios(
+                merge_picker_window_vote_ratios(
+                    pick.get("picker_window_vote_ratios", "")
+                    for pick in station_picks
                 )
             ),
             "picker_uncertainties": "|".join(sorted({
@@ -364,24 +371,6 @@ def merge_group(events, phase_pick_tol=1.0):
                 if value
             })),
             "pick_provenance": provenance,
-            "repick_status": "|".join(sorted({
-                pick.get("repick_status", "unknown")
-                for pick in station_picks
-                if pick.get("repick_status", "unknown")
-            })),
-            "repick_support": max(
-                pick.get("repick_support", -1) for pick in station_picks
-            ),
-            "repick_sources": "|".join(sorted({
-                source
-                for pick in station_picks
-                for source in pick.get("repick_sources", "").split("|")
-                if source
-            })),
-            "repick_required_support": max(
-                pick.get("repick_required_support", -1)
-                for pick in station_picks
-            ),
             "p_snr_e": median_valid([
                 pick.get("p_snr_e", -1.0) for pick in station_picks
             ]),
@@ -392,6 +381,16 @@ def merge_group(events, phase_pick_tol=1.0):
                 pick.get("p_snr_z", -1.0) for pick in station_picks
             ]),
             })
+            ratios = picks[-1]["picker_window_vote_ratios"]
+            picks[-1]["quality"] = (
+                repick_quality_code(provenance, ratios, cfg)
+                if provenance != "initial" and ratios else
+                min(
+                    (pick.get("quality", -1) for pick in station_picks
+                     if pick.get("quality", -1) >= 0),
+                    default=-1,
+                )
+            )
     return {
         "time": median_time([event["time"] for event in events]),
         "lat": median([event["lat"] for event in events]),
@@ -449,7 +448,7 @@ def merge_phase_files(
     )
     merged = []
     for group in groups:
-        event = merge_group(group, cfg.merge_phase_pick_time_tol_sec)
+        event = merge_group(group, cfg.merge_phase_pick_time_tol_sec, cfg)
         if event_time_start is not None and event["time"] < event_time_start:
             continue
         if event_time_end is not None and event["time"] >= event_time_end:
@@ -486,23 +485,20 @@ def merge_phase_files(
             catalog_fp.write(header)
             for pick in event["picks"]:
                 line = (
-                    "{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},"
-                    "{:.4f},{:.4f},{},{},{},{},{},{},{},{},{},"
+                    "{},{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},"
+                    "{:.4f},{:.4f},{},{},{},{},{},"
                     "{:.4f},{:.4f},{:.4f}\n".format(
                         pick["sta"],
                         format_time(pick["p"], cfg.merge_time_format_digits),
                         format_time(pick["s"], cfg.merge_time_format_digits),
-                        pick["score"], pick["p_prob"], pick["s_prob"],
+                        pick["score"], pick.get("quality", -1),
+                        pick["p_prob"], pick["s_prob"],
                         pick["tp_std"], pick["ts_std"],
                         pick["p_prob_std"], pick["s_prob_std"],
                         pick["num_support"], pick["sources"],
-                        pick["picker_cluster_sizes"],
+                        pick.get("picker_window_vote_ratios", ""),
                         pick.get("picker_uncertainties", ""),
                         pick.get("pick_provenance", "initial"),
-                        pick.get("repick_status", "unknown"),
-                        pick.get("repick_support", -1),
-                        pick.get("repick_sources", ""),
-                        pick.get("repick_required_support", -1),
                         pick.get("p_snr_e", -1.0),
                         pick.get("p_snr_n", -1.0),
                         pick.get("p_snr_z", -1.0),

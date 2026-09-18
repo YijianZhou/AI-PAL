@@ -19,10 +19,10 @@ class Config(AIPALConfig):
     # Model structure. Class order: Noise, P, S.
     self.ft_frame_length = 0.5
     self.ft_frame_step = 0.1
-    self.ft_d_model = 384
-    self.ft_num_heads = 6
+    self.ft_d_model = 256
+    self.ft_num_heads = 4
     self.ft_num_layers = 5
-    self.ft_ffn_hidden = 768
+    self.ft_ffn_hidden = 512
     self.ft_norm_eps = 1e-6
     self.ft_rotary_dim = 64
     self.ft_max_sequence_length = 512
@@ -34,7 +34,8 @@ class Config(AIPALConfig):
 
     # Training.
     self.num_epochs = 20
-    self.batch_size = 64
+    self.batch_size = 128
+    self.neg_reduction_ratio = 1.0
     self.learning_rate = 1e-4
     self.min_learning_rate = 1e-6
     self.warmup_steps = 10000
@@ -43,7 +44,8 @@ class Config(AIPALConfig):
     self.adam_eps = 1e-8
     self.amp = True
     self.grad_clip_norm = 1.0
-    self.ckpt_step = 500
+    self.valid_step = 5000
+    self.max_checkpoints = 20
     self.summary_step = 100
 
     # Continuous inference.

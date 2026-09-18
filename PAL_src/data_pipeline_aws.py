@@ -23,6 +23,8 @@ WAVEFORM_NAME = re.compile(
     r"(?P<year_day>\d{7})\.ms$"
 )
 COMPONENT_ORDER = ("E", "N", "Z")
+MAX_MSEED_SEGMENTS_PER_COMPONENT = 5000
+MAX_MSEED_SAMPLE_COVERAGE_RATIO = 1.10
 
 
 def _as_date(value):
@@ -252,6 +254,41 @@ def _interpolate_trace(trace, sampling_rate):
     )
     return trace
 
+
+def _validate_mseed_fragments(stream, target_rate, source):
+    """Reject heavily fragmented or overlapping miniSEED before merging."""
+    segment_count = len(stream)
+    start_time = min(trace.stats.starttime for trace in stream)
+    end_time = max(trace.stats.endtime for trace in stream)
+    expected_samples = max(
+        1, int(round(float(end_time - start_time) * target_rate)) + 1
+    )
+    equivalent_samples = sum(
+        max(
+            1,
+            int(round(
+                float(trace.stats.endtime - trace.stats.starttime) * target_rate
+            )) + 1,
+        )
+        for trace in stream
+    )
+    coverage_ratio = equivalent_samples / expected_samples
+    if (
+        segment_count > MAX_MSEED_SEGMENTS_PER_COMPONENT
+        or coverage_ratio > MAX_MSEED_SAMPLE_COVERAGE_RATIO
+    ):
+        raise ValueError(
+            "pathological miniSEED fragmentation/overlap in {}: "
+            "{} segments (limit {}), sample coverage ratio {:.3f} "
+            "(limit {:.3f})".format(
+                source,
+                segment_count,
+                MAX_MSEED_SEGMENTS_PER_COMPONENT,
+                coverage_ratio,
+                MAX_MSEED_SAMPLE_COVERAGE_RATIO,
+            )
+        )
+
 def _read_s3_trace(record, s3_client, bucket):
     body = s3_client.get_object(Bucket=bucket, Key=record["key"])["Body"].read()
     stream = read(io.BytesIO(body), format="MSEED")
@@ -271,6 +308,11 @@ def _read_s3_trace(record, s3_client, bucket):
         key=lambda trace: float(trace.stats.endtime - trace.stats.starttime),
     )
     target_rate = float(target_trace.stats.sampling_rate)
+    _validate_mseed_fragments(
+        matching,
+        target_rate,
+        "s3://{}/{}".format(bucket, record["key"]),
+    )
     for trace in matching:
         _interpolate_trace(trace, target_rate)
     matching.merge(method=1, fill_value=0)
@@ -290,8 +332,11 @@ def read_data_aws(
     acceleration_instrument_codes=("N",),
     start_time=None,
     end_time=None,
+    to_prep=True,
 ):
     """Merge adjacent daily S3 components and convert counts to velocity."""
+    if not to_prep:
+        raise ValueError("raw SCEDC waveform objects require to_prep=True")
     if not records:
         return Stream()
 
@@ -365,8 +410,8 @@ def read_data_aws(
         output += trace
     return output
 
-def get_pal_picks(date_value, pick_dir):
-    """Read PAL pick output while retaining its NET.STA identifier."""
+def get_pal_picks(date_value, pick_dir, vp=5.9, vs=3.45):
+    """Read PAL picks and derive PAL's rough origin time in memory."""
     dtype = [
         ("net_sta", "O"), ("sta_ot", "O"), ("tp", "O"),
         ("ts", "O"), ("s_amp", "O"),
@@ -377,11 +422,21 @@ def get_pal_picks(date_value, pick_dir):
     picks = []
     with path.open(encoding="utf-8") as fp:
         for line in fp:
-            values = line.rstrip("\n").split(",")
-            if len(values) < 5:
+            values = [value.strip() for value in line.rstrip("\n").split(",")]
+            if len(values) < 4:
                 continue
-            picks.append(
-                (values[0], UTCDateTime(values[1]), UTCDateTime(values[2]),
-                 UTCDateTime(values[3]), float(values[4]))
-            )
+            try:
+                tp, ts = UTCDateTime(values[1]), UTCDateTime(values[2])
+                s_amp = float(values[3])
+                distance = (
+                    (ts - tp) / (1.0 / float(vs) - 1.0 / float(vp))
+                )
+                sta_ot = tp - distance / float(vp)
+            except (TypeError, ValueError):
+                if len(values) < 5:
+                    continue
+                sta_ot = UTCDateTime(values[1])
+                tp, ts = UTCDateTime(values[2]), UTCDateTime(values[3])
+                s_amp = float(values[4])
+            picks.append((values[0], sta_ot, tp, ts, s_amp))
     return np.array(picks, dtype=dtype)

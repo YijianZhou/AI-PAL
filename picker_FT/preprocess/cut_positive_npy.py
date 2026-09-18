@@ -36,7 +36,13 @@ to_prep = cfg.to_prep
 global_max_norm = cfg.global_max_norm
 num_aug = cfg.num_aug
 positive_num_aug_mode = getattr(cfg, 'positive_num_aug_mode', 'fixed')
+if positive_num_aug_mode == 'fixed' and (num_aug is None or num_aug < 1):
+    raise ValueError('set num_aug >= 1 when positive_num_aug_mode is "fixed"')
 max_noise = cfg.max_noise
+
+
+def phase_is_available(value):
+    return float(value) >= 0
 
 
 def get_sta_date(event_list):
@@ -46,13 +52,21 @@ def get_sta_date(event_list):
         event_name = dtime2str(ot)
         for net_sta, pick in picks.items():
             tp, ts = pick[:2]
+            has_p = phase_is_available(tp)
+            has_s = phase_is_available(ts)
+            if not has_p and not has_s:
+                raise ValueError(
+                    'phase row has neither P nor S for %s in %s'
+                    % (net_sta, event_name)
+                )
+            phase_anchor = tp if has_p else ts
             metadata = pick[2] if len(pick) > 2 else {}
             if positive_num_aug_mode == 'phase':
                 if 'num_aug' not in metadata:
                     raise ValueError(
                         'phase augmentation mode requires num_aug metadata for '
                         '%s at %s; run 0_analyze_phase_rarity first'
-                        % (net_sta, tp)
+                        % (net_sta, phase_anchor)
                     )
                 pick_num_aug = int(metadata['num_aug'])
             elif positive_num_aug_mode == 'fixed':
@@ -62,7 +76,7 @@ def get_sta_date(event_list):
                     'positive_num_aug_mode must be "phase" or "fixed"'
                 )
             if pick_num_aug < 1:
-                raise ValueError('num_aug must be >= 1 for %s at %s' % (net_sta, tp))
+                raise ValueError('num_aug must be >= 1 for %s at %s' % (net_sta, phase_anchor))
             rand = np.random.rand(1)[0]
             if rand < train_ratio:
                 samp_class = 'train'
@@ -70,7 +84,7 @@ def get_sta_date(event_list):
                 samp_class = 'valid'
             else:
                 continue
-            sta_date = '%s_%s' % (net_sta, tp.date)
+            sta_date = '%s_%s' % (net_sta, phase_anchor.date)
             sta_date_dict.setdefault(sta_date, []).append(
                 [samp_class, event_name, tp, ts, pick_num_aug]
             )
@@ -81,9 +95,15 @@ def add_noise(st, day_stream, tp, ts, picks):
     date = UTCDateTime(st[0].stats.starttime.date)
     t0 = date + win_len/2 + np.random.rand(1)[0] * (86400-win_len*1.5)
     t1 = t0 + win_len
-    is_tp = (picks['tp'] > t0) * (picks['tp'] < t1)
-    is_ts = (picks['ts'] > t0) * (picks['ts'] < t1)
-    if sum(is_tp*is_ts) > 0:
+    is_tp = np.asarray([
+        phase_is_available(value) and t0 < value < t1
+        for value in picks['tp']
+    ])
+    is_ts = np.asarray([
+        phase_is_available(value) and t0 < value < t1
+        for value in picks['ts']
+    ])
+    if np.any(is_tp | is_ts):
         return st
     st_noise = day_stream.copy().slice(t0-win_len/2, t1+win_len/2)
     if len(st_noise) != 3:
@@ -95,8 +115,16 @@ def add_noise(st, day_stream, tp, ts, picks):
         return st
     npts = min([len(tr) for tr in st + st_noise])
     noise_scale = max_noise * np.random.rand(1)[0]
+    has_p = phase_is_available(tp)
+    has_s = phase_is_available(ts)
+    phase_anchor = tp if has_p else ts
+    signal_start = tp if has_p and has_s else phase_anchor - step_len
+    signal_end = ts if has_p and has_s else phase_anchor + step_len
     for ii in range(3):
-        scale = noise_scale * np.amax(abs(st[ii].slice(tp, ts).data))
+        signal = st[ii].slice(signal_start, signal_end).data
+        if len(signal) == 0:
+            signal = st[ii].data
+        scale = noise_scale * np.amax(abs(signal))
         st[ii].data[0:npts] += st_noise[ii].data[0:npts] * scale
     return st.detrend('demean').normalize(global_max=global_max_norm)
 
@@ -134,19 +162,25 @@ class Positive(Dataset):
     dtype = [('tp','O'),('ts','O')]
     picks = np.array([(tp,ts) for _,_,tp,ts,_ in samples], dtype=dtype)
     for [samp_class, event_name, tp, ts, pick_num_aug] in samples:
-        if tp > ts:
+        has_p = phase_is_available(tp)
+        has_s = phase_is_available(ts)
+        if has_p and has_s and tp > ts:
             continue
+        phase_anchor = tp if has_p else ts
         n_aug = pick_num_aug if samp_class == 'train' else 1
         for aug_idx in range(n_aug):
-            rand_dt = min(rand_dt_max, win_len-step_len-(ts-tp))
-            start_time = tp - step_len - np.random.rand(1)[0] * rand_dt
+            phase_span = ts - tp if has_p and has_s else 0.0
+            rand_dt = min(rand_dt_max, win_len-step_len-phase_span)
+            start_time = phase_anchor - step_len - np.random.rand(1)[0] * rand_dt
             end_time = start_time + win_len
             st = cut_event_window(day_stream, start_time, end_time)
             if not st:
                 continue
             if aug_idx > 0 and max_noise > 0:
                 st = add_noise(st, day_stream, tp, ts, picks)
-            sample = stream_to_sample(st, tp-start_time, ts-start_time, win_npts)
+            tp_rel = tp - start_time if has_p else -1.0
+            ts_rel = ts - start_time if has_s else -1.0
+            sample = stream_to_sample(st, tp_rel, ts_rel, win_npts)
             if samp_class == 'train':
                 train_samples.append(sample)
             if samp_class == 'valid':

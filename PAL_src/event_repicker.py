@@ -29,7 +29,9 @@ import associator_pal
 from phase_merge import (
     format_time, group_events, read_phase_file, resolve_pick_provenance,
 )
-from pick_ensemble import format_picker_cluster_sizes
+from pick_ensemble import (
+    format_picker_window_vote_ratios, repick_quality_code,
+)
 from waveform_qc import displacement_amplitude, is_glitch
 
 
@@ -40,7 +42,7 @@ POS_PICKER_REGISTRY = {
     "RUN": ("picker_RUN", "RUNPositivePicker"),
 }
 
-EVENT_REPICK_VERSION = "both_group_anchor_reassociation_v18"
+EVENT_REPICK_VERSION = "repick_quality_vote_ratio_v19"
 EVENT_WAVEFORM_PRE_ORIGIN_SEC = 5.0
 EVENT_WAVEFORM_POST_S_SEC = 10.0
 EVENT_WAVEFORM_PLOT_DPI = 200
@@ -407,6 +409,15 @@ class EventRepicker(object):
                 "repick_min_window_vote_ratio must be in (0, 1]"
             )
 
+    def set_station_geometry(self, stations):
+        """Refresh epoch-aware station geometry before one interval."""
+        if not stations:
+            raise ValueError("event repicker station geometry is empty")
+        self.stations = stations
+        self.reassociator = associator_pal.PS_Pair_Assoc(
+            self.stations, **self.reassociation_params
+        )
+
     def _resolve_reassociation_params(self):
         """Resolve the full-network PAL parameters used after repicking."""
         configured = getattr(self.cfg, "subnet_assoc_params", {})
@@ -419,7 +430,7 @@ class EventRepicker(object):
             raise ValueError("full-network min_sta must be positive")
         supported = {
             "xy_margin", "xy_grid", "z_grids", "vp", "ot_dev",
-            "max_res", "max_drop", "min_sta",
+            "max_res", "max_drop", "min_sta", "lat_range", "lon_range",
         }
         params = {key: value for key, value in params.items() if key in supported}
         print(
@@ -1058,6 +1069,11 @@ class EventRepicker(object):
                 num_station_streams += 1
                 wrote_event = True
             num_events += int(wrote_event)
+            callback = getattr(
+                self.cfg, "event_waveform_complete_callback", None
+            )
+            if wrote_event and callback is not None:
+                callback(origin, event_dir)
         print(
             "filtered event waveforms: {} events | {} station streams | {}"
             .format(num_events, num_station_streams, output_dir),
@@ -1647,7 +1663,11 @@ class EventRepicker(object):
                 "{}:{}".format(group_name, name): value
                 for name, value in group_pick["members"].items()
             })
-        return {
+        vote_ratios = {
+            name: float(item["num_votes"]) / float(self.cfg.repick_num_repeat)
+            for name, item in all_members.items()
+        }
+        output = {
             "sta": job["station"],
             "p": tp.datetime,
             "s": ts.datetime,
@@ -1661,16 +1681,16 @@ class EventRepicker(object):
             "s_prob_std": timing["s_prob_std"],
             "num_support": sum(item["num_support"] for item in selected.values()),
             "sources": "|".join(sorted(all_members)),
-            "picker_cluster_sizes": format_picker_cluster_sizes({
-                name: item["num_votes"] for name, item in all_members.items()
-            }),
+            "picker_window_vote_ratios": format_picker_window_vote_ratios(
+                vote_ratios
+            ),
             "picker_uncertainties": _format_picker_uncertainties(all_members),
             "pick_provenance": provenance,
-            "repick_status": "accepted",
-            "repick_support": len(groups),
-            "repick_sources": "|".join(groups),
-            "repick_required_support": len(groups),
         }
+        output["quality"] = repick_quality_code(
+            provenance, output["picker_window_vote_ratios"], self.cfg
+        )
+        return output
 
     def _combine_repicker_groups(self, job, group_results):
         pos_neg = list(group_results["POS_NEG"])
@@ -2130,8 +2150,8 @@ class EventRepicker(object):
                     catalog_fp.write(header)
                 for pick in sorted(event["picks"], key=lambda item: item["sta"]):
                     phase_fp.write(
-                        "{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},"
-                        "{:.4f},{:.4f},{},{},{},{},{},{},{},{},{},"
+                        "{},{},{},{},{},{:.4f},{:.4f},{:.4f},{:.4f},"
+                        "{:.4f},{:.4f},{},{},{},{},{},"
                         "{:.4f},{:.4f},{:.4f}\n".format(
                             pick["sta"],
                             format_time(
@@ -2141,6 +2161,7 @@ class EventRepicker(object):
                                 pick["s"], self.cfg.merge_time_format_digits
                             ),
                             pick["score"],
+                            pick.get("quality", -1),
                             pick["p_prob"],
                             pick["s_prob"],
                             pick["tp_std"],
@@ -2149,13 +2170,9 @@ class EventRepicker(object):
                             pick["s_prob_std"],
                             pick["num_support"],
                             pick["sources"],
-                            pick["picker_cluster_sizes"],
+                            pick.get("picker_window_vote_ratios", ""),
                             pick.get("picker_uncertainties", ""),
                             pick.get("pick_provenance", "initial"),
-                            pick.get("repick_status", "unknown"),
-                            pick.get("repick_support", -1),
-                            pick.get("repick_sources", ""),
-                            pick.get("repick_required_support", -1),
                             pick.get("p_snr_e", -1.0),
                             pick.get("p_snr_n", -1.0),
                             pick.get("p_snr_z", -1.0),

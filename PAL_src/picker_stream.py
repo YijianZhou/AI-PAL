@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from data_pipeline import preprocess_picker_stream
+from torch_backends import configure_torch_backends
 
 
 def _drop_file_cache(file_object):
@@ -19,17 +20,6 @@ def _drop_file_cache(file_object):
         advise(file_object.fileno(), 0, 0, advice)
     except OSError:
         pass
-
-
-def configure_torch_backends(_cfg=None):
-    """Disable unsupported NNPACK dispatch before loading picker models."""
-    nnpack = getattr(torch.backends, "nnpack", None)
-    set_flags = getattr(nnpack, "set_flags", None)
-    if set_flags is None:
-        return False
-    set_flags(False)
-    print("PyTorch NNPACK backend disabled", flush=True)
-    return True
 
 
 class RetainedStationWaveform(object):
@@ -118,6 +108,7 @@ class PreparedPickerStream(object):
         window_stride_sec,
         taper_max_length_sec,
         num_channels=3,
+        missing_channel_coverage=None,
     ):
         self.sampling_rate = float(sampling_rate)
         self.window_length_sec = float(window_length_sec)
@@ -133,13 +124,10 @@ class PreparedPickerStream(object):
         self.start_time = start_time
         self.end_time = end_time
         self.stream = stream.slice(start_time, end_time)
-        self.raw_stream = raw_stream.slice(start_time, end_time)
-        # ObsPy filtering commonly promotes samples to float64. Native models
-        # and positive repickers consume float32, so retaining float64 doubles
-        # the dominant realtime waveform-cache allocation without adding useful
-        # precision.
-        for trace in self.stream:
-            trace.data = np.asarray(trace.data, dtype=np.float32)
+        self.raw_stream = (
+            raw_stream.slice(start_time, end_time)
+            if raw_stream is not None else None
+        )
         self.net_sta = "{}.{}".format(
             self.stream[0].stats.network,
             self.stream[0].stats.station,
@@ -161,54 +149,83 @@ class PreparedPickerStream(object):
         self._cpu_tensor = torch.from_numpy(data)
         self._device_tensors = {"cpu": self._cpu_tensor}
         self._device_lock = Lock()
-        self.missing_channels = self._build_missing_channel_mask()
-        # Raw samples are needed only for the missing-channel mask. Keeping an
-        # hour-long raw copy for every station can exhaust host RAM while GPU
-        # inference is serialized.
+        self.missing_channels = self._build_missing_channel_mask(
+            missing_channel_coverage
+        )
+        # Raw samples are needed only for the missing-channel mask. Keeping a
+        # full continuous waveform copy for every station wastes host RAM while
+        # GPU inference is serialized.
         self.raw_stream = None
 
     @classmethod
     def from_raw_stream(cls, stream, cfg):
-        filtered, raw = preprocess_picker_stream(
+        missing_channel_coverage = cls._compact_missing_channel_coverage(
+            stream
+        )
+        filtered, _ = preprocess_picker_stream(
             stream,
             num_channels=cfg.num_chn,
             sampling_rate=cfg.samp_rate,
             min_length_sec=cfg.win_len,
             frequency_band=cfg.freq_band,
             taper_max_length_sec=cfg.taper_max_length_sec,
+            to_filter=bool(getattr(cfg, "to_filter", True)),
+            retain_raw=False,
         )
         if len(filtered) != cfg.num_chn:
             return None
         try:
             return cls(
                 filtered,
-                raw,
+                None,
                 cfg.samp_rate,
                 cfg.win_len,
                 cfg.win_stride,
                 cfg.taper_max_length_sec,
                 num_channels=cfg.num_chn,
+                missing_channel_coverage=missing_channel_coverage,
             )
         except ValueError:
             return None
 
-    def _build_missing_channel_mask(self):
+    @staticmethod
+    def _compact_missing_channel_coverage(stream):
+        """Retain original zero coverage without copying waveform amplitudes."""
+        return [
+            (
+                trace.stats.starttime,
+                float(trace.stats.sampling_rate),
+                np.logical_or(
+                    ~np.isfinite(np.asarray(trace.data)),
+                    np.asarray(trace.data) == 0,
+                ),
+            )
+            for trace in stream
+        ]
+
+    def _build_missing_channel_mask(self, compact_coverage=None):
         masks = []
+        if compact_coverage is None:
+            compact_coverage = [
+                (
+                    trace.stats.starttime,
+                    float(trace.stats.sampling_rate),
+                    np.asarray(trace.data) == 0,
+                )
+                for trace in self.raw_stream
+            ]
         for index in range(self.num_windows):
             window_start = self.start_time + index * self.window_stride_sec
             channel_mask = []
-            for trace in self.raw_stream:
-                rate = float(trace.stats.sampling_rate)
-                first = int(round((window_start - trace.stats.starttime) * rate))
+            for trace_start, rate, zero_mask in compact_coverage:
+                first = int(round((window_start - trace_start) * rate))
                 window_npts = int(round(rate * self.window_length_sec))
                 last = first + window_npts
-                if first < 0 or last > len(trace.data):
+                if first < 0 or last > len(zero_mask):
                     channel_mask.append(True)
                     continue
-                data = trace.data[first:last]
                 channel_mask.append(
-                    len(data) < window_npts
-                    or np.count_nonzero(data == 0) > window_npts / 4
+                    np.count_nonzero(zero_mask[first:last]) > window_npts / 4
                 )
             masks.append(channel_mask)
         return np.asarray(masks, dtype=bool)

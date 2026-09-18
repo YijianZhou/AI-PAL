@@ -52,7 +52,7 @@ def make_loader(sample_npy, num_workers, write_batch_size, prefetch_factor):
     dataset = NpyWindowShards(sample_npy)
     kwargs = dict(batch_size=1, shuffle=False, num_workers=num_workers, pin_memory=False, collate_fn=collate_shard)
     if num_workers > 0:
-        kwargs.update(prefetch_factor=prefetch_factor, persistent_workers=True)
+        kwargs.update(prefetch_factor=prefetch_factor)
     return DataLoader(dataset, **kwargs)
 
 

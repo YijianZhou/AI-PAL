@@ -67,11 +67,17 @@ class SARPositivePicker(object):
         ckpt_path = ckpt_dir
     else:
         if int(ckpt_idx) == -1:
-            ckpts = glob.glob(os.path.join(ckpt_dir, '*.ckpt'))
-            if not ckpts:
+            best_path = os.path.join(ckpt_dir, 'best.ckpt')
+            numbered = glob.glob(os.path.join(ckpt_dir, '[0-9]*_*.ckpt'))
+            if os.path.isfile(best_path):
+                ckpt_path = best_path
+            elif not numbered:
                 raise FileNotFoundError('No .ckpt files found in {}'.format(ckpt_dir))
-            ckpt_idx = max([int(os.path.basename(ckpt).split('_')[0]) for ckpt in ckpts])
-        ckpt_path = sorted(glob.glob(os.path.join(ckpt_dir, '%s_*.ckpt' % ckpt_idx)))[0]
+            else:
+                ckpt_idx = max(int(os.path.basename(path).split('_')[0]) for path in numbered)
+                ckpt_path = sorted(glob.glob(os.path.join(ckpt_dir, '%s_*.ckpt' % ckpt_idx)))[0]
+        else:
+            ckpt_path = sorted(glob.glob(os.path.join(ckpt_dir, '%s_*.ckpt' % ckpt_idx)))[0]
     print('SAR checkpoint: {}'.format(ckpt_path), flush=True)
     self.device = torch.device(
         'cuda:%s' % gpu_idx

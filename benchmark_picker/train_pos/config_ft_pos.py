@@ -1,15 +1,3 @@
-from pathlib import Path
-import sys
-
-_config_dir = Path(__file__).resolve().parent
-for _directory in (_config_dir, *_config_dir.parents):
-  _pal_src = _directory / "PAL_src"
-  if (_pal_src / "config_ai_pal.py").exists():
-    if str(_pal_src) not in sys.path:
-      sys.path.insert(0, str(_pal_src))
-    break
-else:
-  raise ImportError("PAL_src/config_ai_pal.py was not found above {}".format(__file__))
 from config_ai_pal import Config as AIPALConfig
 
 class Config(AIPALConfig):
@@ -19,10 +7,10 @@ class Config(AIPALConfig):
     # Model structure. Class order: Noise, P, S.
     self.ft_frame_length = 0.5
     self.ft_frame_step = 0.1
-    self.ft_d_model = 384
-    self.ft_num_heads = 6
+    self.ft_d_model = 256
+    self.ft_num_heads = 4
     self.ft_num_layers = 5
-    self.ft_ffn_hidden = 768
+    self.ft_ffn_hidden = 512
     self.ft_norm_eps = 1e-6
     self.ft_rotary_dim = 64
     self.ft_max_sequence_length = 512
@@ -34,7 +22,7 @@ class Config(AIPALConfig):
 
     # Training.
     self.num_epochs = 20
-    self.batch_size = 64
+    self.batch_size = 128
     self.learning_rate = 1e-4
     self.min_learning_rate = 1e-6
     self.warmup_steps = 10000
@@ -43,7 +31,8 @@ class Config(AIPALConfig):
     self.adam_eps = 1e-8
     self.amp = True
     self.grad_clip_norm = 1.0
-    self.ckpt_step = 500
+    self.valid_step = 5000
+    self.max_checkpoints = 20
     self.summary_step = 100
 
     # Continuous inference.

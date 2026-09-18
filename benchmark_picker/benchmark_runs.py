@@ -5,34 +5,34 @@ from pathlib import Path
 # =============================================================================
 # USER SETTINGS: ENABLED MODEL VERSIONS
 # =============================================================================
-# checkpoint may point to a directory (latest checkpoint is selected) or to one
+# checkpoint may point to a directory (best.ckpt preferred) or to one
 # exact checkpoint file. marker must be unique and filesystem-safe.
 MODEL_RUNS = [
     {
         'model': 'SAR',
-        'checkpoint': Path('/nas/zhouyj/AI_ckpt/ceed_ckpt_sar_pos_01'),
-        'marker': 'ceed_pos_sar01',
+        'checkpoint': Path('/nas/zhouyj/AI_ckpt/ceed_pos/SAR/best.ckpt'),
+        'marker': 'ceed_pos_sar_v7',
         'label': 'SAR CEED-pos 0.1s',
         'color': '#4477AA',
     },
     {
         'model': 'PHN',
-        'checkpoint': Path('/nas/zhouyj/AI_ckpt/ceed_ckpt_phn_pos_1M'),
-        'marker': 'ceed_pos_phn1m',
+        'checkpoint': Path('/nas/zhouyj/AI_ckpt/ceed_pos/PHN/best.ckpt'),
+        'marker': 'ceed_pos_phn_v7',
         'label': 'PHN CEED-pos 1M',
         'color': '#CC6677',
     },
     {
         'model': 'RUN',
-        'checkpoint': Path('/nas/zhouyj/AI_ckpt/ceed_ckpt_run_pos_amp'),
-        'marker': 'ceed_pos_run',
+        'checkpoint': Path('/nas/zhouyj/AI_ckpt/ceed_pos/RUN/best.ckpt'),
+        'marker': 'ceed_pos_run_v7',
         'label': 'RUN CEED-pos',
         'color': '#228833',
     },
     {
         'model': 'FT',
-        'checkpoint': Path('/nas/zhouyj/AI_ckpt/ceed_ckpt_ft_pos'),
-        'marker': 'ceed_pos_ft',
+        'checkpoint': Path('/nas/zhouyj/AI_ckpt/ceed_pos/FT/best.ckpt'),
+        'marker': 'ceed_pos_ft_v7',
         'label': 'FT CEED-pos',
         'color': '#AA4499',
     },
@@ -68,7 +68,7 @@ MODEL_RUNS = [
 
 # Select any subset without editing MODEL_RUNS. Use [] to enable every entry.
 ENABLED_RUN_MARKERS = [
-    'ceed_pos_sar01', 'ceed_pos_phn1m', 'ceed_pos_run', 'ceed_pos_ft',
+    'ceed_pos_sar_v7', 'ceed_pos_phn_v7', 'ceed_pos_run_v7', 'ceed_pos_ft_v7',
 ]
 
 # CEED is an in-domain positive reference. It has no benchmark noise subset.
@@ -77,7 +77,7 @@ NOISE_DATASETS = ['INSTANCE', 'CWA', 'PNW', 'STEAD', 'OBST2024']
 SAMPLE_TYPES = ['positive', 'noise']
 
 # Name of the combined plot directory and figure titles.
-COMPARISON_MARKER = 'ceed_pos_4models'
+COMPARISON_MARKER = 'ceed_pos_4models_v7'
 
 
 def enabled_runs():

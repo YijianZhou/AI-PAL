@@ -1,15 +1,3 @@
-from pathlib import Path
-import sys
-
-_config_dir = Path(__file__).resolve().parent
-for _directory in (_config_dir, *_config_dir.parents):
-  _pal_src = _directory / "PAL_src"
-  if (_pal_src / "config_ai_pal.py").exists():
-    if str(_pal_src) not in sys.path:
-      sys.path.insert(0, str(_pal_src))
-    break
-else:
-  raise ImportError("PAL_src/config_ai_pal.py was not found above {}".format(__file__))
 from config_ai_pal import Config as AIPALConfig
 
 class Config(AIPALConfig):
@@ -29,7 +17,8 @@ class Config(AIPALConfig):
     self.batch_size = 128
     self.learning_rate = 1e-3
     self.weight_decay = 0.0
-    self.ckpt_step = 500
+    self.valid_step = 5000
+    self.max_checkpoints = 20
     self.summary_step = 100
 
     # Continuous inference.

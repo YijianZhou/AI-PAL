@@ -1,8 +1,7 @@
 """Parallel runner for local and SCEDC AWS daily PAL picking."""
 
 import contextlib
-import importlib
-import multiprocessing
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -16,46 +15,6 @@ def parse_date_range(time_range):
     return start, end
 
 
-def _split_ranges(start, end, worker_count):
-    num_days = (end - start).days
-    worker_count = min(max(1, worker_count), num_days)
-    base_days, remainder = divmod(num_days, worker_count)
-    ranges = []
-    current = start
-    for worker_index in range(worker_count):
-        days = base_days + (1 if worker_index < remainder else 0)
-        next_date = current + timedelta(days=days)
-        ranges.append((current, next_date))
-        current = next_date
-    return ranges
-
-
-def _pick_worker(task):
-    from run_pick import run_pick
-
-    (
-        worker_range,
-        data_dir,
-        station_file,
-        pick_dir,
-        config_module,
-        config_class,
-        overwrite,
-        log_path,
-    ) = task
-    cfg = getattr(importlib.import_module(config_module), config_class)()
-    with Path(log_path).open("w", encoding="utf-8") as log_fp:
-        with contextlib.redirect_stdout(log_fp), contextlib.redirect_stderr(log_fp):
-            run_pick(
-                worker_range,
-                data_dir,
-                station_file,
-                pick_dir,
-                cfg,
-                overwrite=overwrite,
-            )
-
-
 def run_parallel_local_pick(
     time_range,
     data_dir,
@@ -67,7 +26,9 @@ def run_parallel_local_pick(
     overwrite=False,
     include_association_halo=False,
 ):
-    """Write daily picks, optionally including one day beyond each boundary."""
+    """Process dates sequentially and stations concurrently within each date."""
+    from run_pick import run_pick
+
     start, end = parse_date_range(time_range)
     if include_association_halo:
         start -= timedelta(days=1)
@@ -79,77 +40,59 @@ def run_parallel_local_pick(
     log_dir = Path(log_dir).resolve()
     pick_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
-    tasks = []
-    for index, (worker_start, worker_end) in enumerate(
-        _split_ranges(start, end, num_workers), start=1
-    ):
-        worker_range = "{}-{}".format(
-            worker_start.strftime("%Y%m%d"),
-            worker_end.strftime("%Y%m%d"),
+    run_range = "{}-{}".format(
+        start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+    )
+    log_path = log_dir / "pick_{}.log".format(run_range)
+    print(
+        "PAL picking: sequential days | {} station workers | log {}".format(
+            max(1, int(num_workers)), log_path
         )
-        log_path = log_dir / "pick_worker_{}_{}.log".format(index, worker_range)
-        print("launch pick worker {}: {} -> {}".format(index, worker_range, log_path))
-        tasks.append((
-            worker_range,
-            str(Path(data_dir).resolve()),
-            str(Path(station_file).resolve()),
-            str(pick_dir),
-            config_factory.__module__,
-            config_factory.__name__,
-            bool(overwrite),
-            str(log_path),
-        ))
-
-    with multiprocessing.Pool(processes=len(tasks)) as pool:
-        results = [pool.apply_async(_pick_worker, (task,)) for task in tasks]
-        failures = []
-        for index, result in enumerate(results, start=1):
-            try:
-                result.get()
-                print("pick worker {} completed".format(index))
-            except Exception as exc:
-                failures.append((index, repr(exc)))
-    if failures:
-        raise RuntimeError("pick workers failed: {}".format(failures))
-
-def _aws_pick_worker(task):
-    (
-        worker_range,
-        station_file,
-        pick_dir,
-        pal_source_dir,
-        config_module,
-        config_class,
-        bucket,
-        region,
-        root_prefix,
-        access_mode,
-        location_priority,
-        acceleration_instrument_codes,
-        overwrite,
-        retry_failed_dates,
-        log_path,
-    ) = task
-    from run_pick_aws import run_pick as run_pick_aws
-
-    cfg = getattr(importlib.import_module(config_module), config_class)()
-    with Path(log_path).open("w", encoding="utf-8") as log_fp:
+    )
+    with log_path.open("w", encoding="utf-8") as log_fp:
         with contextlib.redirect_stdout(log_fp), contextlib.redirect_stderr(log_fp):
-            run_pick_aws(
-                worker_range,
-                station_file,
-                pick_dir,
-                pal_source_dir,
-                cfg,
-                bucket,
-                region,
-                root_prefix,
-                access_mode,
-                location_priority,
-                acceleration_instrument_codes,
-                overwrite,
-                retry_failed_dates,
-            )
+            try:
+                run_pick(
+                    run_range,
+                    str(Path(data_dir).resolve()),
+                    str(Path(station_file).resolve()),
+                    str(pick_dir),
+                    config_factory(),
+                    overwrite=bool(overwrite),
+                    num_workers=num_workers,
+                )
+            except BaseException:
+                print("\nFATAL PAL PICK ERROR", flush=True)
+                traceback.print_exc(file=log_fp)
+                log_fp.flush()
+                raise
+    print("PAL picking completed: {}".format(run_range))
+
+def _pending_aws_dates(
+    start, end, pick_dir, overwrite, retry_failed_dates, buffer_sec,
+):
+    from run_pick_aws import has_current_ownership
+
+    status_dir = Path(pick_dir).parent / "pick_status"
+    pending = []
+    current = start
+    while current < end:
+        stem = current.isoformat()
+        done = status_dir / (stem + ".done.json")
+        failed = status_dir / (stem + ".failed.json")
+        pick_path = Path(pick_dir) / (stem + ".pick")
+        count_path = Path(pick_dir) / (stem + ".trigger_counts.csv")
+        ownership_current = (
+            pick_path.exists()
+            and count_path.exists()
+            and has_current_ownership(pick_path, buffer_sec)
+        )
+        if overwrite or not ownership_current or (
+            not done.exists() and (retry_failed_dates or not failed.exists())
+        ):
+            pending.append(current)
+        current += timedelta(days=1)
+    return pending
 
 
 def run_parallel_aws_pick(
@@ -169,57 +112,97 @@ def run_parallel_aws_pick(
     overwrite=False,
     retry_failed_dates=False,
 ):
-    """Run independent daily AWS picking ranges in parallel processes."""
+    """Process AWS dates sequentially and stations concurrently per date."""
+    from data_pipeline_aws import build_s3_client
+    from run_pick_aws import build_picker, load_raw_tail_cache, process_day
+
     start, end = parse_date_range(time_range)
     pick_dir = Path(pick_dir).resolve()
     log_dir = Path(log_dir).resolve()
     pick_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = []
-    for index, (worker_start, worker_end) in enumerate(
-        _split_ranges(start, end, num_workers), start=1
-    ):
-        worker_range = "{}-{}".format(
-            worker_start.strftime("%Y%m%d"),
-            worker_end.strftime("%Y%m%d"),
+    cfg_preview = config_factory()
+    buffer_sec = float(getattr(cfg_preview, "data_buffer_sec", 0.0))
+    dates = _pending_aws_dates(
+        start, end, pick_dir, bool(overwrite), bool(retry_failed_dates),
+        buffer_sec,
+    )
+    total_days = (end - start).days
+    skipped_days = total_days - len(dates)
+    if not dates:
+        print("all {} AWS pick dates are already complete".format(total_days))
+        return
+    station_workers = max(1, int(num_workers))
+    print(
+        "sequential AWS dates: {} pending, {} skipped, {} station workers"
+        .format(
+            len(dates), skipped_days, station_workers
         )
-        log_path = log_dir / "pick_worker_{}_{}.log".format(index, worker_range)
-        print("launch pick worker {}: {} -> {}".format(
-            index, worker_range, log_path
-        ))
-        tasks.append((
-            worker_range,
-            str(Path(station_file).resolve()),
-            str(pick_dir),
-            str(Path(pal_source_dir).expanduser().resolve()),
-            config_factory.__module__,
-            config_factory.__name__,
-            bucket,
-            region,
-            root_prefix,
-            access_mode,
-            tuple(location_priority),
-            tuple(acceleration_instrument_codes),
-            bool(overwrite),
-            bool(retry_failed_dates),
-            str(log_path),
-        ))
-
-    with multiprocessing.Pool(processes=len(tasks)) as pool:
-        results = [pool.apply_async(_aws_pick_worker, (task,)) for task in tasks]
-        failures = []
-        for index, result in enumerate(results, start=1):
+    )
+    cfg = config_factory()
+    picker, cfg = build_picker(
+        str(Path(pal_source_dir).expanduser().resolve()), cfg
+    )
+    s3_client = build_s3_client(region, access_mode)
+    pending_dates = set(dates)
+    previous_raw_tails = {}
+    failures = []
+    current = start
+    completed = 0
+    while current < end:
+        if current not in pending_dates:
+            if current + timedelta(days=1) in pending_dates:
+                previous_raw_tails = load_raw_tail_cache(
+                    current, station_file, cfg, s3_client, bucket,
+                    root_prefix, location_priority,
+                    acceleration_instrument_codes,
+                )
+            current += timedelta(days=1)
+            continue
+        if not previous_raw_tails and current == start:
+            previous_raw_tails = load_raw_tail_cache(
+                current - timedelta(days=1), station_file, cfg, s3_client,
+                bucket, root_prefix, location_priority,
+                acceleration_instrument_codes,
+            )
+        log_path = log_dir / "pick_day_{}.log".format(current.isoformat())
+        try:
+            with log_path.open("w", encoding="utf-8") as log_fp:
+                with contextlib.redirect_stdout(log_fp), contextlib.redirect_stderr(log_fp):
+                    next_raw_tails = process_day(
+                        current, station_file, pick_dir, picker, cfg,
+                        s3_client, bucket, root_prefix, location_priority,
+                        acceleration_instrument_codes, overwrite,
+                        retry_failed_dates, previous_raw_tails,
+                        num_workers=station_workers,
+                    )
+                    if next_raw_tails is None:
+                        next_raw_tails = load_raw_tail_cache(
+                            current, station_file, cfg, s3_client, bucket,
+                            root_prefix, location_priority,
+                            acceleration_instrument_codes,
+                        )
+            previous_raw_tails = next_raw_tails
+        except Exception as exc:
+            with log_path.open("a", encoding="utf-8") as log_fp:
+                log_fp.write("\nFATAL DATE ERROR\n")
+                log_fp.write(traceback.format_exc())
+            failures.append((current.isoformat(), repr(exc)))
+            print("AWS pick date {} failed: {}".format(current, exc))
             try:
-                result.get()
-                print("pick worker {} completed".format(index))
-            except Exception as exc:
-                failures.append((index, repr(exc)))
+                previous_raw_tails = load_raw_tail_cache(
+                    current, station_file, cfg, s3_client, bucket,
+                    root_prefix, location_priority,
+                    acceleration_instrument_codes,
+                )
+            except Exception:
+                previous_raw_tails = {}
+        completed += 1
+        if completed == 1 or completed % 10 == 0 or completed == len(dates):
+            print("AWS pick progress: {}/{} pending dates".format(
+                completed, len(dates)
+            ))
+        current += timedelta(days=1)
     if failures:
-        raise RuntimeError("AWS pick workers failed: {}".format(failures))
-
-
-
-
-
-
+        raise RuntimeError("AWS pick dates failed: {}".format(failures))

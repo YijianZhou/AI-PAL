@@ -1,4 +1,4 @@
-"""Run pseudo-realtime multi-model picking and PAL association.
+"""Run realtime picking, preferred PAL association, and explicit references.
 
 This script is intended to be launched from
 ``3_run_ai_pal/run_ai_pal_realtime/1_run_ai_pal_pick_assoc_realtime_eg.py`` after staging
@@ -28,6 +28,8 @@ if AI_PAL_ROOT not in sys.path:
 import config_ai_pal
 import realtime_pipeline as rtp
 import realtime_pickers
+import runtime_console
+from reference_association import reference_workflows, run_gamma, require_gamma_runtime
 from picker_stream import configure_torch_backends
 from station_sets import build_station_union
 # Load PAL under a unique module name without changing global import precedence.
@@ -62,6 +64,7 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--native_pickers_json", type=str, required=True)
     parser.add_argument("--reference_pickers_json", type=str, required=True)
+    parser.add_argument("--reference_associators_json", type=str, default="{}")
     parser.add_argument("--repicker_pos_neg_json", type=str, default="{}")
     parser.add_argument("--repicker_pos_json", type=str, default="{}")
     return cfg, parser.parse_args()
@@ -70,7 +73,7 @@ def parse_args():
 def _enabled_picker_names(cfg):
     names = list(cfg.continuous_picker_specs)
     names.extend(
-        name for name in cfg.picker_ref_group if name not in names
+        name for name in cfg.reference_picker_names if name not in names
     )
     supported = {"SAR", "FT", "PHN", "RUN", "PHN-SB"}
     unknown = [
@@ -78,7 +81,7 @@ def _enabled_picker_names(cfg):
         if spec["model"] not in supported
     ]
     unknown.extend(
-        name for name in cfg.picker_ref_group if name not in supported
+        name for name in cfg.reference_picker_names if name not in {"PHN-SB"}
     )
     if unknown:
         raise ValueError("unsupported realtime pickers: {}".format(unknown))
@@ -92,22 +95,12 @@ def _association_branch_members(cfg):
         for name in members
     ]
     branches = {rtp.PREFERRED_ENSEMBLE_BRANCH: preferred}
-    for picker_name in cfg.picker_ref_group:
-        branches[picker_name] = [picker_name]
+    for name, workflow in reference_workflows(cfg).items():
+        branches[name] = [workflow["picker"]]
     return branches
 
 
-def _continuous_picker_key(group_name, model_name):
-    return (
-        model_name
-        if group_name == "POS_NEG"
-        else "POS-{}".format(model_name)
-    )
-
-
 def apply_overrides(cfg, args):
-    if cfg.association_methods != ["PAL"]:
-        raise ValueError("currently supported association_methods: ['PAL']")
     cfg.out_root = args.out_root
     if args.full_sta_file is None:
         cfg.full_sta_file = str(build_station_union(
@@ -179,34 +172,30 @@ def apply_overrides(cfg, args):
             sorted(duplicate_names)
         ))
     picker_pos_neg = list(dict.fromkeys(cfg.picker_pos_neg_group))
-    picker_pos = list(dict.fromkeys(cfg.picker_pos_group))
-    references = set(cfg.picker_ref_group)
-    reference_branches = list(cfg.picker_ref_group)
-    cfg.continuous_picker_groups = {
-        "POS_NEG": [
-            _continuous_picker_key("POS_NEG", name)
-            for name in picker_pos_neg
-        ],
-        "POS": [
-            _continuous_picker_key("POS", name) for name in picker_pos
-        ],
+    cfg.reference_workflow_specs = reference_workflows(cfg)
+    cfg.reference_picker_names = list(dict.fromkeys(
+        item["picker"] for item in cfg.reference_workflow_specs.values()
+    ))
+    references = set(cfg.reference_picker_names)
+    reference_branches = list(cfg.reference_workflow_specs)
+    cfg.reference_associator_settings = json.loads(
+        getattr(args, "reference_associators_json", "{}")
+    )
+    if any(item["associator"] == "GaMMA" for item in cfg.reference_workflow_specs.values()):
+        for name, workflow in cfg.reference_workflow_specs.items():
+            if workflow["associator"] == "GaMMA" and not cfg.reference_associator_settings.get(name):
+                raise ValueError("missing GaMMA settings for reference workflow: {}".format(name))
+        require_gamma_runtime()
+    cfg.continuous_picker_groups = {"POS_NEG": picker_pos_neg}
+    cfg.continuous_picker_specs = {
+        name: {"group": "POS_NEG", "model": name} for name in picker_pos_neg
     }
-    cfg.continuous_picker_specs = {}
-    for group_name, model_names in (
-        ("POS_NEG", picker_pos_neg), ("POS", picker_pos),
-    ):
-        for model_name in model_names:
-            runtime_name = _continuous_picker_key(group_name, model_name)
-            cfg.continuous_picker_specs[runtime_name] = {
-                "group": group_name,
-                "model": model_name,
-            }
     if not cfg.continuous_picker_specs:
         raise ValueError("at least one preferred continuous picker is required")
     cfg.enabled_pickers = _enabled_picker_names(cfg)
     configured_plot_ref = list(getattr(
         cfg, "enable_event_waveform_plot_ref", []
-    ))
+    )) if reference_branches else []
     invalid_plot_ref = [
         index for index in configured_plot_ref
         if not isinstance(index, int)
@@ -223,21 +212,17 @@ def apply_overrides(cfg, args):
         reference_branches[index] for index in configured_plot_ref
     ]
     missing_native = set(picker_pos_neg) - set(cfg.native_picker_settings)
-    missing_continuous_pos = set(picker_pos) - set(
-        cfg.repicker_pos_settings
-    )
     missing_reference = references - set(cfg.reference_picker_settings)
-    if missing_native or missing_continuous_pos or missing_reference:
+    if missing_native or missing_reference:
         raise ValueError(
-            "selected picker specifications are missing: POS_NEG={} POS={} "
+            "selected picker specifications are missing: POS_NEG={} "
             "reference={}".format(
-                sorted(missing_native), sorted(missing_continuous_pos),
+                sorted(missing_native),
                 sorted(missing_reference)
             )
         )
     cfg.continuous_picker_group_min_support = {
         "POS_NEG": int(cfg.picker_pos_neg_group_min_picker_support),
-        "POS": int(cfg.picker_pos_group_min_picker_support),
     }
     for group_name, members in cfg.continuous_picker_groups.items():
         if not members:
@@ -258,7 +243,8 @@ def apply_overrides(cfg, args):
             "continuous_picker_group_min_support": (
                 cfg.continuous_picker_group_min_support
             ),
-            "picker_ref_group": cfg.picker_ref_group,
+            "reference_workflows": cfg.reference_workflow_specs,
+            "reference_associators": cfg.reference_associator_settings,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -277,10 +263,8 @@ def apply_overrides(cfg, args):
         continuous_spec = cfg.continuous_picker_specs.get(runtime_name)
         if continuous_spec is None:
             settings = cfg.reference_picker_settings[runtime_name]
-        elif continuous_spec["group"] == "POS_NEG":
-            settings = cfg.native_picker_settings[continuous_spec["model"]]
         else:
-            settings = cfg.repicker_pos_settings[continuous_spec["model"]]
+            settings = cfg.native_picker_settings[continuous_spec["model"]]
         cfg.picker_gpu_indices[runtime_name] = int(settings["gpu_idx"])
     print("picker GPU assignments: {}".format(cfg.picker_gpu_indices))
 
@@ -301,11 +285,6 @@ def apply_overrides(cfg, args):
             "repicker_pos_neg_group: {}".format(
                 sorted(set(picker_pos_neg) - set(selected_pos_neg))
             )
-        )
-    if set(picker_pos) - set(selected_pos):
-        raise ValueError(
-            "continuous POS pickers must be selected from repicker_pos_group: "
-            "{}".format(sorted(set(picker_pos) - set(selected_pos)))
         )
     cfg.repicker_pos_neg_settings = {
         name: cfg.repicker_pos_neg_settings[name] for name in selected_pos_neg
@@ -329,10 +308,7 @@ def apply_overrides(cfg, args):
                 )
             for name, spec in settings.items():
                 # Continuous POS_NEG models are reused and need no second load.
-                continuous_group = (
-                    picker_pos_neg if group_name == "POS_NEG" else picker_pos
-                )
-                if name in continuous_group:
+                if group_name == "POS_NEG" and name in picker_pos_neg:
                     continue
                 ckpt_path = spec.get("ckpt", "")
                 if not os.path.isfile(ckpt_path):
@@ -357,11 +333,7 @@ def apply_overrides(cfg, args):
     )
 
     visible_names = {}
-    preferred_runtime_names = [
-        name
-        for group_name in ("POS_NEG", "POS")
-        for name in cfg.continuous_picker_groups[group_name]
-    ]
+    preferred_runtime_names = picker_pos_neg
     for index, runtime_name in enumerate(preferred_runtime_names, start=1):
         spec = cfg.continuous_picker_specs[runtime_name]
         visible_names[runtime_name] = (
@@ -369,7 +341,7 @@ def apply_overrides(cfg, args):
                 index, spec["group"].lower(), spec["model"]
             )
         )
-    for index, reference_name in enumerate(cfg.picker_ref_group, start=1):
+    for index, reference_name in enumerate(cfg.reference_picker_names, start=1):
         reference_label = (
             "PhaseNet-SeisBench"
             if reference_name == "PHN-SB" else reference_name
@@ -398,13 +370,15 @@ def apply_overrides(cfg, args):
             "phase_dir_name": "2.1_phase_AI-PAL",
             "final_phase_dir_name": "3.1_phase_final_AI-PAL",
         },
-        "PHN-SB": {
-            "result_name": "PHN-SB_PAL",
-            "pick_dir_name": "1.3.1_picks_ref_PhaseNet-SeisBench",
-            "phase_dir_name": "2.2.1_phase_ref_PHN-SB_PAL",
-            "final_phase_dir_name": "3.2.1_phase_final_ref_PHN-SB_PAL",
-        },
     }
+    for index, (name, workflow) in enumerate(cfg.reference_workflow_specs.items(), start=1):
+        result_name = "{}_{}".format(workflow["picker"], workflow["associator"])
+        layouts[name] = {
+            "result_name": result_name,
+            "pick_dir_name": visible_names[workflow["picker"]],
+            "phase_dir_name": "2.2.{}_phase_ref_{}".format(index, result_name),
+            "final_phase_dir_name": "3.2.{}_phase_final_ref_{}".format(index, result_name),
+        }
     cfg.result_branches = {}
     for branch_name, members in cfg.association_branch_members.items():
         layout = layouts[branch_name]
@@ -433,6 +407,8 @@ def apply_overrides(cfg, args):
             else os.path.join(cfg.out_root, layout["pick_dir_name"])
         )
         cfg.result_branches[branch_name] = {
+            "associator": cfg.reference_workflow_specs.get(branch_name, {}).get("associator", "PAL"),
+            "associator_config": cfg.reference_associator_settings.get(branch_name, {}),
             "result_name": result_name,
             "members": members,
             "pick_dir": pick_dir,
@@ -470,6 +446,8 @@ def get_assoc_param(cfg, subnet_name, param):
     if suffix != subnet_name:
         params.update(configured.get(suffix, {}))
     if param not in params:
+        if param in ("lat_range", "lon_range"):
+            return None
         raise KeyError("Missing {} association parameter for {}".format(
             param, subnet_name
         ))
@@ -484,6 +462,7 @@ class ParallelSubnetAssociators(object):
         self.station_dicts = {}
         self.pick_sta_dict = {}
         self.startup_timing = {}
+        self.full_station_dict = rtp.get_realtime_sta_dict(cfg.full_sta_file)
         specifications = {}
         for subnet_name, fsta in cfg.association_station_files.items():
             sta_dict = rtp.get_realtime_sta_dict(fsta)
@@ -493,6 +472,7 @@ class ParallelSubnetAssociators(object):
                 for param in (
                     "xy_margin", "xy_grid", "z_grids", "min_sta",
                     "ot_dev", "max_res", "max_drop", "vp",
+                    "lat_range", "lon_range",
                 )
             })
         self.executor = ThreadPoolExecutor(
@@ -574,6 +554,8 @@ class ParallelSubnetAssociators(object):
 
     def associate(self, picks, segment, result_name, branch):
         self.assert_healthy()
+        if branch.get("associator", "PAL") == "GaMMA":
+            return run_gamma(picks, self.full_station_dict, segment, branch)
         futures = {
             subnet_name: self.executor.submit(
                 self._associate_one,
@@ -601,7 +583,16 @@ class ParallelSubnetAssociators(object):
 if __name__ == "__main__":
     cfg, args = parse_args()
     cfg = apply_overrides(cfg, args)
+    runtime_console.configure(cfg)
     configure_torch_backends(cfg)
+    runtime_console.log(
+        "AI-PAL",
+        "realtime startup | continuous={} | reference={} | postprocess={}".format(
+            cfg.continuous_picker_groups,
+            cfg.reference_picker_names,
+            "enabled" if cfg.enable_post_process else "disabled",
+        ),
+    )
     print("AI-PAL config source: {}".format(os.path.abspath(config_ai_pal.__file__)))
     print("PAL associator source: {}".format(
         os.path.abspath(associator_pal.__file__)
@@ -640,17 +631,18 @@ if __name__ == "__main__":
     }
     pickers = {}
     model_load_times = {}
+    runtime_console.log(
+        "startup",
+        "loading {} continuous/reference models | devices={}".format(
+            len(cfg.enabled_pickers), cfg.picker_gpu_indices
+        ),
+    )
     for picker_name in cfg.enabled_pickers:
         t0 = time.perf_counter()
         continuous_spec = cfg.continuous_picker_specs.get(picker_name)
         if continuous_spec is not None:
             model_name = continuous_spec["model"]
-            group_name = continuous_spec["group"]
-            settings = (
-                cfg.native_picker_settings[model_name]
-                if group_name == "POS_NEG"
-                else cfg.repicker_pos_settings[model_name]
-            )
+            settings = cfg.native_picker_settings[model_name]
             module_name, class_name = native_registry[model_name]
             module = importlib.import_module(module_name)
             picker_class = getattr(module, class_name)
@@ -792,6 +784,12 @@ if __name__ == "__main__":
                 .format(branch_name, exc.__class__.__name__, exc),
                 flush=True,
             )
+    runtime_console.log(
+        "ready",
+        "stations={} | association_networks={} | initialization complete".format(
+            len(pick_sta_dict), len(subnet_associators.associators)
+        ),
+    )
     try:
         rtp.write_initialization_timing(
             cfg.out_monitoring_dir,

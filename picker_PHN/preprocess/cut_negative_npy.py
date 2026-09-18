@@ -37,6 +37,32 @@ valid_ratio = cfg.valid_ratio
 max_assoc_ratio = cfg.max_assoc_ratio
 num_aug = cfg.num_aug
 positive_num_aug_mode = getattr(cfg, 'positive_num_aug_mode', 'fixed')
+if positive_num_aug_mode == 'fixed' and (num_aug is None or num_aug < 1):
+    raise ValueError('set num_aug >= 1 when positive_num_aug_mode is "fixed"')
+rarity_augmentation_values = getattr(cfg, 'rarity_augmentation_values', None)
+rarity_percentiles = getattr(cfg, 'rarity_percentiles', None)
+
+
+def phase_is_available(value):
+    return float(value) >= 0
+
+
+def expected_positive_multiplier():
+    if positive_num_aug_mode == 'fixed':
+        train_multiplier = float(num_aug)
+    elif positive_num_aug_mode == 'phase':
+        values = np.asarray(rarity_augmentation_values, dtype=float)
+        percentiles = np.asarray(rarity_percentiles, dtype=float)
+        if len(values) != len(percentiles) + 1:
+            raise ValueError('rarity augmentation values must have one more item than percentiles')
+        edges = np.concatenate(([0.0], percentiles, [100.0]))
+        if np.any(np.diff(edges) < 0) or edges[0] != 0 or edges[-1] != 100:
+            raise ValueError('rarity percentiles must be sorted values between 0 and 100')
+        weights = np.diff(edges) / 100.0
+        train_multiplier = float(np.sum(weights * values))
+    else:
+        raise ValueError('positive_num_aug_mode must be "phase" or "fixed"')
+    return train_ratio * train_multiplier + valid_ratio
 
 
 def get_pick_dict(event_list):
@@ -44,7 +70,8 @@ def get_pick_dict(event_list):
     for i, [_, picks] in enumerate(event_list):
       for net_sta, pick in picks.items():
         tp, ts = pick[:2]
-        sta_date = '%s_%s' % (net_sta, tp.date)
+        phase_anchor = tp if phase_is_available(tp) else ts
+        sta_date = '%s_%s' % (net_sta, phase_anchor.date)
         pick_dict.setdefault(sta_date, []).append([tp, ts])
     return pick_dict
 
@@ -88,7 +115,10 @@ class Negative(Dataset):
     assoc_ratio = num_assoc / (num_unassoc + num_assoc)
     if assoc_ratio >= max_assoc_ratio:
         return [], []
-    num_cut = int(num_unassoc * self.cut_neg_ratio * (max_assoc_ratio - assoc_ratio) / max_assoc_ratio)
+    num_cut = int(
+        num_unassoc * self.cut_neg_ratio
+        * (max_assoc_ratio - assoc_ratio) / max_assoc_ratio
+    )
     dtype = [('tp','O'),('ts','O')]
     picks = self.pick_dict[sta_date] if sta_date in self.pick_dict else []
     picks = np.array([(tp,ts) for tp,ts in picks], dtype=dtype)
@@ -102,9 +132,15 @@ class Negative(Dataset):
             continue
         start_time = date + win_len/2 + np.random.rand(1)[0] * (86400-win_len*1.5)
         end_time = start_time + win_len
-        is_tp = (picks['tp'] > start_time) * (picks['tp'] < end_time)
-        is_ts = (picks['ts'] > start_time) * (picks['ts'] < end_time)
-        if sum(is_tp*is_ts) > 0:
+        is_tp = np.asarray([
+            phase_is_available(value) and start_time < value < end_time
+            for value in picks['tp']
+        ])
+        is_ts = np.asarray([
+            phase_is_available(value) and start_time < value < end_time
+            for value in picks['ts']
+        ])
+        if np.any(is_tp | is_ts):
             continue
         st = cut_event_window(day_stream, start_time, end_time)
         if not st:
@@ -135,14 +171,13 @@ if __name__ == '__main__':
     parser.add_argument('--shard_size', type=int, default=1024)
     args = parser.parse_args()
     event_list, num_pos = read_fpha(args.fpha)
-    if positive_num_aug_mode == 'phase':
-        # Rarity-aware augmentation applies only to positive windows. Keep the
-        # negative inventory tied to the original associated-pick count.
-        negative_target_count = num_pos
-    elif positive_num_aug_mode == 'fixed':
-        negative_target_count = num_aug * num_pos
-    else:
-        raise ValueError('positive_num_aug_mode must be "phase" or "fixed"')
+    positive_multiplier = expected_positive_multiplier()
+    negative_target_count = int(round(num_pos * positive_multiplier))
+    print(
+        'negative baseline target = %d from %d original phases x %.4f expected positive multiplier (%s mode)'
+        % (negative_target_count, num_pos, positive_multiplier, positive_num_aug_mode),
+        flush=True,
+    )
     pick_dict = get_pick_dict(event_list)
     if args.fassoc_rate:
         pick_num_dict, num_picks = read_assoc_rate(args.fassoc_rate)
@@ -169,6 +204,11 @@ if __name__ == '__main__':
             * (max_assoc_ratio - assoc_ratio) / max_assoc_ratio
         ))
     planned_attempts = sum(planned_by_item)
+    print(
+        'planned negative attempts = %d for %d positive samples'
+        % (planned_attempts, negative_target_count),
+        flush=True,
+    )
     processed_attempts = 0
     generated_samples = 0
     train_rows, valid_rows = [], []

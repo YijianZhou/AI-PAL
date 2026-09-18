@@ -151,21 +151,26 @@ def get_seq_target(tp, ts):
     if num_steps <= 0:
         raise AttributeError("SAR target generation requires the SAR model config")
     target_seq = np.zeros(num_steps, dtype=np.int32)
-    if tp < 0 or ts < 0:
-        return target_seq
-    tp_idx, ts_idx = tp*samp_rate, ts*samp_rate
-    tp0 = 0 if tp_idx < step_len else int((tp_idx-step_len)/step_stride) + 1
-    tp1 = int(tp_idx / step_stride) + 1
-    tp0 = max(0, min(tp0, num_steps))
-    tp1 = max(0, min(tp1, num_steps))
-    target_seq[tp0:tp1] = 1
-    ts0 = int((ts_idx-step_len)/step_stride) + 1
-    ts1 = int(ts_idx / step_stride) + 1
-    if ts0 <= tp0:
-        ts0 = tp0 + int((tp1-tp0)/2)
-    ts0 = max(0, min(ts0, num_steps))
-    ts1 = max(0, min(ts1, num_steps))
-    target_seq[ts0:ts1] = 2
+    p_bounds = None
+    if tp >= 0:
+        tp_idx = tp * samp_rate
+        tp0 = 0 if tp_idx < step_len else int(
+            (tp_idx-step_len) / step_stride
+        ) + 1
+        tp1 = int(tp_idx / step_stride) + 1
+        tp0 = max(0, min(tp0, num_steps))
+        tp1 = max(0, min(tp1, num_steps))
+        target_seq[tp0:tp1] = 1
+        p_bounds = (tp0, tp1)
+    if ts >= 0:
+        ts_idx = ts * samp_rate
+        ts0 = int((ts_idx-step_len) / step_stride) + 1
+        ts1 = int(ts_idx / step_stride) + 1
+        if p_bounds is not None and ts0 <= p_bounds[0]:
+            ts0 = p_bounds[0] + int((p_bounds[1]-p_bounds[0]) / 2)
+        ts0 = max(0, min(ts0, num_steps))
+        ts1 = max(0, min(ts1, num_steps))
+        target_seq[ts0:ts1] = 2
     return target_seq
 
 
