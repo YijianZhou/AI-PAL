@@ -1,5 +1,6 @@
 """Shared AI-PAL preprocessing, data-pipeline, and association parameters."""
 import numpy as np
+
 import data_pipeline
 
 
@@ -15,14 +16,15 @@ class Config(object):
     self.num_chn = 3
     self.freq_band = [1, 20]
     self.global_max_norm = False
-    self.to_prep = False  # local archive is prepared by preprocess/
+    self.waveform_backend = "local"  # "local" archive or "scedc" S3; tune when copying.
+    self.to_prep = False  # True for raw traces; False for prepared local archives.
     self.to_filter = True  # apply freq_band before AI inference
+    self.channel_priority = ["HH", "BH", "EH", "HN", "EN", "SH"]
     self.p_context_sec = 0.5
     self.data_buffer_sec = 60.0
     self.taper_max_length_sec = 10.0
     self.normalize_to_three_channels = True
     self.location_priority = ["10", "20", "01", "00", ""]
-    self.channel_priority = ["HH", "BH", "EH", "HN", "EN", "SH"]
 
     # 2. Continuous picking and picker ensemble
     self.picker_pos_neg_group = ["SAR", "PHN"]
@@ -89,13 +91,13 @@ class Config(object):
     self.enable_event_waveform_plot = True
     self.save_filtered_event_waveforms = False
 
-    # 6. Shared training-sample defaults
+    # 6. Training-sample construction
     self.train_ratio = 0.9
     self.valid_ratio = 0.1
     self.max_assoc_ratio = 0.5
+    self.positive_num_aug_mode = "phase"  # "phase": per-pick num_aug tags; "fixed": global num_aug.
     self.num_aug = None  # Unused in "phase" mode; set >= 1 for "fixed" mode.
     self.max_noise = 0.5
-    self.positive_num_aug_mode = "phase"  # "phase": per-pick num_aug tags; "fixed": global num_aug.
     self.rarity_augmentation_values = [1, 2, 3, 4]
     self.rarity_percentiles = [50, 75, 90]
     self.rarity_max_hypo_dist_km = 200.0
@@ -105,13 +107,23 @@ class Config(object):
     self.rarity_time_bin_days = 10.0
 
     # 7. Data-pipeline bindings
+    waveform_pipeline = data_pipeline
+    station_loader = data_pipeline.load_station_stream
+    if self.waveform_backend == "scedc":
+        import data_pipeline_ai_aws as waveform_pipeline
+        station_loader = waveform_pipeline.load_station_stream
+    elif self.waveform_backend == "scedc_training":
+        import data_pipeline_training_aws as training_pipeline
+        station_loader = training_pipeline.load_station_stream
+    elif self.waveform_backend != "local":
+        raise ValueError("waveform_backend must be local, scedc, or scedc_training")
     self.read_fpha = data_pipeline.read_fpha
     self.read_fpick = data_pipeline.read_fpick
     self.read_assoc_rate = data_pipeline.read_assoc_rate
-    self.get_data_dict = data_pipeline.get_data_dict
-    self.get_buffered_data_dict = data_pipeline.get_buffered_data_dict
-    self.load_station_stream = data_pipeline.load_station_stream
-    self.get_sta_dict = data_pipeline.get_sta_dict
-    self.read_data = data_pipeline.read_data
+    self.get_data_dict = waveform_pipeline.get_data_dict
+    self.get_buffered_data_dict = waveform_pipeline.get_buffered_data_dict
+    self.load_station_stream = station_loader
+    self.get_sta_dict = waveform_pipeline.get_sta_dict
+    self.read_data = waveform_pipeline.read_data
     self.get_picks = data_pipeline.get_picks
     self.dtime2str = data_pipeline.dtime2str
