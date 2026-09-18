@@ -2,7 +2,7 @@ from config_ai_pal import Config as AIPALConfig
 
 
 class Config(AIPALConfig):
-  """Res-U-Net model, training, and inference parameters."""
+  """Res-U-Net positive-picker model, training, and inference parameters."""
   def __init__(self):
     super().__init__()
     # Model and label structure.
@@ -33,7 +33,6 @@ class Config(AIPALConfig):
     # Training.
     self.num_epochs = 20
     self.batch_size = 128
-    self.neg_reduction_ratio = 0.5
     self.learning_rate = 1e-4
     self.min_learning_rate = 1e-6
     self.warmup_steps = 10000
@@ -45,5 +44,5 @@ class Config(AIPALConfig):
     self.valid_step = 5000
     self.summary_step = 100
 
-    # Continuous inference.
+    # Positive-event inference.
     self.trig_thres = 0.3

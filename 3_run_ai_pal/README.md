@@ -4,7 +4,7 @@ Unified continuous inference and PAL-association entry points:
 
 - `run_ai_pal_local/`: offline continuous picking and association examples.
 - `run_ai_pal_realtime/`: restart-safe multi-picker realtime processing.
-- `run_ai_pal_aws/`: reserved for the AWS continuous inference implementation.
+- `run_ai_pal_aws/`: resumable SCEDC S3 inference in SageMaker Processing.
 
 Fixed positive-event and negative-event experiments belong to
 `../benchmark_picker/`.
@@ -33,7 +33,7 @@ flowchart LR
     L --> M[Duplicate merge and time ownership]
     M --> N[Final AI-PAL phases]
     B --> R[Realtime reference picker]
-    R --> S[Independent reference PAL association]
+    R --> S[Explicit reference workflows: PAL / GaMMA]
     S --> T[Final reference phases]
 ```
 
@@ -51,17 +51,36 @@ it; the staged canonical import remains `config_ai_pal`.
 sliding-window consensus, picker-ensemble, and PAL parameters. Each
 `config_<model>_eg.py` supplies only model and inference settings.
 
-Select local continuous models with `picker_pos_neg_group` and
-`picker_pos_group`, and postprocessing models with `repicker_pos_neg_group`
+Set `console_verbosity` to `"default"` for concise workflow summaries,
+`"quiet"` for warnings and final outputs only, or `"debug"` for the complete
+picker, association, timing, and cache log. Monitoring products retain their
+full detail regardless of console verbosity.
+
+`to_prep` and `to_filter` are independent. Set `to_prep = True` for raw local
+files so AI-PAL performs AWS-equivalent band/location selection, fragmentation
+checks, component merging, layout normalization, and gain/unit conversion. Set
+it to `False` only for an already merged, unambiguous local archive. Set
+`to_filter = False` to skip `freq_band` filtering; alignment, resampling,
+finite-value cleanup, gap treatment, detrending, tapering, and model edge
+exclusion still run. Raw AWS objects require `to_prep = True`.
+
+Select local continuous models with `picker_pos_neg_group`,
+and postprocessing models with `repicker_pos_neg_group`
 and `repicker_pos_group`, in `run_ai_pal_local/config_ai_pal_<case>.py`.
 Local workflows do not run a reference-picker branch. Continuous models must
-be subsets of their corresponding repicker groups; loaded objects are reused
-during postprocessing. Set either continuous group list to `[]` to disable it;
-the other non-empty group then supplies `1.2_picks_AI-PAL-ENSEMBLE` by itself. POS is
-disabled for continuous picking by default but remains enabled for repicking.
-The launchers keep `PICKERS_POS_NEG` and `PICKERS_POS` as
-path/device registries. Pos+neg checkpoints use the latest `.ckpt` in each
-model directory, while positive-only checkpoints use explicit files. Use
+be a subset of `repicker_pos_neg_group`; loaded objects are reused
+during postprocessing. At least one continuous POS_NEG model is required.
+Positive-only models are used exclusively for event repicking.
+Combined and postprocessing launchers keep `PICKERS_POS_NEG` and `PICKERS_POS` as
+path/device registries; pick-only launchers need only POS_NEG models.
+Both groups use explicit `ckpt` file paths, never directory/latest selection.
+Copy each model's `best.ckpt` (minimum full-validation loss) and matching config
+into the inference project's `input` folder before running. For local POS_NEG
+models, the defaults are `input/<case>_ckpt/sar_best.ckpt`,
+`ft_best.ckpt`, `phn_best.ckpt`, and `run_best.ckpt`; set the POS paths
+in `PICKERS_POS` likewise. A missing file is an error, not a fallback.
+AWS uses the explicit mounted path `checkpoints/<MODEL>/best.ckpt`;
+its S3 checkpoint inputs must contain that exact file. Use
 `gpu_idx = -1` to run a model on CPU; nonnegative values select that CUDA
 device. `NUM_WORKERS`
 controls concurrent station-date reading and preprocessing; daily output files
@@ -79,12 +98,19 @@ can be large, increase `NUM_WORKERS` with attention to host RAM. Each picker
 keeps standalone preprocessing as its default when called without a prepared
 stream.
 
-For each target UTC date, the local runners read `data_buffer_sec` (default 60 s)
-from the preceding and following date folders before preprocessing. Filtering
-uses a taper capped by `taper_max_length_sec` (default 10 s), and inference
-excludes that same taper duration at both ends of the buffered
-stream. Only picks whose P arrival is inside the target UTC date are written to
-that date's file, so midnight signals have context without duplicate ownership.
+Offline dates are processed sequentially. Before the first requested date, the
+runner reads only the preceding day's final `2 * data_buffer_sec` raw tail. For
+each subsequent date it reads that date once, caches its final raw tail, and
+prepends the prior cached tail before preprocessing. Thus every station is
+processed with a 24-hour plus `2 * data_buffer_sec` stream without repeatedly
+opening both adjacent daily files. Here "raw" means merged, gain-corrected
+waveform data before picker detrending, tapering, and filtering.
+
+The file named for date `D` owns picks in the half-open interval
+`[D - data_buffer_sec, D + 1 day - data_buffer_sec)`. Filtering uses a taper
+capped by `taper_max_length_sec` (default 10 s), and this shifted ownership
+leaves `data_buffer_sec` of waveform context on both sides. Association hours,
+daily event ownership, and staged postprocessing use the same shifted bounds.
 Each model first clusters raw P/S pairs across its sliding windows. Both P and S
 arrivals must match within `tp_dev` and `ts_dev`, and each distinct window casts
 at most one vote. `picker_min_cluster_size` controls the required number of
@@ -92,21 +118,18 @@ windows (default 2). P/S arrival times and probabilities are medians; their
 population standard deviations are written as `tp_std`, `ts_std`,
 `p_prob_std`, and `s_prob_std`.
 
-After all models finish, daily picks are clustered inside POS_NEG and POS using
-`picker_pos_neg_group_min_picker_support` and
-`picker_pos_group_min_picker_support`. Accepted group products are then merged
-with equal group weight. The canonical result is
+After all continuous POS_NEG models finish, their daily picks are clustered using
+`picker_pos_neg_group_min_picker_support`. The canonical result is
 written to `output/<CASE_CODE>/1.2_picks_AI-PAL-ENSEMBLE/`. Set
 `save_individual_picker_outputs = False` to use temporary model branches and
 retain only the ensemble; `True` preserves indexed individual branches such as
-`1.1.1_picks_pos_neg_SAR/` and `1.1.2_picks_pos_PHN/` as well.
+`1.1.1_picks_pos_neg_SAR/` and `1.1.2_picks_pos_neg_PHN/` as well.
 
 Local output uses the preferred-branch subset of the realtime numbering:
 
 ```text
 output/<CASE_CODE>/
 |-- 1.1.<N>_picks_pos_neg_<MODEL>/   optional individual POS_NEG picks
-|-- 1.1.<N>_picks_pos_<MODEL>/       optional individual POS picks
 |-- 1.2_picks_AI-PAL-ENSEMBLE/       canonical preferred picks
 |-- 2.1.0_phase_init_AI-PAL/         initial PAL association products
 `-- 3.1_phase_final_AI-PAL/          finalized postprocessed products
@@ -146,11 +169,14 @@ Both local picking launchers resume at daily-file granularity when
 outputs are enabled, all selected model files must also exist. If the
 individual files are complete but the ensemble is missing, only the ensemble
 merge is rerun. A missing complete file or stale `.partial` file causes that
-whole UTC day to be rerun, and atomic replacement prevents a partial file from
+whole nominal day to be rerun, and atomic replacement prevents a partial file from
 being mistaken for a completed result. In the one-click workflow, an existing
 pick day still has its filtered waveform context rebuilt when positive
 repicking is enabled, but continuous-picker inference is skipped. Set
 `OVERWRITE_PICKS = True` after changing checkpoints or picker settings.
+Each new ensemble day has an adjacent `.ownership.json` sidecar. Pick files
+from versions without this shifted-interval marker are rerun once rather than
+being mixed with the new date convention.
 
 Run `run_ai_pal_local/2.2_run_pal_assoc_eg.py` after picking. It associates only
 the canonical `1.2_picks_AI-PAL-ENSEMBLE` branch. The final station rows in the phase file
@@ -169,7 +195,8 @@ Association is performed in non-overlapping intervals controlled by
 `association_interval_sec` (3600 s by default). Every interval receives picks
 from `association_buffer_sec` before and after its boundaries, but its final
 phase/catalog contains only events whose origin time is in the half-open
-interval `[start, end)`. All intervals except the final one of a UTC day can be
+interval `[start, end)`. The 24 intervals are anchored at
+`D - data_buffer_sec`. All intervals except the final one of a nominal day can be
 completed as soon as that day's picks exist. The final interval waits for the
 next day's picks, so boundary events retain forward context.
 
@@ -250,21 +277,46 @@ the full neighboring daily stream is not duplicated for repicking.
 The former near-source distance exception and minimum refined-pick ratio are
 not used. Reliability is established structurally by associating only
 both-group anchors. Reference picker branches are unchanged.
-The final station row keeps the usual
-ensemble standard deviations and adds column 14,
+The final postprocessed station-row schema is:
+
+```text
+net_sta,tp,ts,s_amp,quality,p_prob,s_prob,tp_std,ts_std,p_prob_std,s_prob_std,num_support,pickers,picker_window_vote_ratios,picker_uncertainties,pick_provenance,p_snr_e,p_snr_n,p_snr_z
+```
+
+`quality` is the Hypoinverse quality code. By default, both-group picks receive quality 0.
+For a single-group pick, models with a randomized-window vote ratio strictly
+above 0.5 are counted: at least two give quality 1, one gives quality 2, and
+none gives quality 3. These correspond to location weights 1.0, 0.75, 0.5,
+and 0.25. `picker_window_vote_ratios` stores each model's accepted-window
+count divided by `repick_num_repeat`.
+
+Tune this mapping in `config_ai_pal`:
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `pick_quality_both_groups_code` | 0 | Code for agreement between POS_NEG and POS; takes precedence. |
+| `pick_quality_strong_vote_ratio` | 0.5 | A model is strong only when its window-vote ratio is strictly greater. |
+| `pick_quality_code1_min_pickers` | 2 | Minimum strong models for single-group code 1. |
+| `pick_quality_code2_min_pickers` | 1 | Otherwise, minimum strong models for code 2; fewer gives code 3. |
+
+The ratio must be in [0, 1], and integer counts must satisfy
+`code1_min > code2_min >= 1`. These settings label picks; they do not change
+picker acceptance or association criteria. The same policy is used when
+duplicate picks are merged in local, AWS, and realtime processing. Missing
+settings in older configs retain the defaults. Existing files are not rewritten
+automatically.
+
+The final station row keeps the usual ensemble standard deviations and
 `picker_uncertainties`, formatted with group-qualified model names such as
 `POS_NEG:SAR:tp=...|POS:SAR:tp=...`, containing per-model arrival-time
 and probability standard deviations. The filtered waveform segments are merged
 before event windows are sliced, including next-day data for the final hour.
-Column 15, `pick_provenance`, records only `both_groups`, `pos_neg_only`, or
-`pos_only`. Columns 16-19 record repicker diagnostics:
-`repick_status`, agreeing-group count (`repick_support`), group names
-(`repick_sources`), and required group count. Per-model randomized-window votes
-remain in `picker_cluster_sizes`. Events without enough repicker-derived pairs
+`pick_provenance` records only `both_groups`, `pos_neg_only`, or `pos_only`.
+Events without enough repicker-derived pairs
 for PAL reassociation are discarded; initial continuous-picker pairs are never
 used as fallback output.
 
-Columns 20-22 are `p_snr_e`, `p_snr_n`, and `p_snr_z`. They are measured only
+`p_snr_e`, `p_snr_n`, and `p_snr_z` are measured only
 for final reassociated event picks, using PAL's energy STA/LTA definition on
 the same filtered, gain-corrected E/N/Z velocity waveforms used for repicking.
 For each component, the reported value is the maximum ratio from 0.5 s before
@@ -277,8 +329,8 @@ and merging. The underlying `hour_complete_callback` remains available for
 additional event products before retained waveform arrays are released.
 
 `2.1_run_ai_pal_pick_eg.py` uses one `FULL_STATION_FILE` containing every station to
-pick. It reads the configured adjacent-day waveform buffer but writes only P/S
-pairs whose P arrival belongs to the target UTC date. Its canonical output is
+pick. It uses the rolling raw-tail cache described above and writes only P/S
+pairs whose P arrival belongs to the nominal date's shifted ownership interval. Its canonical output is
 `output/<CASE_CODE>/1.2_picks_AI-PAL-ENSEMBLE`, matching the one-click workflow.
 
 In `2.2_run_pal_assoc_eg.py`, leave `SUBNET_STATION_FILES` empty to
@@ -319,10 +371,32 @@ Fixed positive-event and negative-event launchers are maintained in
 continuous-data processing.
 ## AWS Workflow
 
-The AWS multi-picker inference launcher remains to be implemented. The shared
-native picker, ensemble, PAL association, and phase-merge sources already use
-the same 13-column QC schema, so AWS jobs built on these modules preserve
-`picker_cluster_sizes` identically to local and realtime runs.
+`run_ai_pal_aws/1_run_ai_pal_pick_assoc_aws_eg.py` stages the shared source,
+case configs, station files, positive-only checkpoints, and trained POS_NEG
+checkpoint prefixes into one GPU Processing Job. It uses the same daily picker,
+hourly buffered association, subnet merge, event repicking, and full-network
+reassociation runners as the local one-click workflow.
+
+`PAL_src/data_pipeline_ai_aws.py` reads the public SCEDC continuous archive
+directly from S3. The active `NET.STA.BAND` station-file epoch selects the
+archived channel and gain for each date; adjacent dates supply the waveform
+buffer. Strong-motion acceleration is integrated to velocity by the shared AWS
+reader, while one- and two-component stations retain the established
+three-channel expansion behavior. Association products still use `NET.STA`.
+
+Completed daily picks and hourly products are uploaded directly to the run's
+S3 output prefix. Direct upload avoids SageMaker's managed-output file-count
+limit. A replacement job mounts that prefix and reuses complete pick days,
+which makes the workflow resumable across the five-day Processing limit.
+See `run_ai_pal_aws/README_AWS.md` for submission and monitoring commands.
+
+The alternative `2.1`, `2.2`, and `2.3` AWS launchers split the same workflow
+into independent picking, association, and repick/reassociation jobs. They
+share one S3 inference prefix and enforce completion manifests between stages.
+The picking stage writes daily files with one halo day on each side of the
+target range. The association stage writes daily merged initial phases. The
+postprocessing stage is epoch-aware and can optionally publish filtered SAC
+event waveforms for the cross-correlation relocation workflow.
 ## Realtime Workflow
 
 Edit `run_ai_pal_realtime/config_ai_pal_eg.py` for shared preprocessing,
@@ -368,13 +442,70 @@ unspecified values from `subnet_assoc_params["default"]`. Cross-subnet merge
 parameters are retained in the shared config but are bypassed in full-only
 mode.
 
-The default first picker group (`SAR` and `PHN`) is merged with
-equal-weight joint P/S consensus and then associated once. Pickers in later
-reference groups remain independent picking and PAL branches.
+PAL derives its horizontal grid from station coverage unless `lat_range` or
+`lon_range` supplies an explicit `[minimum, maximum]` bound. Bounds in
+`subnet_assoc_params["default"]` also carry into full-network reassociation and
+can be replaced by the `full` override.
+
+The preferred continuous POS_NEG models supply a joint P/S ensemble for PAL.
+`reference_workflows` selects explicit picker/associator combinations; the
+default is PHN-SB + PAL and PHN-SB + GaMMA. PHN-SB runs only once per segment,
+and both associators reuse those picks. No Cartesian product is generated.
+The reference picker list is derived from these workflows; only the required
+pickers are loaded, once each. An empty `reference_workflows` disables references.
+
+```python
+self.reference_workflows = [
+    {"picker": "PHN-SB", "associator": "PAL"},
+    {"picker": "PHN-SB", "associator": "GaMMA"},
+]
+```
+
+Install `GMMA==1.2.12` and `scikit-learn==1.6.1` in the realtime Python environment:
+
+```bash
+python -m pip install "GMMA==1.2.12" "scikit-learn==1.6.1"
+```
+
+GMMA 1.2.12 uses an API removed in scikit-learn 1.7; startup rejects incompatible
+versions before loading models. Copy
+`config_ref_gamma_eg.py` to the case directory and set its path in the launcher's
+`ASSOCIATORS_REF["GaMMA"]["config"]` (relative to the working directory, like picker
+config paths). The preferred associator is always PAL. The GaMMA config controls velocity,
+geographic/depth bounds, DBSCAN, mixture fitting, timing-scatter limits, and CPU
+workers. GaMMA uses the full picking station list and runs in an isolated CPU
+process. `ncpu` controls its internal workers; numerical-library threads are
+limited to one per worker. No additional waveform reading or picker inference
+is needed. The 1.2.12 release does not expose the newer hierarchical DBSCAN
+split settings, so they are deliberately absent from this config.
+
+GaMMA receives individual P/S arrivals and their original probabilities.
+Amplitude fitting is disabled because the existing displacement `s_amp` is
+not the velocity amplitude expected by GaMMA. Its native events and all phase
+assignments are saved beside the worker log in
+`_internal/PHN-SB_GaMMA/subnet_phase/`. These CSVs precede waveform QC and OT
+filtering; they are diagnostics, not the published catalog. Native GaMMA scores
+are diagnostic values, not picker probabilities or location quality codes.
+The paired phase format retains P and S only when both are assigned to the same
+event and `ts > tp`; events must still have `min_sta` distinct NET.STA
+pairs, using the same station-count convention as PAL (default 4). This single
+parameter sets GaMMA's internal minimum total/P/S counts to `2 * min_sta`,
+`min_sta`, and `min_sta`; complete-pair station counts are checked again after
+association and waveform QC. Amplitude fitting is fixed off, not configurable.
+Unpaired assignments remain in the native CSV. Associated pairs then
+receive the shared amplitude/glitch QC and magnitude calculation. GaMMA's
+unavailable-magnitude sentinel is never published.
+
+With the default workflow order, reference phases are written to
+`2.2.1_phase_ref_PHN-SB_PAL` and `2.2.2_phase_ref_PHN-SB_GaMMA`; final phases go
+to `3.2.1_phase_final_ref_PHN-SB_PAL` and `3.2.2_phase_final_ref_PHN-SB_GaMMA`.
+Both use the same corrected OT interval and advancing publication cursor.
+Monitoring has a separate reference row for shared picking, association,
+merging/QC, and event/pair counts. The end-to-end panel includes all workflows.
 
 Set `enable_post_process = True` to apply the same dual-group postprocessing
 used by the combined local workflow. Repicking runs only on the
-preferred `AI-PAL` branch built from `picker_groups[0]`; reference branches are
+preferred `AI-PAL` ensemble branch; reference branches are
 unchanged. Each source segment is first associated by subnet and merged across
 subnets. Its detections are then repicked and reassociated with full-network
 PAL, merged for duplicates within that same segment, and filtered to the
@@ -391,7 +522,7 @@ explicit `ckpt` file per model. Packaged Cent-Cal positive-plus-negative
 checkpoints are in `Pre-trained_models/Cent-Cal_ckpt/`, while CEED positive-only
 checkpoints are in `Pre-trained_models/CEED_ckpt/`. Set launcher paths to those
 package files or to deployment-managed copies.
-Each `config_<model>_pos_<case>.py` is a self-contained model config rather
+Each `config_<model>_pos_ceed.py` describes a CEED-trained positive picker, independent of the inference case, and is a self-contained model config rather
 than a subclass of its continuous counterpart. The packaged values currently
 match, but architecture, training, and inference settings can diverge for
 future positive models without changing the continuous picker config.
@@ -422,10 +553,10 @@ segment reports only `[previous_T1_corr, current_T1_corr)`, while its internal
 phase file retains the full corrected segment interval. Only these newly
 reported events are plotted to
 `OUT/event_waveform_final_AI-PAL/<origin-time>.png`. Set
-`enable_event_waveform_plot_ref` to zero-based indexes into the flattened
-reference groups in `picker_groups[1:]`; those final reference detections are
+`enable_event_waveform_plot_ref` to zero-based indexes into
+`reference_workflows` (`[0, 1]` plots both defaults); those final reference detections are
 written separately under
-`OUT/event_waveform_final_ref_<picker>_PAL/<origin-time>.png`.
+`OUT/event_waveform_final_ref_<picker>_<associator>/<origin-time>.png`.
 Snapshots earlier than the committed interval end are released immediately
 after plotting. Plotting uses the window
 from 5 s before origin through 10 s after the latest S pick and writes PNGs at

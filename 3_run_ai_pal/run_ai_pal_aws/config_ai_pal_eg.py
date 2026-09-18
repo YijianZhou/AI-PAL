@@ -16,8 +16,8 @@ class Config(object):
     self.num_chn = 3
     self.freq_band = [1, 20]
     self.global_max_norm = False
-    self.waveform_backend = "local"  # "local" archive or "scedc" S3; tune when copying.
-    self.to_prep = False  # True for raw traces; False for prepared local archives.
+    self.waveform_backend = "scedc"  # "local" archive or "scedc" S3; tune when copying.
+    self.to_prep = True  # True for raw traces; False for prepared local archives.
     self.to_filter = True  # apply freq_band before AI inference
     self.channel_priority = ["HH", "BH", "EH", "HN", "EN", "SH"]
     self.p_context_sec = 0.5
@@ -88,7 +88,7 @@ class Config(object):
     self.repick_group_min_picker_support = 2
 
     # 5. Final event products
-    self.enable_event_waveform_plot = True
+    self.enable_event_waveform_plot = False
     self.save_filtered_event_waveforms = False
 
     # 6. Training-sample construction

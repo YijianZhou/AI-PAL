@@ -17,17 +17,18 @@ CASE_CODE = "eg"  # Packaged example; drives configs and local output paths.
 # Config paths are derived from CASE_CODE; picker selection stays explicit.
 CONFIG_AI_PAL = Path("config_ai_pal_%s.py" % CASE_CODE)
 # Set to None to pick the selector-deduplicated union of all subnet files.
-FULL_STATION_FILE = "input/station_realtime_scsn_complete.csv"
+FULL_STATION_FILE = None
 
 # Leave empty to associate a provided FULL_STATION_FILE once with "full".
 # Otherwise these map in order to r1, r2, ... and only subnets are associated;
 # they are also the required picking-union inputs when the full file is None.
 SUBNET_STATION_FILES = [
-    "input/station_realtime_scsn_complete_r1.csv",
-    "input/station_realtime_scsn_complete_r2.csv",
-    "input/station_realtime_scsn_complete_r3.csv",
-    "input/station_realtime_scsn_complete_r4.csv",
-    "input/station_realtime_scsn_complete_r5.csv",
+    "input/station_scedc_realtime_r1_ai-pal-v1.csv",
+    "input/station_scedc_realtime_r2_ai-pal-v1.csv",
+    "input/station_scedc_realtime_r3_ai-pal-v1.csv",
+    "input/station_scedc_realtime_r4_ai-pal-v1.csv",
+    "input/station_scedc_realtime_r5_ai-pal-v1.csv",
+    "input/station_scedc_realtime_r6_ai-pal-v1.csv",
 ]
 IN_DIR = "/app/aqms/ai_pal/IN"
 IN_GLOB = "*.ms"
@@ -43,59 +44,62 @@ PICKERS_POS_NEG = {
     "SAR": {
         "config": Path("config_sar_%s.py" % CASE_CODE),
         "gpu_idx": 0,
-        "ckpt": Path("input/Cent-Cal_ckpt/cent-cal_pos-neg_sar.ckpt"),
+        "ckpt": Path("input/SoCal_ckpt/sar_best.ckpt"),
     },
     "FT": {
         "config": Path("config_ft_%s.py" % CASE_CODE),
         "gpu_idx": 1,
-        "ckpt": Path("input/Cent-Cal_ckpt/cent-cal_pos-neg_ft.ckpt"),
+        "ckpt": Path("input/SoCal_ckpt/ft_best.ckpt"),
     },
     "PHN": {
         "config": Path("config_phn_%s.py" % CASE_CODE),
         "gpu_idx": 2,
-        "ckpt": Path("input/Cent-Cal_ckpt/cent-cal_pos-neg_phn.ckpt"),
+        "ckpt": Path("input/SoCal_ckpt/phn_best.ckpt"),
     },
     "RUN": {
         "config": Path("config_run_%s.py" % CASE_CODE),
         "gpu_idx": 3,
-        "ckpt": Path("input/Cent-Cal_ckpt/cent-cal_pos-neg_run.ckpt"),
+        "ckpt": Path("input/SoCal_ckpt/run_best.ckpt"),
     },
 }
 
-# Positive-only models. picker_pos_group selects models also used during
-# continuous picking; repicker_pos_group selects event-repicking models.
+# Positive-only models, selected by repicker_pos_group for post-processing.
 PICKERS_POS = {
     "SAR": {
-        "config": Path("config_sar_pos_%s.py" % CASE_CODE),
+        "config": Path("config_sar_pos_ceed.py"),
         "gpu_idx": -1,
-        "ckpt": Path("input/CEED_ckpt/ceed_pos_sar.ckpt"),
+        "ckpt": Path("input/CEED_ckpt/ceed_pos_sar_best.ckpt"),
     },
     "FT": {
-        "config": Path("config_ft_pos_%s.py" % CASE_CODE),
+        "config": Path("config_ft_pos_ceed.py"),
         "gpu_idx": -1,
-        "ckpt": Path("input/CEED_ckpt/ceed_pos_ft.ckpt"),
+        "ckpt": Path("input/CEED_ckpt/ceed_pos_ft_best.ckpt"),
     },
     "PHN": {
-        "config": Path("config_phn_pos_%s.py" % CASE_CODE),
+        "config": Path("config_phn_pos_ceed.py"),
         "gpu_idx": -1,
-        "ckpt": Path("input/CEED_ckpt/ceed_pos_phn-1m.ckpt"),
+        "ckpt": Path("input/CEED_ckpt/ceed_pos_phn_best.ckpt"),
     },
     "RUN": {
-        "config": Path("config_run_pos_%s.py" % CASE_CODE),
+        "config": Path("config_run_pos_ceed.py"),
         "gpu_idx": -1,
-        "ckpt": Path("input/CEED_ckpt/ceed_pos_run.ckpt"),
+        "ckpt": Path("input/CEED_ckpt/ceed_pos_run_best.ckpt"),
     },
 }
 
-# Available reference-picker specifications. Select names in picker_ref_group
-# in config_ai_pal_<case>.py. Each selected reference remains an independent
-# picking + PAL branch and is never added to the preferred ensemble.
+# Available reference-picker specifications. Select combinations in reference_workflows
+# in config_ai_pal_<case>.py. Reference picks are shared across associators
+# and are never added to the preferred ensemble.
 PICKER_REF = {
     "PHN-SB": {
         "config": Path("config_ref_phn-sb_%s.py" % CASE_CODE),
         "gpu_idx": -1,
     },
 }
+
+ASSOCIATORS_REF = {
+    "GaMMA": {"config": Path("config_ref_gamma_%s.py" % CASE_CODE)},
+}  # Reference PAL uses the PAL parameters in CONFIG_AI_PAL.
 
 # Number of stations prepared concurrently. Inference is serialized per device.
 NUM_WORKERS = 5
@@ -127,9 +131,14 @@ selection_cfg = config_module.Config()
 picker_pos_neg_names = list(dict.fromkeys(
     selection_cfg.picker_pos_neg_group
 ))
-picker_pos_names = list(dict.fromkeys(selection_cfg.picker_pos_group))
-reference_names = list(dict.fromkeys(selection_cfg.picker_ref_group))
-if not picker_pos_neg_names and not picker_pos_names:
+from reference_association import reference_workflows, load_reference_configs
+reference_names = list(dict.fromkeys(
+    item["picker"] for item in reference_workflows(selection_cfg).values()
+))
+reference_associators = load_reference_configs(
+    selection_cfg, Path.cwd(), ASSOCIATORS_REF
+)
+if not picker_pos_neg_names:
     raise ValueError("at least one preferred continuous picker is required")
 pos_neg_names = list(dict.fromkeys(selection_cfg.repicker_pos_neg_group))
 pos_names = list(dict.fromkeys(selection_cfg.repicker_pos_group))
@@ -137,15 +146,10 @@ if set(picker_pos_neg_names) - set(pos_neg_names):
     raise ValueError(
         "picker_pos_neg_group must be a subset of repicker_pos_neg_group"
     )
-if set(picker_pos_names) - set(pos_names):
-    raise ValueError(
-        "picker_pos_group must be a subset of repicker_pos_group"
-    )
 missing = {
     "PICKERS_POS_NEG": sorted(
         set(picker_pos_neg_names) - set(PICKERS_POS_NEG)
     ),
-    "PICKERS_POS": sorted(set(picker_pos_names) - set(PICKERS_POS)),
     "PICKER_REF": sorted(set(reference_names) - set(PICKER_REF)),
     "PICKERS_POS_NEG (post-processing)": sorted(
         set(pos_neg_names) - set(PICKERS_POS_NEG)
@@ -218,9 +222,9 @@ pos_runtime = {
 }
 
 print(
-    "selected pickers: continuous POS_NEG={} POS={} | reference={} | "
+    "selected pickers: continuous POS_NEG={} | reference={} | "
     "repickers POS_NEG={} POS={}".format(
-        picker_pos_neg_names, picker_pos_names, reference_names,
+        picker_pos_neg_names, reference_names,
         pos_neg_names, pos_names
     ),
     flush=True,
@@ -238,6 +242,7 @@ command = [
     "--num_workers={}".format(NUM_WORKERS),
     "--native_pickers_json={}".format(json.dumps(native_runtime)),
     "--reference_pickers_json={}".format(json.dumps(reference_runtime)),
+    "--reference_associators_json={}".format(json.dumps(reference_associators)),
     "--repicker_pos_neg_json={}".format(json.dumps(pos_neg_runtime)),
     "--repicker_pos_json={}".format(json.dumps(pos_runtime)),
 ]

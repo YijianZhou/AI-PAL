@@ -22,7 +22,7 @@ PICK_ROOT = Path("output/%s" % CASE_CODE)
 OUT_ROOT = Path("output/%s" % CASE_CODE)
 ENSEMBLE_PICK_DIR = PICK_ROOT / "1.2_picks_AI-PAL-ENSEMBLE"
 INITIAL_PHASE_ROOT = OUT_ROOT / "2.1.0_phase_init_AI-PAL"
-TIME_RANGE = "20190704-20190707"  # Exclusive end date.
+TIME_RANGE = "20190704-20190707"  # Nominal dates; end date is exclusive.
 # The shared workflow config is derived from CASE_CODE.
 CONFIG_AI_PAL = Path("config_ai_pal_%s.py" % CASE_CODE)
 
