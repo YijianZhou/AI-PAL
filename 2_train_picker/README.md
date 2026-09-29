@@ -1,9 +1,29 @@
 # Train Pickers
 
+`negative_loss_weight` (default `1.0`) scales negative-only training windows.
+Positive windows retain equal data-point weighting, including their background
+samples; Noise/P/S class weights are unchanged. For actual batch counts Bp/Bn
+and separately averaged group losses Lp/Ln, training uses
+`(Bp*Lp + negative_loss_weight*Bn*Ln) / (Bp + negative_loss_weight*Bn)`.
+Weights must be finite and nonnegative. Zero negative batches use Lp alone.
+Older configs without this setting retain weight 1. Startup output reports
+the effective coefficients; console, TensorBoard and training CSV diagnostics
+include `train_pos_loss` and `train_neg_loss` before weighting. Validation and
+best-checkpoint selection do not use this multiplier.
+
+Validation always covers the complete positive and negative validation sets,
+including when `batch_size = [128, 0]`. Zero negatives disables negative
+training only; both validation classes must exist and be nonempty. Negative
+accuracy/loss remain visible in console, TensorBoard and training diagnostics.
+Best-checkpoint selection uses the mean of the separately averaged positive
+and negative validation losses. The 5,000-step/final validation schedule is unchanged.
+
 - `train_picker_local/`: integrated sample cutting and one local waveform Zarr
   dataset with frame/sample target arrays,
-  continuous training via `3_train_eg.py`, and positive-window training via
-  `3_train_pos_eg.py` for SAR, FT, PHN, and RUN.
+  local training via `3_train_eg.py` for SAR, FT, PHN, and RUN.
+- Global CEED retraining is optional and lives in
+  [Pre-trained_models/CEED/train_picker](../Pre-trained_models/CEED/README.md).
+  Normally reuse the provided `Pre-trained_models/CEED/CEED_ckpt` models and configs.
 - `train_picker_aws/`: SageMaker submission, container-entry, and monitoring
   workflows for sample cutting, Zarr conversion, and per-model GPU training.
 
@@ -66,14 +86,16 @@ phase file can bypass that analysis when fixed augmentation is required.
 
 ## Local Training
 
+See [local run order and dataset requirements](train_picker_local/README.md).
+
+
 Run from `train_picker_local/` after editing shared paths, `ENABLED_MODELS`, and
 `gpu_idx`:
 
 0. `python 0_analyze_phase_rarity_eg.py`
 1. `python 1_cut_train-samples_eg.py`
 2. `python 2_npy2zarr_eg.py`
-3. `python 3_train_eg.py` for continuous-data picker training, or
-   `python 3_train_pos_eg.py` for positive-window picker training.
+3. `python 3_train_eg.py`
 
 Local training accepts either representation. For the original integrated
 dataset, leave `TRAINING_YEARS = None` and point `ZARR_PATH` directly at the
@@ -139,12 +161,33 @@ detection accuracy, and `<model>_training_diagnostics.png` for loss plus frame
 accuracy (SAR/FT) or sample accuracy (PHN/RUN). Both figures show full-range and
 5th-95th percentile zoom panels.
 
-Standard training interprets `batch_size` as the number of positive windows;
-negative windows are added according to the stored negative/positive ratio, up
-to one negative per positive. Consequently, model computation can approach
-twice the positive-only workload. The paired datasets preserve Zarr chunk
-locality for both classes, and training prints the effective positive/negative
-mix and chunk size at startup. `NUM_WORKERS` and `PREFETCH_FACTOR` remain
+Training uses `batch_size = [bs_pos, bs_neg]`: SAR/FT default to `[128, 32]`
+(160 windows per full batch), PHN/RUN to `[128, 16]` (144). The former
+`neg_reduction_ratio` setting is removed; archive class proportions do not
+determine the training mix. Update older scalar batch-size configs to a pair.
+Positive-only training uses the first entry and never reads negative samples.
+
+Positive batches follow the physical chunks of each Zarr store, restarting
+alignment at each annual boundary. Chunk order is shuffled across all years,
+and rows are shuffled within chunks. Short tails are retained by default;
+the resulting number of batches per epoch can differ slightly from older runs.
+
+Epochs remain positive-sample passes. Workers traverse disjoint, approximately
+equal-sized partitions of a shuffled negative-chunk sequence. A worker caches
+one decoded waveform/target chunk, shuffles its rows and consumes them across
+batches before loading another. It reshuffles after completing its partition;
+progress persists across positive epochs through persistent DataLoader workers.
+Only worker-partition boundaries can split chunks. Full chunks are read into
+CPU buffers, but only requested negatives are transferred to the device. Partial/chunk-tail
+batches scale the negative count proportionally, rounded to nearest with a
+minimum of one when negatives are enabled; a zero second entry disables them.
+Negative counts larger than positive counts are also supported.
+
+Validation is unchanged by this sampler update: full positive and negative
+validation splits are traversed independently. Their separately averaged losses
+are combined with equal class weight; positive-only mode uses positives alone.
+Best checkpoints use validation loss. Training prints the mix and chunk size.
+`NUM_WORKERS` and `PREFETCH_FACTOR` remain
 tunable in the launcher; excessive workers can reduce throughput on shared or
 network storage.
 

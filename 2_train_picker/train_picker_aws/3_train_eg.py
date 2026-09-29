@@ -35,9 +35,11 @@ shared_config = local_workflow_dir / "config_ai_pal_{}.py".format(CASE_CODE)
 pal_src_dir = AI_PAL_ROOT / "PAL_src"
 pal_source_files = (
     pal_src_dir / "data_pipeline.py",
+    pal_src_dir / "station_inventory.py",
     pal_src_dir / "data_pipeline_aws.py",
     pal_src_dir / "data_pipeline_training_aws.py",
     pal_src_dir / "training_zarr_dataset.py",
+    pal_src_dir / "training_validation.py",
     pal_src_dir / "training_monitor.py",
     pal_src_dir / "torch_backends.py",
 )

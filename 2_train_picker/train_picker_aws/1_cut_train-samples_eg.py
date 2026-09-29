@@ -264,6 +264,8 @@ def submit_year(
         shutil.copy2(local_config, source_stage / "config.py")
         shutil.copy2(training_adapter, source_stage)
         shutil.copy2(pal_data_pipeline, source_stage)
+        shutil.copy2(AI_PAL_ROOT / "PAL_src" / "station_inventory.py", source_stage)
+        shutil.copy2(AI_PAL_ROOT / "PAL_src" / "rolling_waveform.py", source_stage)
         shutil.copy2(pal_data_pipeline_aws, source_stage)
         shutil.copy2(requirements, source_stage / "requirements.txt")
 
