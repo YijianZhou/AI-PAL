@@ -1,7 +1,8 @@
 from config_ai_pal import Config as AIPALConfig
 
+
 class Config(AIPALConfig):
-  """PhaseNet model, training, and inference parameters."""
+  """PhaseNet positive-picker model, training, and inference parameters."""
   def __init__(self):
     super().__init__()
     # Model and label structure.
@@ -20,5 +21,5 @@ class Config(AIPALConfig):
     self.valid_step = 5000
     self.summary_step = 100
 
-    # Continuous inference.
+    # Positive-event inference.
     self.trig_thres = 0.3

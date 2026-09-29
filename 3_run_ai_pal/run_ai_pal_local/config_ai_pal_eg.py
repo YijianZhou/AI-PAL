@@ -1,6 +1,5 @@
 """Shared AI-PAL preprocessing, data-pipeline, and association parameters."""
 import numpy as np
-
 import data_pipeline
 
 
@@ -17,9 +16,10 @@ class Config(object):
     self.freq_band = [1, 20]
     self.global_max_norm = False
     self.waveform_backend = "local"  # "local" archive or "scedc" S3; tune when copying.
-    self.to_prep = False  # True for raw traces; False for prepared local archives.
+    self.to_clean = False  # Merge raw traces and apply waveform QC; False for already-cleaned archives.
     self.to_filter = True  # apply freq_band before AI inference
     self.channel_priority = ["HH", "BH", "EH", "HN", "EN", "SH"]
+    self.station_selection_order = "channel_first"  # or "location_first"
     self.p_context_sec = 0.5
     self.data_buffer_sec = 60.0
     self.taper_max_length_sec = 10.0
@@ -27,19 +27,15 @@ class Config(object):
     self.location_priority = ["10", "20", "01", "00", ""]
 
     # 2. Continuous picking and picker ensemble
-    self.picker_pos_neg_group = ["SAR", "PHN"]
-    self.picker_batch_size = 512
+    self.picker_local_group = ["SAR", "PHN"]
+    self.picker_global_group = ["SAR_CEED", "PHN_CEED"]  # CEED models trained with local negatives.
+    self.picker_batch_size = 256
     self.tp_dev = 1.0
     self.ts_dev = 1.5
     self.picker_min_cluster_size = 2
-    self.picker_pos_neg_group_min_picker_support = 1
+    self.picker_group_min_picker_support = [0, 0, 1]  # Min Local, Global, total votes; all must pass.
     self.save_individual_picker_outputs = True
 
-    # Final pick quality (0 best, 3 fallback); does not reject picks.
-    self.pick_quality_both_groups_code = 0  # POS_NEG and POS agree.
-    self.pick_quality_strong_vote_ratio = 0.5  # Strictly greater than this ratio.
-    self.pick_quality_code1_min_pickers = 2  # Strong pickers needed for code 1.
-    self.pick_quality_code2_min_pickers = 1  # Otherwise code 2; fewer gives 3.
     self.amp_win = [1, 6]
     self.rm_glitch = True
     self.win_peak = 1
@@ -78,8 +74,8 @@ class Config(object):
 
     # 4. Post-processing: event repicking and PAL reassociation
     self.enable_post_process = True
-    self.repicker_pos_neg_group = ["SAR", "FT", "PHN", "RUN"]
-    self.repicker_pos_group = ["SAR", "FT", "PHN", "RUN"]
+    self.repicker_local_group = ["SAR", "FT", "PHN", "RUN"]
+    self.repicker_global_group = ["SAR_CEED", "FT_CEED", "PHN_CEED", "RUN_CEED"]
     self.repick_phase_buffer_sec = 2.0
     self.repick_num_repeat = 20
     self.repick_batch_size = 128
@@ -87,9 +83,16 @@ class Config(object):
     self.repick_min_window_vote_ratio = 0.2
     self.repick_group_min_picker_support = 2
 
+    # Final pick quality (0 best, 3 fallback); does not reject picks.
+    self.pick_quality_both_groups_code = 0  # Local and Global agree.
+    self.pick_quality_strong_vote_ratio = 0.5  # Greater than or equal to this ratio.
+    self.pick_quality_code0_min_pickers = 3  # Strong pickers within either group for code 0.
+    self.pick_quality_code1_min_pickers = 2  # Strong pickers needed for code 1.
+    self.pick_quality_code2_min_pickers = 1  # Otherwise code 2; fewer gives 3.
+
     # 5. Final event products
     self.enable_event_waveform_plot = True
-    self.save_filtered_event_waveforms = False
+    self.save_filtered_event_waveform = False
 
     # 6. Training-sample construction
     self.train_ratio = 0.9
@@ -120,9 +123,12 @@ class Config(object):
     self.read_fpha = data_pipeline.read_fpha
     self.read_fpick = data_pipeline.read_fpick
     self.read_assoc_rate = data_pipeline.read_assoc_rate
-    self.get_data_dict = waveform_pipeline.get_data_dict
-    self.get_buffered_data_dict = waveform_pipeline.get_buffered_data_dict
-    self.load_station_stream = station_loader
+    from functools import partial
+    selection = dict(channel_priority=self.channel_priority,
+        location_priority=self.location_priority, station_selection_order=self.station_selection_order)
+    self.get_data_dict = partial(waveform_pipeline.get_data_dict, **selection)
+    self.get_buffered_data_dict = partial(waveform_pipeline.get_buffered_data_dict, **selection)
+    self.load_station_stream = partial(station_loader, **selection)
     self.get_sta_dict = waveform_pipeline.get_sta_dict
     self.read_data = waveform_pipeline.read_data
     self.get_picks = data_pipeline.get_picks

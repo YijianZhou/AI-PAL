@@ -46,14 +46,18 @@ def main():
     )
     cfg = config_module.Config()
     gpu_map = json.loads(os.environ.get("MODEL_GPU_MAP", "{}"))
-    specs = {}
-    for model in dict.fromkeys(cfg.picker_pos_neg_group):
-        specs[model] = {
-            "group": "POS_NEG", "model": model,
-            "config": WORKFLOW / "config_{}_case.py".format(model.lower()),
-            "gpu_idx": int(gpu_map.get(model, 0)),
-            "ckpt": checkpoint_file(CHECKPOINT_ROOT / model / "best.ckpt"),
-        }
+    from continuous_pickers import continuous_specs
+    pos_neg = {model: {
+        "config": WORKFLOW / "config_{}_case.py".format(model.lower()),
+        "gpu_idx": int(gpu_map.get(model, 0)),
+        "ckpt": CHECKPOINT_ROOT / model / "best.ckpt",
+    } for model in cfg.picker_local_group}
+    positive = {model + "_CEED": {
+        "config": WORKFLOW / "config_{}_global_ceed.py".format(model.lower()),
+        "gpu_idx": int(gpu_map.get("Global_" + model, gpu_map.get(model, 0))),
+        "ckpt": WORKFLOW / "input" / "CEED_ckpt" / ("ceed_{}_best.ckpt".format(model.lower())),
+    } for model in ("SAR", "FT", "PHN", "RUN")}
+    specs = continuous_specs(cfg, pos_neg, positive)
     start, end = parse_date_range(target_range)
     pick_range = "{}-{}".format(
         (start - timedelta(days=1)).strftime("%Y%m%d"),

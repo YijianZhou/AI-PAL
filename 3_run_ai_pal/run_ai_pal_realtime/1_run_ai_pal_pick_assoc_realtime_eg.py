@@ -38,9 +38,9 @@ OUT_ROOT = "output/%s_realtime" % CASE_CODE
 # ============================================================================
 # USER SETTINGS: PICKERS, DEVICES, AND CHECKPOINTS
 # ============================================================================
-# Available POS_NEG picker specifications. Select continuous models with
-# picker_pos_neg_group in config_ai_pal_<case>.py. Set gpu_idx=-1 for CPU.
-PICKERS_POS_NEG = {
+# Available Local picker specifications. Select continuous models with
+# picker_local_group in config_ai_pal_<case>.py. Set gpu_idx=-1 for CPU.
+PICKERS_LOCAL = {
     "SAR": {
         "config": Path("config_sar_%s.py" % CASE_CODE),
         "gpu_idx": 0,
@@ -63,27 +63,27 @@ PICKERS_POS_NEG = {
     },
 }
 
-# Positive-only models, selected by repicker_pos_group for post-processing.
-PICKERS_POS = {
-    "SAR": {
-        "config": Path("config_sar_pos_ceed.py"),
+# Dataset-qualified Global models, selected for continuous picking and repicking.
+PICKERS_GLOBAL = {
+    "SAR_CEED": {
+        "config": Path("config_sar_global_ceed.py"),
         "gpu_idx": -1,
-        "ckpt": Path("input/CEED_ckpt/ceed_pos_sar_best.ckpt"),
+        "ckpt": Path("input/CEED_ckpt/ceed_sar_best.ckpt"),
     },
-    "FT": {
-        "config": Path("config_ft_pos_ceed.py"),
+    "FT_CEED": {
+        "config": Path("config_ft_global_ceed.py"),
         "gpu_idx": -1,
-        "ckpt": Path("input/CEED_ckpt/ceed_pos_ft_best.ckpt"),
+        "ckpt": Path("input/CEED_ckpt/ceed_ft_best.ckpt"),
     },
-    "PHN": {
-        "config": Path("config_phn_pos_ceed.py"),
+    "PHN_CEED": {
+        "config": Path("config_phn_global_ceed.py"),
         "gpu_idx": -1,
-        "ckpt": Path("input/CEED_ckpt/ceed_pos_phn_best.ckpt"),
+        "ckpt": Path("input/CEED_ckpt/ceed_phn_best.ckpt"),
     },
-    "RUN": {
-        "config": Path("config_run_pos_ceed.py"),
+    "RUN_CEED": {
+        "config": Path("config_run_global_ceed.py"),
         "gpu_idx": -1,
-        "ckpt": Path("input/CEED_ckpt/ceed_pos_run_best.ckpt"),
+        "ckpt": Path("input/CEED_ckpt/ceed_run_best.ckpt"),
     },
 }
 
@@ -128,9 +128,10 @@ if config_spec is None or config_spec.loader is None:
 config_module = importlib.util.module_from_spec(config_spec)
 config_spec.loader.exec_module(config_module)
 selection_cfg = config_module.Config()
-picker_pos_neg_names = list(dict.fromkeys(
-    selection_cfg.picker_pos_neg_group
+picker_local_names = list(dict.fromkeys(
+    selection_cfg.picker_local_group
 ))
+picker_pos_names = list(dict.fromkeys(selection_cfg.picker_global_group))
 from reference_association import reference_workflows, load_reference_configs
 reference_names = list(dict.fromkeys(
     item["picker"] for item in reference_workflows(selection_cfg).values()
@@ -138,24 +139,26 @@ reference_names = list(dict.fromkeys(
 reference_associators = load_reference_configs(
     selection_cfg, Path.cwd(), ASSOCIATORS_REF
 )
-if not picker_pos_neg_names:
+if not picker_local_names and not picker_pos_names:
     raise ValueError("at least one preferred continuous picker is required")
-pos_neg_names = list(dict.fromkeys(selection_cfg.repicker_pos_neg_group))
-pos_names = list(dict.fromkeys(selection_cfg.repicker_pos_group))
-if set(picker_pos_neg_names) - set(pos_neg_names):
+pos_neg_names = list(dict.fromkeys(selection_cfg.repicker_local_group))
+pos_names = list(dict.fromkeys(selection_cfg.repicker_global_group))
+if set(picker_local_names) - set(pos_neg_names):
     raise ValueError(
-        "picker_pos_neg_group must be a subset of repicker_pos_neg_group"
+        "picker_local_group must be a subset of repicker_local_group"
     )
+if set(picker_pos_names) - set(pos_names):
+    raise ValueError("picker_global_group must be a subset of repicker_global_group")
 missing = {
-    "PICKERS_POS_NEG": sorted(
-        set(picker_pos_neg_names) - set(PICKERS_POS_NEG)
+    "PICKERS_LOCAL": sorted(
+        set(picker_local_names) - set(PICKERS_LOCAL)
     ),
     "PICKER_REF": sorted(set(reference_names) - set(PICKER_REF)),
-    "PICKERS_POS_NEG (post-processing)": sorted(
-        set(pos_neg_names) - set(PICKERS_POS_NEG)
+    "PICKERS_LOCAL (post-processing)": sorted(
+        set(pos_neg_names) - set(PICKERS_LOCAL)
     ),
-    "PICKERS_POS (post-processing)": sorted(
-        set(pos_names) - set(PICKERS_POS)
+    "PICKERS_GLOBAL (post-processing)": sorted(
+        set(pos_names) - set(PICKERS_GLOBAL)
     ),
 }
 missing = {key: names for key, names in missing.items() if names}
@@ -163,13 +166,13 @@ if missing:
     raise ValueError("selected picker specifications are missing: {}".format(missing))
 
 selected_pickers = {
-    name: PICKERS_POS_NEG[name] for name in picker_pos_neg_names
+    name: PICKERS_LOCAL[name] for name in picker_local_names
 }
 selected_references = {name: PICKER_REF[name] for name in reference_names}
 selected_pos_neg = {
-    name: PICKERS_POS_NEG[name] for name in pos_neg_names
+    name: PICKERS_LOCAL[name] for name in pos_neg_names
 }
-selected_pos = {name: PICKERS_POS[name] for name in pos_names}
+selected_pos = {name: PICKERS_GLOBAL[name] for name in pos_names}
 
 for settings in (
     list(selected_pickers.values()) + list(selected_pos_neg.values())
@@ -194,6 +197,7 @@ native_runtime = {
     name: {
         "gpu_idx": int(settings["gpu_idx"]),
         "ckpt": str(Path(settings["ckpt"]).resolve()),
+        "config": str(Path(settings["config"]).resolve()),
     }
     for name, settings in selected_pickers.items()
 }
@@ -222,9 +226,9 @@ pos_runtime = {
 }
 
 print(
-    "selected pickers: continuous POS_NEG={} | reference={} | "
-    "repickers POS_NEG={} POS={}".format(
-        picker_pos_neg_names, reference_names,
+    "selected pickers: continuous Local={} Global={} | reference={} | "
+    "repickers Local={} Global={}".format(
+        picker_local_names, picker_pos_names, reference_names,
         pos_neg_names, pos_names
     ),
     flush=True,
@@ -243,8 +247,8 @@ command = [
     "--native_pickers_json={}".format(json.dumps(native_runtime)),
     "--reference_pickers_json={}".format(json.dumps(reference_runtime)),
     "--reference_associators_json={}".format(json.dumps(reference_associators)),
-    "--repicker_pos_neg_json={}".format(json.dumps(pos_neg_runtime)),
-    "--repicker_pos_json={}".format(json.dumps(pos_runtime)),
+    "--repicker_local_json={}".format(json.dumps(pos_neg_runtime)),
+    "--repicker_global_json={}".format(json.dumps(pos_runtime)),
 ]
 if FULL_STATION_FILE is not None:
     command.extend(["--full_sta_file", str(FULL_STATION_FILE)])

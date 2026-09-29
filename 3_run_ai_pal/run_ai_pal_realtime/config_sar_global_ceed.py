@@ -2,7 +2,7 @@ from config_ai_pal import Config as AIPALConfig
 
 
 class Config(AIPALConfig):
-  """SAR model, training, and inference parameters."""
+  """SAR positive-picker model, training, and inference parameters."""
   def __init__(self):
     super().__init__()
     # Model structure.
@@ -15,10 +15,10 @@ class Config(AIPALConfig):
 
     # Training.
     self.num_epochs = 20
-    self.batch_size = [128, 32]  # [positive, negative]; 0 negatives selects positives only.
+    self.batch_size = [128, 32]  # [positive, negative]; positive-only mode ignores negative.
     self.lr = 1e-4
     self.valid_step = 5000
     self.summary_step = 100
 
-    # Continuous inference.
+    # Positive-event inference.
     self.trig_thres = 0.3

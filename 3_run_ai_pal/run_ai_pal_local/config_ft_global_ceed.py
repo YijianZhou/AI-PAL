@@ -1,7 +1,8 @@
 from config_ai_pal import Config as AIPALConfig
 
+
 class Config(AIPALConfig):
-  """Frame Transformer model, training, and inference parameters."""
+  """Frame Transformer positive-picker model and training parameters."""
   def __init__(self):
     super().__init__()
     # Model structure. Class order: Noise, P, S.
@@ -34,5 +35,5 @@ class Config(AIPALConfig):
     self.valid_step = 5000
     self.summary_step = 100
 
-    # Continuous inference.
+    # Positive-event inference.
     self.trig_thres = 0.3

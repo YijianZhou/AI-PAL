@@ -14,8 +14,7 @@ class Config(AIPALConfig):
 
     # Training.
     self.num_epochs = 20
-    self.batch_size = 128
-    self.neg_reduction_ratio = 0.5
+    self.batch_size = [128, 8]  # [positive, negative]; 0 negatives selects positives only.
     self.learning_rate = 1e-3
     self.weight_decay = 0.0
     self.valid_step = 5000

@@ -44,7 +44,7 @@ def main():
     cfg.enable_event_waveform_plot = (
         os.environ.get("ENABLE_EVENT_WAVEFORM_PLOT", "0") == "1"
     )
-    cfg.save_filtered_event_waveforms = (
+    cfg.save_filtered_event_waveform = (
         os.environ.get("SAVE_FILTERED_EVENT_WAVEFORMS", "0") == "1"
     )
 
@@ -58,8 +58,8 @@ def main():
     cfg.event_waveform_complete_callback = event_waveform_complete
     gpu_map = json.loads(os.environ.get("MODEL_GPU_MAP", "{}"))
     positive_names = {
-        "SAR": "ceed_pos_sar_best.ckpt", "FT": "ceed_pos_ft_best.ckpt",
-        "PHN": "ceed_pos_phn_best.ckpt", "RUN": "ceed_pos_run_best.ckpt",
+        "SAR": "ceed_sar_best.ckpt", "FT": "ceed_ft_best.ckpt",
+        "PHN": "ceed_phn_best.ckpt", "RUN": "ceed_run_best.ckpt",
     }
     pos_neg = {
         model: {
@@ -67,34 +67,34 @@ def main():
             "gpu_idx": int(gpu_map.get(model, 0)),
             "ckpt": checkpoint_file(CHECKPOINT_ROOT / model / "best.ckpt"),
         }
-        for model in dict.fromkeys(cfg.repicker_pos_neg_group)
+        for model in dict.fromkeys(cfg.repicker_local_group)
     }
     positive = {
-        model: {
-            "config": WORKFLOW / "config_{}_pos_ceed.py".format(model.lower()),
+        model + "_CEED": {
+            "config": WORKFLOW / "config_{}_global_ceed.py".format(model.lower()),
             "gpu_idx": int(gpu_map.get(model, 0)),
             "ckpt": WORKFLOW / "input" / "CEED_ckpt" / positive_names[model],
         }
-        for model in dict.fromkeys(cfg.repicker_pos_group)
+        for model in positive_names
     }
+    positive = {name: positive[name] for name in dict.fromkeys(cfg.repicker_global_group)}
     case_root = OUTPUT_ROOT / case_code
-    initial_phase_dir = (
-        case_root / "2.1.0_phase_init_AI-PAL" / "daily_assoc" / "merged"
-    )
+    from association_runner import offline_association_root
+    initial_phase_dir = offline_association_root(case_root) / "merged"
     final_root = case_root / "3.1_phase_final_AI-PAL"
     writer.exclude_from_sync(final_root / "event_waveforms")
     started = time.time()
     writer.write_json("_status/2.3_postprocess_job.json", {
         "status": "running", "time_range": time_range,
-        "save_filtered_event_waveforms": cfg.save_filtered_event_waveforms,
+        "save_filtered_event_waveform": cfg.save_filtered_event_waveform,
         "enable_event_waveform_plot": cfg.enable_event_waveform_plot,
     })
     try:
         paths = run_offline_event_postprocessing(
             ai_pal_root=SOURCE_ROOT,
             cfg=cfg,
-            repicker_pos_neg_specs=pos_neg,
-            repicker_pos_specs=positive,
+            repicker_local_specs=pos_neg,
+            repicker_global_specs=positive,
             data_dir=station_file,
             station_file=station_file,
             initial_phase_dir=initial_phase_dir,
@@ -108,7 +108,7 @@ def main():
         writer.write_json("2.3_postprocess_manifest.json", {
             "status": "complete", "time_range": time_range,
             "num_daily_phase_files": len(paths),
-            "save_filtered_event_waveforms": cfg.save_filtered_event_waveforms,
+            "save_filtered_event_waveform": cfg.save_filtered_event_waveform,
             "elapsed_sec": time.time() - started,
         })
     except Exception as exc:

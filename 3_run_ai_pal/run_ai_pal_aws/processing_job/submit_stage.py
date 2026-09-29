@@ -18,17 +18,17 @@ from processing_job.job_common import prefix_has_objects, upload_tree
 
 
 MODEL_NAMES = ("SAR", "FT", "PHN", "RUN")
-POSITIVE_CHECKPOINTS = (
-    "ceed_pos_sar_best.ckpt", "ceed_pos_ft_best.ckpt",
-    "ceed_pos_phn_best.ckpt", "ceed_pos_run_best.ckpt",
+GLOBAL_CHECKPOINTS = (
+    "ceed_sar_best.ckpt", "ceed_ft_best.ckpt",
+    "ceed_phn_best.ckpt", "ceed_run_best.ckpt",
 )
 PAL_SOURCE_NAMES = (
     "associator_pal.py", "association_runner.py", "aws_inference_job.py",
-    "data_pipeline.py", "data_pipeline_aws.py", "data_pipeline_ai_aws.py",
+    "data_pipeline.py", "station_inventory.py", "data_pipeline_aws.py", "data_pipeline_ai_aws.py",
     "event_repicker.py", "offline_event_postprocessor.py",
-    "offline_pick_assoc_runner.py", "offline_picker_runner.py",
-    "rolling_waveform.py",
-    "phase_merge.py", "pick_ensemble.py", "picker_stream.py",
+    "offline_picker_runner.py",
+    "rolling_waveform.py", "continuous_pickers.py",
+    "phase_merge.py", "phase_qc.py", "pick_ensemble.py", "picker_stream.py",
     "runtime_console.py", "torch_backends.py", "trigger_counts.py",
     "station_sets.py", "waveform_qc.py",
 )
@@ -98,12 +98,12 @@ def submit_stage(
                 ),
             ))
             if include_positive_models:
-                required.append(workflow_dir / "config_{}_pos_ceed.py".format(
+                required.append(workflow_dir / "config_{}_global_ceed.py".format(
                     model.lower()))
         if include_positive_models:
             required.extend(
                 workflow_dir / "input" / "CEED_ckpt" / name
-                for name in POSITIVE_CHECKPOINTS
+                for name in GLOBAL_CHECKPOINTS
             )
     for path in required:
         if not path.exists():
@@ -155,8 +155,8 @@ def submit_stage(
                 )
                 if include_positive_models:
                     shutil.copy2(
-                        workflow_dir / "config_{}_pos_ceed.py".format(lower),
-                        workflow_stage / "config_{}_pos_ceed.py".format(lower),
+                        workflow_dir / "config_{}_global_ceed.py".format(lower),
+                        workflow_stage / "config_{}_global_ceed.py".format(lower),
                     )
                 upload_tree(
                     s3, ai_pal_root / "picker_{}".format(model), bucket,
@@ -165,7 +165,7 @@ def submit_stage(
             if include_positive_models:
                 ceed_stage = input_stage / "CEED_ckpt"
                 ceed_stage.mkdir()
-                for name in POSITIVE_CHECKPOINTS:
+                for name in GLOBAL_CHECKPOINTS:
                     shutil.copy2(
                         workflow_dir / "input" / "CEED_ckpt" / name,
                         ceed_stage / name,

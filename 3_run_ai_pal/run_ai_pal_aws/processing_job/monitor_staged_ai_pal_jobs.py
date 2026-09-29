@@ -14,8 +14,8 @@ from job_common import human_bytes, latest_processing_job, print_job_status
 
 # Keep these aligned with the three staged launchers.
 CASE_CODE = "eg"
-TIME_RANGE = "20190704-20190707"
-INFERENCE_RUN = "eg-ai-pal-staged-20190704-20190707-v1"
+TIME_RANGE = "20200704-20200707"
+INFERENCE_RUN = "eg-ai-pal-staged-20200704-20200707-v1"
 region = "us-west-2"
 
 
@@ -56,15 +56,23 @@ def main():
         and key.endswith(".pick") for key in keys
     )
     assoc_done = sum(
-        "/2.1.0_phase_init_AI-PAL/daily_assoc/assoc_status/" in key
+        any(path in key for path in (
+            "/_internal/daily_assoc_AI-PAL/assoc_status/",
+            "/2.1_phase_init_AI-PAL/daily_assoc/assoc_status/",
+            "/2.1.0_phase_init_AI-PAL/daily_assoc/assoc_status/"))
         and key.endswith(".done.json") for key in keys
     )
     assoc_failed = sum(
-        "/2.1.0_phase_init_AI-PAL/daily_assoc/assoc_status/" in key
+        any(path in key for path in (
+            "/_internal/daily_assoc_AI-PAL/assoc_status/",
+            "/2.1_phase_init_AI-PAL/daily_assoc/assoc_status/",
+            "/2.1.0_phase_init_AI-PAL/daily_assoc/assoc_status/"))
         and key.endswith(".failed.json") for key in keys
     )
     post_done = sum(
-        "/3.1_phase_final_AI-PAL/postprocess_status/" in key
+        any(path in key for path in (
+            "/_internal/postprocess_AI-PAL/postprocess_status/",
+            "/3.1_phase_final_AI-PAL/postprocess_status/"))
         and key.endswith(".json") for key in keys
     )
     sac_files = sum(

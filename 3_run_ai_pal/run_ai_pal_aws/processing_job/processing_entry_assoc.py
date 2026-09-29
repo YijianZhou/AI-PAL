@@ -26,7 +26,7 @@ def main():
     for path in (SOURCE_ROOT, PAL_SRC):
         sys.path.insert(0, str(path))
 
-    from association_runner import run_buffered_association
+    from association_runner import run_buffered_association, offline_association_root
     from aws_inference_job import PeriodicS3Sync, prepare_output
     import config_ai_pal as config_module
 
@@ -50,7 +50,7 @@ def main():
     cfg = config_module.Config()
     case_root = OUTPUT_ROOT / case_code
     pick_dir = case_root / "1.2_picks_AI-PAL-ENSEMBLE"
-    initial_root = case_root / "2.1.0_phase_init_AI-PAL"
+    initial_root = case_root / "2.1_phase_init_AI-PAL"
     started = time.time()
     writer.write_json("_status/2.2_assoc_job.json", {
         "status": "running", "time_range": time_range,
@@ -61,7 +61,7 @@ def main():
             run_buffered_association(
                 subnet_station_files=station_sets,
                 pick_dir=pick_dir,
-                assoc_root=initial_root / "daily_assoc",
+                assoc_root=offline_association_root(case_root),
                 time_range=time_range,
                 num_workers=int(os.environ.get("NUM_WORKERS", "16")),
                 config_factory=config_module.Config,
