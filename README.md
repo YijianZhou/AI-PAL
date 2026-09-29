@@ -1,5 +1,17 @@
 # AI-PAL
 
+For a new case, keep the PAL detection and local-picker training workflow.
+Global CEED retraining is optional: normally reuse the supplied
+`Pre-trained_models/CEED/CEED_ckpt` checkpoints with their matching configs.
+Optional rebuilding starts in [CEED preparation](Pre-trained_models/CEED/README.md)
+and continues in [CEED training](Pre-trained_models/CEED/README.md).
+
+See [Station File Formats](STATION_FORMATS.md) for supported schemas,
+workflow-specific restrictions, and the station filenames used by launchers.
+
+Current release preparation: **v7.1**. See the [changelog](CHANGELOG.md)
+for major changes since v7.0.
+
 AI-PAL is a self-supervised earthquake detection framework built around one
 central idea: use the rule-based Phase picking, Association, and Location (PAL)
 algorithm to generate locally adapted phase labels and training samples from
@@ -145,7 +157,7 @@ checkpoint paths in that launcher.
 
 When copying, check `waveform_backend`: `"local"` for local/realtime data,
 `"scedc"` for AWS continuous inference, or `"scedc_training"` for AWS
-training-window extraction. Also review `to_prep` and plotting options.
+training-window extraction. Also review `to_clean` and plotting options.
 When switching workflow types, start from the destination template and transfer
 the relevant scientific parameter values. The package's `PAL_src` must be on
 the import path, as arranged by the maintained launchers.
@@ -187,14 +199,14 @@ label formats, resumable Zarr creation, and training commands.
 Use `3_run_ai_pal/` for continuous waveform inference. The preferred picker
 groups produce a canonical `1.2_picks_AI-PAL-ENSEMBLE` branch that PAL
 associates. The
-workflow can then repick detected events with POS_NEG and positive-only model
+workflow can then repick detected events with Local and positive-only model
 groups, reassociate reliable phase pairs, supplement compatible single-group
 picks, and merge duplicate detections.
 
 The package provides:
 
-- A one-command pick, associate, repick, and reassociate workflow.
-- Separate picking, association, and postprocessing stages.
+- Three offline stages: `1_run_ai_pal_pick`, `2_run_pal_assoc`, and
+  `3_run_ai_pal_repick_reassoc`, with local and AWS launchers.
 - A persistent realtime workflow with backfill, polling, health monitoring,
   corrected origin-time ownership, and independent reference-picker branches.
 
@@ -250,8 +262,8 @@ prepared once. Native models reuse one tensor per assigned device.
 
 AI-PAL distinguishes:
 
-- `picker_pos_neg_group`: continuous pickers trained with positive and negative windows.
-- `repicker_pos_neg_group` and `repicker_pos_group`: models used after an
+- `picker_local_group`: continuous pickers trained with positive and negative windows.
+- `repicker_local_group` and `repicker_global_group`: models used after an
   initial detection.
 - `reference_workflows`: explicit realtime picker/associator combinations;
   the defaults share PHN-SB picks between PAL and GaMMA. GaMMA settings live in
@@ -269,8 +281,8 @@ duplicate groups, including events detected by more than two subnets.
 
 ### 5.4 Postprocessing
 
-Postprocessing uses repicker phase pairs detected by both POS_NEG and positive
-groups as PAL reassociation anchors. Compatible POS_NEG-only or positive-only
+Postprocessing uses repicker phase pairs detected by both Local and positive
+groups as PAL reassociation anchors. Compatible Local-only or positive-only
 pairs can be supplemented after the event origin and location are updated.
 Final phase rows retain picker support ratios, uncertainty, provenance,
 displacement amplitude, per-component P-wave energy SNR, and a four-level

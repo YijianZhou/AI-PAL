@@ -14,7 +14,8 @@ class Config(AIPALConfig):
 
     # Training.
     self.num_epochs = 20
-    self.batch_size = 128
+    self.batch_size = [128, 16]  # [CEED positive, local negative].
+    self.negative_loss_weight = 0.5  # Negative-window multiplier; positive data points keep weight 1.
     self.lr = 1e-4
     self.valid_step = 5000
     self.max_checkpoints = 20
