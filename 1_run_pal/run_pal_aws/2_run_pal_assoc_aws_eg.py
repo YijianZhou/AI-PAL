@@ -74,8 +74,9 @@ pal_files = (
     "associator_pal.py",
     "association_runner.py",
     "runtime_console.py",
-    "data_pipeline_aws.py",
+    "data_pipeline_aws.py", "station_inventory.py",
     "phase_merge.py",
+    "phase_qc.py",
     "pick_ensemble.py",
     "trigger_counts.py",
 )

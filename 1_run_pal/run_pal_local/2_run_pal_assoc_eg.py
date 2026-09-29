@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run independent-day PAL association for existing local picks."""
+"""Run buffered daily PAL association for existing local picks."""
 
 import importlib
 import os
@@ -13,7 +13,7 @@ AI_PAL_ROOT = Path("~/software/AI-PAL").expanduser()  # Installed source package
 CASE_CODE = "eg"  # Packaged example; drives the case config and all output paths.
 # Use {"full": ...} for one network, or r1/r2/... keys in its case config.
 SUBNET_STATION_FILES = {
-    "full": Path("input/example_pal_format1.sta"),
+    "full": Path("input/example_pal_format4.sta"),
 }
 PICK_DIR = Path("output/%s/picks" % CASE_CODE)
 OUT_ROOT = Path("output/%s" % CASE_CODE)
@@ -57,7 +57,7 @@ def main():
         config_factory=cfg.Config,
         overwrite=OVERWRITE,
         retry_failed_days=RETRY_FAILED_DAYS,
-        association_buffer_enabled=False,
+        association_buffer_enabled=True,
         output_catalog=out_root / "catalog_{}.dat".format(TIME_RANGE),
         output_phase=out_root / "phase_{}.dat".format(TIME_RANGE),
     )
