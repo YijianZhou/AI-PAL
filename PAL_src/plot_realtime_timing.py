@@ -16,6 +16,17 @@ LABEL_FONTSIZE = 12
 TITLE_FONTSIZE = 14
 
 
+def normalize_timing_groups(record):
+    aliases = {}
+    for key, value in record.items():
+        new_key = (key.replace('POS_NEG_', 'Local_').replace('POS_', 'Global_')
+                   .replace('pos_neg_only', 'local_only').replace('pos_only', 'global_only'))
+        aliases[new_key] = value
+    # Prefer already-current fields if an old and a new alias coexist.
+    aliases.update({key: value for key, value in record.items() if key in aliases})
+    return aliases
+
+
 def read_timing(path):
     with open(path, newline="") as fp:
         rows = list(csv.DictReader(fp))
@@ -29,7 +40,7 @@ def read_timing(path):
         for key in json_fields:
             if record.get(key):
                 json.loads(record[key])
-        return record
+        return normalize_timing_groups(record)
     except ValueError:
         # Older writers emitted unquoted JSON arrays in comma-separated rows.
         # Decode those arrays intact rather than shifting every later column.
@@ -55,7 +66,7 @@ def read_timing(path):
                     raise ValueError("Incomplete legacy timing row in {}".format(path))
         if raw:
             raise ValueError("Unexpected trailing timing fields in {}".format(path))
-        return recovered
+        return normalize_timing_groups(recovered)
 
 
 def get_float(record, key):
@@ -188,10 +199,10 @@ def repicker_timings(record):
     suffix = "_sec"
     def group_order(key):
         name = key[len(prefix):-len(suffix)]
-        if name.startswith("POS_NEG_"):
-            return (1, name[len("POS_NEG_"):])
-        if name.startswith("POS_"):
-            return (0, name[len("POS_"):])
+        if name.startswith("Local_"):
+            return (1, name[len("Local_"):])
+        if name.startswith("Global_"):
+            return (0, name[len("Global_"):])
         return (2, name)
     keys = sorted(
         (key for key in record
@@ -288,9 +299,9 @@ def associated_phase_count_values(record):
         for key in sorted(record) if key.startswith("num_associated_picks_")
     ]
     items += [
-        ("POS_NEG + POS pairs", "num_event_repick_pairs_both_groups"),
-        ("POS_NEG-only pairs", "num_event_repick_pairs_pos_neg_only"),
-        ("POS-only pairs", "num_event_repick_pairs_pos_only"),
+        ("Local + Global pairs", "num_event_repick_pairs_both_groups"),
+        ("Local-only pairs", "num_event_repick_pairs_local_only"),
+        ("Global-only pairs", "num_event_repick_pairs_global_only"),
         ("Generated repicker pairs", "num_event_repicker_pairs_generated"),
         (
             "Glitch-rejected repicker pairs",

@@ -32,7 +32,7 @@ load_station_stream = cfg.load_station_stream
 train_ratio = cfg.train_ratio
 valid_ratio = cfg.valid_ratio
 freq_band = cfg.freq_band
-to_prep = cfg.to_prep
+to_clean = getattr(cfg, "to_clean", getattr(cfg, "to_prep", True))
 global_max_norm = cfg.global_max_norm
 num_aug = cfg.num_aug
 positive_num_aug_mode = getattr(cfg, 'positive_num_aug_mode', 'fixed')
@@ -108,7 +108,7 @@ def add_noise(st, day_stream, tp, ts, picks):
     st_noise = day_stream.copy().slice(t0-win_len/2, t1+win_len/2)
     if len(st_noise) != 3:
         return st
-    if to_prep:
+    if to_clean:
         st_noise = preprocess(st_noise, samp_rate, freq_band)
     st_noise = st_noise.slice(t0, t1).normalize(global_max=global_max_norm)
     if len(st_noise) != 3:
@@ -133,7 +133,7 @@ def cut_event_window(day_stream, t0, t1):
     st = day_stream.copy().slice(t0-win_len/2, t1+win_len/2)
     if 0 in st.max() or len(st) != 3:
         return None
-    if to_prep:
+    if to_clean:
         st = preprocess(st, samp_rate, freq_band)
     st = st.slice(t0, t1)
     if 0 in st.max() or len(st) != 3:

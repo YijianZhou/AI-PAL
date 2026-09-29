@@ -106,7 +106,7 @@ def paired_events(events, assignments, picks, records, projection, min_sta):
             continue
         lon, lat = projection(event["x(km)"], event["y(km)"], inverse=True)
         output.append({"time": utc_datetime(event["time"]), "lat": lat, "lon": lon,
-                       "depth": event["z(km)"], "mag": -1.0, "picks": paired})
+                       "depth": event["z(km)"], "mag": float("nan"), "picks": paired})
     return output
 
 

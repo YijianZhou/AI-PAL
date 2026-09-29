@@ -1,23 +1,18 @@
-"""ResUNet picker for fixed positive-event NPY shard datasets.
-
-This module is for benchmark/event-window inference, not continuous streams.  It
-reads already-preprocessed NPY shards with shape (N, 3, win_npts + 2), applies
-random 25 s sub-window ensemble picking, and reports predicted phase times
-relative to the original NPY event-window start time.
-"""
+"""Shared SAR window inference for production repicking and benchmarks."""
 import glob
 import hashlib
 import os
+import time
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 try:
-    from .models import UNet
+    from .models import SAR
     from . import config
 except ImportError:
-    from models import UNet
+    from models import SAR
     import config
 
 cfg = config.Config()
@@ -26,6 +21,11 @@ samp_rate = cfg.samp_rate
 num_chn = cfg.num_chn
 win_len = cfg.win_len
 win_len_npts = int(win_len * samp_rate)
+step_len = cfg.rnn_step_len
+step_len_npts = int(step_len * samp_rate)
+step_stride = cfg.rnn_step_stride
+step_stride_npts = int(step_stride * samp_rate)
+num_steps = cfg.rnn_num_steps
 global_max_norm = cfg.global_max_norm
 trig_thres = cfg.trig_thres
 tp_dev = cfg.tp_dev
@@ -39,7 +39,7 @@ pos_seed = None
 pos_min_cluster_size = None
 
 
-def configure_positive_picker(start_range, num_repeat, batch_size, random_seed,
+def configure_window_picker(start_range, num_repeat, batch_size, random_seed,
                               min_cluster_size):
     """Set benchmark-only random-window controls supplied by the executable."""
     global pos_start_range, pos_num_repeat, pos_batch_size
@@ -53,8 +53,8 @@ def configure_positive_picker(start_range, num_repeat, batch_size, random_seed,
         raise ValueError("positive-picker repeat, batch, and cluster sizes must be positive")
 
 
-class RUNPositivePicker(object):
-  """ResUNet picker for fixed event windows saved as NPY shards."""
+class SARWindowPicker(object):
+  """SAR picker for fixed event windows saved as NPY shards."""
 
   def __init__(self, ckpt_dir, ckpt_idx=-1, gpu_idx=0):
     if os.path.isfile(ckpt_dir):
@@ -72,17 +72,27 @@ class RUNPositivePicker(object):
                 ckpt_path = sorted(glob.glob(os.path.join(ckpt_dir, '%s_*.ckpt' % ckpt_idx)))[0]
         else:
             ckpt_path = sorted(glob.glob(os.path.join(ckpt_dir, '%s_*.ckpt' % ckpt_idx)))[0]
-    print('RUN checkpoint: {}'.format(ckpt_path), flush=True)
+    print('SAR checkpoint: {}'.format(ckpt_path), flush=True)
     self.device = torch.device(
         'cuda:%s' % gpu_idx
         if int(gpu_idx) >= 0 and torch.cuda.is_available() else 'cpu'
     )
-    self.model = UNet()
+    self.model = SAR()
     self.model.load_state_dict(torch.load(ckpt_path, map_location=self.device))
     self.model.to(self.device)
     self.model.eval()
 
   def pick_shard(self, shard, meta_rows):
+    """Pick all event windows in one shard.
+
+    Parameters
+    ----------
+    shard : ndarray
+        Shape (N, 3, win_npts + 2). Columns 0/1 carry reference P/S times;
+        waveform starts at column 2.
+    meta_rows : list[dict]
+        Metadata rows aligned with shard rows.
+    """
     if shard.size == 0:
         return []
     data = np.asarray(shard[:, :num_chn, 2:], dtype=np.float32)
@@ -109,10 +119,11 @@ class RUNPositivePicker(object):
         for start in range(0, arr.shape[0], pos_batch_size):
             batch = torch.from_numpy(arr[start:start + pos_batch_size]).to(self.device, non_blocking=True).float()
             batch = self.preprocess_cuda_batch(batch)
+            data_seq = self.window_batch_to_seq(batch)
             with torch.inference_mode():
-                logits = self.model(batch)
-                probs = F.softmax(logits, dim=1).detach().cpu().numpy()
-            for local_idx, pred_prob in enumerate(probs):
+                pred_logits = self.model(data_seq)
+                pred_probs = F.softmax(pred_logits, dim=-1).detach().cpu().numpy()
+            for local_idx, pred_prob in enumerate(pred_probs):
                 sample_idx, win_start_sec = jobs[start + local_idx]
                 p_votes, s_votes = self.decode_one_window(pred_prob, win_start_sec)
                 phase_votes[sample_idx][0].extend(p_votes)
@@ -141,6 +152,16 @@ class RUNPositivePicker(object):
         return np.asarray([(low + high) / 2.0], dtype=np.float32)
     return rng.uniform(low, high, size=pos_num_repeat).astype(np.float32)
 
+  def window_batch_to_seq(self, win_batch):
+    data_seq = win_batch.unfold(2, step_len_npts, step_stride_npts)
+    data_seq = data_seq.permute(0, 2, 1, 3).reshape(win_batch.size(0), -1, num_chn * step_len_npts)
+    if data_seq.size(1) < num_steps:
+        pad = data_seq.new_zeros(data_seq.size(0), num_steps - data_seq.size(1), data_seq.size(2))
+        data_seq = torch.cat((data_seq, pad), dim=1)
+    elif data_seq.size(1) > num_steps:
+        data_seq = data_seq[:, 0:num_steps, :]
+    return data_seq.contiguous()
+
   def preprocess_cuda_batch(self, data):
     # Re-normalize each sliced 25 s window; the source shard may be normalized over a longer event window.
     data -= torch.mean(data, dim=2, keepdim=True)
@@ -151,8 +172,8 @@ class RUNPositivePicker(object):
     return data / scale.clamp_min(1e-12)
 
   def decode_one_window(self, pred_prob, win_start_sec):
-    pred_prob_p = np.asarray(pred_prob[1], dtype=np.float32)
-    pred_prob_s = np.asarray(pred_prob[2], dtype=np.float32)
+    pred_prob_p = np.asarray(pred_prob[:, 1], dtype=np.float32)
+    pred_prob_s = np.asarray(pred_prob[:, 2], dtype=np.float32)
     pred_prob_p[~np.isfinite(pred_prob_p)] = 0.0
     pred_prob_s[~np.isfinite(pred_prob_s)] = 0.0
     return (
@@ -170,7 +191,7 @@ class RUNPositivePicker(object):
         if len(det) == 0:
             continue
         idx = float(np.median(det))
-        phase_time = float(win_start_sec + idx / float(samp_rate))
+        phase_time = float(win_start_sec + step_len / 2.0 + step_stride * idx)
         phase_prob = float(np.amax(prob[det]))
         votes.append((phase_time, phase_prob))
     return votes
@@ -226,29 +247,3 @@ def station_id(meta):
         return '{}.{}'.format(sta, channel)
     return sta
 
-
-def rows_to_csv(rows, fout, write_header=False):
-    columns = [
-        'dataset', 'event_id', 'trace_name', 'station_id', 'phase', 'cluster_idx',
-        'pick_time', 'pick_time_std', 'pick_prob', 'pick_prob_std', 'num_votes',
-        'sb_idx', 'shard_path', 'row_in_shard', 'window_start_sec', 'p_ref_sec', 's_ref_sec'
-    ]
-    if write_header:
-        fout.write(','.join(columns) + '\n')
-    for row in rows:
-        vals = [format_value(row.get(col, '')) for col in columns]
-        fout.write(','.join(vals) + '\n')
-
-
-def format_value(value):
-    if isinstance(value, float):
-        if not np.isfinite(value):
-            return ''
-        return '{:.5f}'.format(value)
-    text = str(value)
-    if ',' in text:
-        text = text.replace(',', ';')
-    return text
-
-# Backward-compatible alias for copied PhaseNet runner names.
-PHNPositivePicker = RUNPositivePicker

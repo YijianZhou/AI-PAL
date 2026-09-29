@@ -65,8 +65,8 @@ def parse_args():
     parser.add_argument("--native_pickers_json", type=str, required=True)
     parser.add_argument("--reference_pickers_json", type=str, required=True)
     parser.add_argument("--reference_associators_json", type=str, default="{}")
-    parser.add_argument("--repicker_pos_neg_json", type=str, default="{}")
-    parser.add_argument("--repicker_pos_json", type=str, default="{}")
+    parser.add_argument("--repicker_local_json", type=str, default="{}")
+    parser.add_argument("--repicker_global_json", type=str, default="{}")
     return cfg, parser.parse_args()
 
 
@@ -162,8 +162,8 @@ def apply_overrides(cfg, args):
 
     cfg.native_picker_settings = json.loads(args.native_pickers_json)
     cfg.reference_picker_settings = json.loads(args.reference_pickers_json)
-    cfg.repicker_pos_neg_settings = json.loads(args.repicker_pos_neg_json)
-    cfg.repicker_pos_settings = json.loads(args.repicker_pos_json)
+    cfg.repicker_local_settings = json.loads(args.repicker_local_json)
+    cfg.repicker_global_settings = json.loads(args.repicker_global_json)
     duplicate_names = (
         set(cfg.native_picker_settings) & set(cfg.reference_picker_settings)
     )
@@ -171,7 +171,7 @@ def apply_overrides(cfg, args):
         raise ValueError("pickers cannot be native and reference: {}".format(
             sorted(duplicate_names)
         ))
-    picker_pos_neg = list(dict.fromkeys(cfg.picker_pos_neg_group))
+    picker_local = list(dict.fromkeys(cfg.picker_local_group))
     cfg.reference_workflow_specs = reference_workflows(cfg)
     cfg.reference_picker_names = list(dict.fromkeys(
         item["picker"] for item in cfg.reference_workflow_specs.values()
@@ -186,12 +186,14 @@ def apply_overrides(cfg, args):
             if workflow["associator"] == "GaMMA" and not cfg.reference_associator_settings.get(name):
                 raise ValueError("missing GaMMA settings for reference workflow: {}".format(name))
         require_gamma_runtime()
-    cfg.continuous_picker_groups = {"POS_NEG": picker_pos_neg}
-    cfg.continuous_picker_specs = {
-        name: {"group": "POS_NEG", "model": name} for name in picker_pos_neg
+    from continuous_pickers import continuous_specs
+    cfg.continuous_picker_specs = continuous_specs(
+        cfg, cfg.native_picker_settings, cfg.repicker_global_settings)
+    cfg.continuous_picker_groups = {
+        group: [name for name, spec in cfg.continuous_picker_specs.items()
+                if spec["group"] == group]
+        for group in ("Local", "Global")
     }
-    if not cfg.continuous_picker_specs:
-        raise ValueError("at least one preferred continuous picker is required")
     cfg.enabled_pickers = _enabled_picker_names(cfg)
     configured_plot_ref = list(getattr(
         cfg, "enable_event_waveform_plot_ref", []
@@ -211,38 +213,20 @@ def apply_overrides(cfg, args):
     cfg.event_waveform_plot_ref_branches = [
         reference_branches[index] for index in configured_plot_ref
     ]
-    missing_native = set(picker_pos_neg) - set(cfg.native_picker_settings)
+    missing_native = set(picker_local) - set(cfg.native_picker_settings)
     missing_reference = references - set(cfg.reference_picker_settings)
     if missing_native or missing_reference:
         raise ValueError(
-            "selected picker specifications are missing: POS_NEG={} "
+            "selected picker specifications are missing: Local={} "
             "reference={}".format(
                 sorted(missing_native),
                 sorted(missing_reference)
             )
         )
-    cfg.continuous_picker_group_min_support = {
-        "POS_NEG": int(cfg.picker_pos_neg_group_min_picker_support),
-    }
-    for group_name, members in cfg.continuous_picker_groups.items():
-        if not members:
-            print(
-                "{} continuous picker group disabled".format(group_name),
-                flush=True,
-            )
-            continue
-        required = cfg.continuous_picker_group_min_support[group_name]
-        if required <= 0 or required > len(members):
-            raise ValueError(
-                "{} continuous picker support {} is invalid for {} models"
-                .format(group_name, required, len(members))
-            )
     cfg.picker_selection_signature = json.dumps(
         {
             "continuous_picker_groups": cfg.continuous_picker_groups,
-            "continuous_picker_group_min_support": (
-                cfg.continuous_picker_group_min_support
-            ),
+            "picker_group_min_picker_support": cfg.picker_group_min_picker_support,
             "reference_workflows": cfg.reference_workflow_specs,
             "reference_associators": cfg.reference_associator_settings,
         },
@@ -252,8 +236,8 @@ def apply_overrides(cfg, args):
     cfg.picker_selection_state_dir = os.path.join(
         cfg.out_root, "_internal", "pipeline_state"
     )
-    for name in sorted(picker_pos_neg):
-        ckpt_path = cfg.native_picker_settings[name].get("ckpt", "")
+    for name, settings in cfg.continuous_picker_specs.items():
+        ckpt_path = settings.get("ckpt", "")
         if not os.path.isfile(ckpt_path):
             raise FileNotFoundError(
                 "{} checkpoint file not found: {}".format(name, ckpt_path)
@@ -264,33 +248,35 @@ def apply_overrides(cfg, args):
         if continuous_spec is None:
             settings = cfg.reference_picker_settings[runtime_name]
         else:
-            settings = cfg.native_picker_settings[continuous_spec["model"]]
+            settings = continuous_spec
         cfg.picker_gpu_indices[runtime_name] = int(settings["gpu_idx"])
     print("picker GPU assignments: {}".format(cfg.picker_gpu_indices))
 
-    selected_pos_neg = list(cfg.repicker_pos_neg_group)
-    selected_pos = list(cfg.repicker_pos_group)
+    selected_pos_neg = list(cfg.repicker_local_group)
+    selected_pos = list(cfg.repicker_global_group)
     missing_pos_neg = set(selected_pos_neg) - set(
-        cfg.repicker_pos_neg_settings
+        cfg.repicker_local_settings
     )
-    missing_pos = set(selected_pos) - set(cfg.repicker_pos_settings)
+    missing_pos = set(selected_pos) - set(cfg.repicker_global_settings)
     if missing_pos_neg or missing_pos:
         raise ValueError(
-            "selected repicker specifications are missing: POS_NEG={} POS={}"
+            "selected repicker specifications are missing: Local={} Global={}"
             .format(sorted(missing_pos_neg), sorted(missing_pos))
         )
-    if set(picker_pos_neg) - set(selected_pos_neg):
+    if set(picker_local) - set(selected_pos_neg):
         raise ValueError(
-            "continuous POS_NEG pickers must be selected from "
-            "repicker_pos_neg_group: {}".format(
-                sorted(set(picker_pos_neg) - set(selected_pos_neg))
+            "continuous Local pickers must be selected from "
+            "repicker_local_group: {}".format(
+                sorted(set(picker_local) - set(selected_pos_neg))
             )
         )
-    cfg.repicker_pos_neg_settings = {
-        name: cfg.repicker_pos_neg_settings[name] for name in selected_pos_neg
+    if set(getattr(cfg, "picker_global_group", [])) - set(selected_pos):
+        raise ValueError("continuous Global pickers must be selected from repicker_global_group")
+    cfg.repicker_local_settings = {
+        name: cfg.repicker_local_settings[name] for name in selected_pos_neg
     }
-    cfg.repicker_pos_settings = {
-        name: cfg.repicker_pos_settings[name] for name in selected_pos
+    cfg.repicker_global_settings = {
+        name: cfg.repicker_global_settings[name] for name in selected_pos
     }
     if cfg.enable_post_process:
         if not selected_pos_neg or not selected_pos:
@@ -298,8 +284,8 @@ def apply_overrides(cfg, args):
                 "event repicking requires both repicker groups"
             )
         for group_name, settings in (
-            ("POS_NEG", cfg.repicker_pos_neg_settings),
-            ("POS", cfg.repicker_pos_settings),
+            ("Local", cfg.repicker_local_settings),
+            ("Global", cfg.repicker_global_settings),
         ):
             if len(settings) < int(cfg.repick_group_min_picker_support):
                 raise ValueError(
@@ -307,8 +293,8 @@ def apply_overrides(cfg, args):
                     .format(group_name)
                 )
             for name, spec in settings.items():
-                # Continuous POS_NEG models are reused and need no second load.
-                if group_name == "POS_NEG" and name in picker_pos_neg:
+                # Continuous Local models are reused and need no second load.
+                if group_name == "Local" and name in picker_local:
                     continue
                 ckpt_path = spec.get("ckpt", "")
                 if not os.path.isfile(ckpt_path):
@@ -333,12 +319,12 @@ def apply_overrides(cfg, args):
     )
 
     visible_names = {}
-    preferred_runtime_names = picker_pos_neg
+    preferred_runtime_names = list(cfg.continuous_picker_specs)
     for index, runtime_name in enumerate(preferred_runtime_names, start=1):
         spec = cfg.continuous_picker_specs[runtime_name]
         visible_names[runtime_name] = (
             "1.1.{}_picks_{}_{}".format(
-                index, spec["group"].lower(), spec["model"]
+                index, spec["group"].lower(), spec["identity"]
             )
         )
     for index, reference_name in enumerate(cfg.reference_picker_names, start=1):
@@ -642,15 +628,11 @@ if __name__ == "__main__":
         continuous_spec = cfg.continuous_picker_specs.get(picker_name)
         if continuous_spec is not None:
             model_name = continuous_spec["model"]
-            settings = cfg.native_picker_settings[model_name]
-            module_name, class_name = native_registry[model_name]
-            module = importlib.import_module(module_name)
-            picker_class = getattr(module, class_name)
-            native_picker = picker_class(
-                settings["ckpt"],
-                -1,
-                int(settings["gpu_idx"]),
-            )
+            from offline_picker_runner import _load_pickers
+            settings = dict(continuous_spec)
+            if not settings.get("config"):
+                settings["config"] = os.path.join(AI_PAL_ROOT, "picker_" + model_name, "config.py")
+            native_picker = _load_pickers(AI_PAL_ROOT, {picker_name: settings})[picker_name]
             pickers[picker_name] = realtime_pickers.NativePickerAdapter(
                 picker_name, native_picker
             )
@@ -676,13 +658,13 @@ if __name__ == "__main__":
         event_repicker = EventRepicker(
             AI_PAL_ROOT,
             cfg,
-            cfg.repicker_pos_neg_settings,
+            cfg.repicker_local_settings,
             cfg.full_sta_file,
             station_dict=pick_sta_dict,
-            repicker_pos_specs=cfg.repicker_pos_settings,
+            repicker_global_specs=cfg.repicker_global_settings,
             shared_continuous_pickers={
                 group_name: {
-                    cfg.continuous_picker_specs[runtime_name]["model"]: (
+                    cfg.continuous_picker_specs[runtime_name]["identity"]: (
                         pickers[runtime_name]
                     )
                     for runtime_name in runtime_names

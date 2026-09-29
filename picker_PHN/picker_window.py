@@ -1,10 +1,4 @@
-"""Frame Transformer picker for fixed positive-event NPY shard datasets.
-
-This module is for benchmark/event-window inference, not continuous streams.  It
-reads already-preprocessed NPY shards with shape (N, 3, win_npts + 2), applies
-random 25 s sub-window ensemble picking, and reports predicted phase times
-relative to the original NPY event-window start time.
-"""
+"""Shared PHN window inference for production repicking and benchmarks."""
 import glob
 import hashlib
 import os
@@ -14,10 +8,10 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from .models import FrameTransformerPicker
+    from .models import UNet
     from . import config
 except ImportError:
-    from models import FrameTransformerPicker
+    from models import UNet
     import config
 
 cfg = config.Config()
@@ -39,7 +33,7 @@ pos_seed = None
 pos_min_cluster_size = None
 
 
-def configure_positive_picker(start_range, num_repeat, batch_size, random_seed,
+def configure_window_picker(start_range, num_repeat, batch_size, random_seed,
                               min_cluster_size):
     """Set benchmark-only random-window controls supplied by the executable."""
     global pos_start_range, pos_num_repeat, pos_batch_size
@@ -53,8 +47,8 @@ def configure_positive_picker(start_range, num_repeat, batch_size, random_seed,
         raise ValueError("positive-picker repeat, batch, and cluster sizes must be positive")
 
 
-class FTPositivePicker(object):
-  """Frame Transformer picker for fixed event windows saved as NPY shards."""
+class PHNWindowPicker(object):
+  """PhaseNet picker for fixed event windows saved as NPY shards."""
 
   def __init__(self, ckpt_dir, ckpt_idx=-1, gpu_idx=0):
     if os.path.isfile(ckpt_dir):
@@ -72,12 +66,12 @@ class FTPositivePicker(object):
                 ckpt_path = sorted(glob.glob(os.path.join(ckpt_dir, '%s_*.ckpt' % ckpt_idx)))[0]
         else:
             ckpt_path = sorted(glob.glob(os.path.join(ckpt_dir, '%s_*.ckpt' % ckpt_idx)))[0]
-    print('FT checkpoint: {}'.format(ckpt_path), flush=True)
+    print('PHN checkpoint: {}'.format(ckpt_path), flush=True)
     self.device = torch.device(
         'cuda:%s' % gpu_idx
         if int(gpu_idx) >= 0 and torch.cuda.is_available() else 'cpu'
     )
-    self.model = FrameTransformerPicker()
+    self.model = UNet()
     self.model.load_state_dict(torch.load(ckpt_path, map_location=self.device))
     self.model.to(self.device)
     self.model.eval()
@@ -110,10 +104,8 @@ class FTPositivePicker(object):
             batch = torch.from_numpy(arr[start:start + pos_batch_size]).to(self.device, non_blocking=True).float()
             batch = self.preprocess_cuda_batch(batch)
             with torch.inference_mode():
-                amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-                with torch.autocast(device_type=self.device.type, dtype=amp_dtype, enabled=self.device.type == 'cuda'):
-                    logits = self.model(batch)
-                probs = F.softmax(logits.float(), dim=1).cpu().numpy()
+                logits = self.model(batch)
+                probs = F.softmax(logits, dim=1).detach().cpu().numpy()
             for local_idx, pred_prob in enumerate(probs):
                 sample_idx, win_start_sec = jobs[start + local_idx]
                 p_votes, s_votes = self.decode_one_window(pred_prob, win_start_sec)
@@ -172,7 +164,7 @@ class FTPositivePicker(object):
         if len(det) == 0:
             continue
         idx = float(np.median(det))
-        phase_time = float(win_start_sec + cfg.ft_frame_length / 2.0 + cfg.ft_frame_step * idx)
+        phase_time = float(win_start_sec + idx / float(samp_rate))
         phase_prob = float(np.amax(prob[det]))
         votes.append((phase_time, phase_prob))
     return votes
@@ -228,26 +220,3 @@ def station_id(meta):
         return '{}.{}'.format(sta, channel)
     return sta
 
-
-def rows_to_csv(rows, fout, write_header=False):
-    columns = [
-        'dataset', 'event_id', 'trace_name', 'station_id', 'phase', 'cluster_idx',
-        'pick_time', 'pick_time_std', 'pick_prob', 'pick_prob_std', 'num_votes',
-        'sb_idx', 'shard_path', 'row_in_shard', 'window_start_sec', 'p_ref_sec', 's_ref_sec'
-    ]
-    if write_header:
-        fout.write(','.join(columns) + '\n')
-    for row in rows:
-        vals = [format_value(row.get(col, '')) for col in columns]
-        fout.write(','.join(vals) + '\n')
-
-
-def format_value(value):
-    if isinstance(value, float):
-        if not np.isfinite(value):
-            return ''
-        return '{:.5f}'.format(value)
-    text = str(value)
-    if ',' in text:
-        text = text.replace(',', ';')
-    return text

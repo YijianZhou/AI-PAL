@@ -26,23 +26,26 @@ from obspy import Stream, UTCDateTime
 from obspy.core.util.attribdict import AttribDict
 
 import associator_pal
+from continuous_pickers import picker_architecture
 from phase_merge import (
     format_time, group_events, read_phase_file, resolve_pick_provenance,
 )
 from pick_ensemble import (
     format_picker_window_vote_ratios, repick_quality_code,
+    cluster_pair_votes, cluster_window_pairs,
 )
 from waveform_qc import displacement_amplitude, is_glitch
+from station_inventory import waveform_station_selector
 
 
-POS_PICKER_REGISTRY = {
-    "SAR": ("picker_SAR", "SARPositivePicker"),
-    "FT": ("picker_FT", "FTPositivePicker"),
-    "PHN": ("picker_PHN", "PHNPositivePicker"),
-    "RUN": ("picker_RUN", "RUNPositivePicker"),
+REPICKER_REGISTRY = {
+    "SAR": ("picker_SAR", "SARWindowPicker"),
+    "FT": ("picker_FT", "FTWindowPicker"),
+    "PHN": ("picker_PHN", "PHNWindowPicker"),
+    "RUN": ("picker_RUN", "RUNWindowPicker"),
 }
 
-EVENT_REPICK_VERSION = "repick_quality_vote_ratio_v19"
+EVENT_REPICK_VERSION = "repick_pair_window_votes_v20"
 EVENT_WAVEFORM_PRE_ORIGIN_SEC = 5.0
 EVENT_WAVEFORM_POST_S_SEC = 10.0
 EVENT_WAVEFORM_PLOT_DPI = 200
@@ -129,20 +132,24 @@ def _format_picker_uncertainties(values):
     for name in sorted(values):
         item = values[name]
         fields.append(
-            "{}:tp={:.4f};ts={:.4f};pp={:.4f};sp={:.4f}".format(
+            "{}:tp={:.4f};ts={:.4f};pp={:.4f};sp={:.4f};pmed={:.6f};smed={:.6f}".format(
                 name,
                 item["tp_std"],
                 item["ts_std"],
                 item["p_prob_std"],
                 item["s_prob_std"],
+                item["p_prob"],
+                item["s_prob"],
             )
         )
     return "|".join(fields)
 
 
-def _safe_event_filename(origin_time):
+def _safe_event_filename(origin_time, latitude, longitude):
     origin_time = UTCDateTime(origin_time)
-    return origin_time.strftime("%Y%m%dT%H%M%S.%fZ") + ".png"
+    return "{}_{:.5f}_{:.5f}.png".format(
+        origin_time.strftime("%Y%m%dT%H%M%S.%fZ"), float(latitude), float(longitude)
+    )
 
 
 def _safe_event_code(origin_time):
@@ -154,6 +161,9 @@ class PositivePickerAdapter(object):
 
     def __init__(self, name, module, picker, cfg):
         self.name = name
+        self.model_name = picker_architecture(name)
+        if self.model_name not in REPICKER_REGISTRY:
+            raise ValueError('unsupported repicker architecture: {}'.format(self.model_name))
         self.module = module
         self.picker = picker
         self.cfg = cfg
@@ -193,7 +203,7 @@ class PositivePickerAdapter(object):
 
         low_rel = 0.0
         high_rel = max(0.0, float(start_high - context_start))
-        self.module.configure_positive_picker(
+        self.module.configure_window_picker(
             [low_rel, high_rel],
             workflow_cfg.repick_num_repeat,
             workflow_cfg.repick_batch_size,
@@ -226,12 +236,12 @@ class PositivePickerAdapter(object):
     def predict_preprocessed_batch(self, batch):
         """Run one already-normalized shared window batch."""
         with torch.inference_mode():
-            if self.name == "SAR":
+            if self.model_name == "SAR":
                 logits = self.picker.model(
                     self.picker.window_batch_to_seq(batch)
                 )
                 return F.softmax(logits, dim=-1).detach().cpu().numpy()
-            if self.name == "FT":
+            if self.model_name == "FT":
                 amp_dtype = (
                     torch.bfloat16
                     if self.device.type == "cuda"
@@ -249,32 +259,21 @@ class PositivePickerAdapter(object):
             return F.softmax(logits, dim=1).detach().cpu().numpy()
 
     def finalize_shared_votes(self, job, p_votes, s_votes, workflow_cfg):
-        rows = self.picker.cluster_sample_votes(
-            job["meta"], "P", p_votes, workflow_cfg.tp_dev
-        )
-        rows.extend(self.picker.cluster_sample_votes(
-            job["meta"], "S", s_votes, workflow_cfg.ts_dev
-        ))
-        return self._select_pairs(
-            rows,
-            job["context_start"],
-            job["tp_pred"],
-            job["ts_pred"],
-            workflow_cfg.tp_dev,
-            workflow_cfg.ts_dev,
-        )
+        pairs = cluster_window_pairs(p_votes, s_votes, workflow_cfg.tp_dev,
+                                     workflow_cfg.ts_dev, _minimum_window_votes(workflow_cfg))
+        return [dict(tp=job["context_start"] + pair["tp"],
+                     ts=job["context_start"] + pair["ts"],
+                     p_prob=pair["p_prob"], s_prob=pair["s_prob"],
+                     tp_std=pair["tp_std"], ts_std=pair["ts_std"],
+                     p_prob_std=pair["p_prob_std"], s_prob_std=pair["s_prob_std"],
+                     num_votes=pair["num_support"]) for pair in pairs]
 
     def _window_start_range(self, stream, tp_pred, ts_pred, buffer_seconds):
         phase_span = float(ts_pred - tp_pred)
-        if phase_span <= 0 or phase_span >= self.window_seconds:
+        if phase_span <= 0 or phase_span > self.window_seconds - 2.0 * buffer_seconds:
             return None
-        if phase_span <= self.window_seconds - 2.0 * buffer_seconds:
-            low = ts_pred + buffer_seconds - self.window_seconds
-            high = tp_pred - buffer_seconds
-        else:
-            available_shift = self.window_seconds - phase_span
-            low = tp_pred - available_shift
-            high = tp_pred
+        low = ts_pred + buffer_seconds - self.window_seconds
+        high = tp_pred - buffer_seconds
 
         stream_start = max(trace.stats.starttime for trace in stream)
         stream_end = min(trace.stats.endtime for trace in stream)
@@ -300,13 +299,11 @@ class PositivePickerAdapter(object):
                 # The preliminary event contributes only its origin and
                 # location. Keep every vote-supported pair and let PAL decide
                 # which pairs form reassociated events.
-                residual = abs(tp - tp_pred) / float(tp_dev)
-                residual += abs(ts - ts_pred) / float(ts_dev)
-                pairs.append((residual, tp, ts, p_row, s_row))
+                pairs.append((tp, ts, p_row, s_row))
         if not pairs:
             return []
         selected = []
-        for _, tp, ts, p_row, s_row in sorted(pairs, key=lambda item: item[0]):
+        for tp, ts, p_row, s_row in sorted(pairs, key=lambda item: (item[0], item[1])):
             selected.append({
                 "tp": tp,
                 "ts": ts,
@@ -332,8 +329,8 @@ class EventRepicker(object):
     """Repick events with pos+neg and positive-only model ensembles."""
 
     def __init__(
-        self, ai_pal_root, cfg, repicker_pos_neg_specs, station_file,
-        station_dict=None, repicker_pos_specs=None,
+        self, ai_pal_root, cfg, repicker_local_specs, station_file,
+        station_dict=None, repicker_global_specs=None,
         shared_continuous_pickers=None,
     ):
         self.ai_pal_root = Path(ai_pal_root)
@@ -341,21 +338,21 @@ class EventRepicker(object):
             sys.path.insert(0, str(self.ai_pal_root))
         self.cfg = cfg
         self.repicker_specs = {
-            "POS_NEG": dict(repicker_pos_neg_specs or {}),
-            "POS": dict(repicker_pos_specs or {}),
+            "Local": dict(repicker_local_specs or {}),
+            "Global": dict(repicker_global_specs or {}),
         }
         shared_continuous_pickers = dict(shared_continuous_pickers or {})
         if any(
-            name in shared_continuous_pickers for name in ("POS_NEG", "POS")
+            name in shared_continuous_pickers for name in ("Local", "Global")
         ):
             self._shared_continuous_pickers = {
                 group_name: dict(shared_continuous_pickers.get(group_name, {}))
-                for group_name in ("POS_NEG", "POS")
+                for group_name in ("Local", "Global")
             }
         else:
             self._shared_continuous_pickers = {
-                "POS_NEG": shared_continuous_pickers,
-                "POS": {},
+                "Local": shared_continuous_pickers,
+                "Global": {},
             }
         self.station_file = Path(station_file)
         self.stations = (
@@ -445,21 +442,21 @@ class EventRepicker(object):
         if self.pickers is not None:
             return
         configured_names = {
-            name
+            picker_architecture(name)
             for specs in self.repicker_specs.values()
-            for name in specs
+            for name, spec in specs.items()
         }
-        unknown = configured_names - set(POS_PICKER_REGISTRY)
+        unknown = configured_names - set(REPICKER_REGISTRY)
         if unknown:
             raise KeyError("unsupported event repickers: {}".format(
                 sorted(unknown)
             ))
         loaded = {}
-        self.picker_groups = {"POS_NEG": {}, "POS": {}}
+        self.picker_groups = {"Local": {}, "Global": {}}
         for group_name, specs in self.repicker_specs.items():
             for name, spec in specs.items():
                 key = "{}:{}".format(group_name, name)
-                package, class_name = POS_PICKER_REGISTRY[name]
+                package, class_name = REPICKER_REGISTRY[picker_architecture(name)]
                 config_path = Path(spec["config"])
                 if not config_path.is_file():
                     raise FileNotFoundError(config_path)
@@ -497,9 +494,9 @@ class EventRepicker(object):
                     )
                 package_module = importlib.import_module(package)
                 setattr(package_module, "config", config_module)
-                sys.modules.pop(package + ".picker_pos", None)
+                sys.modules.pop(package + ".picker_window", None)
                 importlib.invalidate_caches()
-                module = importlib.import_module(package + ".picker_pos")
+                module = importlib.import_module(package + ".picker_window")
                 picker_class = getattr(module, class_name)
                 shared = self._shared_continuous_pickers.get(
                     group_name, {}
@@ -523,13 +520,13 @@ class EventRepicker(object):
                         str(ckpt_path), -1, spec.get("gpu_idx", -1),
                     )
                     load_message = "loaded checkpoint"
-                module.configure_positive_picker(
+                module.configure_window_picker(
                     [0.0, 0.0], self.cfg.repick_num_repeat,
                     self.cfg.repick_batch_size, self.cfg.repick_random_seed,
                     _minimum_window_votes(self.cfg),
                 )
                 adapter = PositivePickerAdapter(
-                    name, module, picker, module.cfg
+                    name, module, picker, module.cfg,
                 )
                 loaded[key] = adapter
                 self.picker_groups[group_name][name] = adapter
@@ -580,14 +577,14 @@ class EventRepicker(object):
         """Reuse loaded pos+neg models selected for continuous inference."""
         if self.pickers is not None:
             raise RuntimeError("continuous models must be bound before loading")
-        if any(name in pickers for name in ("POS_NEG", "POS")):
-            for group_name in ("POS_NEG", "POS"):
+        if any(name in pickers for name in ("Local", "Global")):
+            for group_name in ("Local", "Global"):
                 self._shared_continuous_pickers.setdefault(
                     group_name, {}
                 ).update(pickers.get(group_name, {}))
         else:
             self._shared_continuous_pickers.setdefault(
-                "POS_NEG", {}
+                "Local", {}
             ).update(pickers)
 
     def load_pickers(self):
@@ -801,8 +798,8 @@ class EventRepicker(object):
         )
         provenance_counts = {
             "both_groups": 0,
-            "pos_neg_only": 0,
-            "pos_only": 0,
+            "local_only": 0,
+            "global_only": 0,
         }
         for event in events:
             for pick in event["picks"]:
@@ -844,8 +841,8 @@ class EventRepicker(object):
                 num_events_reassociation_rejected
             ),
             "num_phase_pairs_both_groups": provenance_counts["both_groups"],
-            "num_phase_pairs_pos_neg_only": provenance_counts["pos_neg_only"],
-            "num_phase_pairs_pos_only": provenance_counts["pos_only"],
+            "num_phase_pairs_local_only": provenance_counts["local_only"],
+            "num_phase_pairs_global_only": provenance_counts["global_only"],
             "num_late_s_events_skipped": num_late_s_events,
             "num_repick_windows": num_windows,
             "job_build_sec": job_build_sec,
@@ -994,9 +991,9 @@ class EventRepicker(object):
                 "evt_lat": float(event["lat"]),
                 "evt_lon": float(event["lon"]),
                 "evt_dep": float(event["depth"]),
-                "mag": -1.0,
+                "mag": float("nan"),
             })
-            event["mag"] = float(event_location.get("mag", -1.0))
+            event["mag"] = float(event_location.get("mag", float("nan")))
             accepted.append(event)
         self._write_outputs(accepted, phase_path, catalog_path)
         return {
@@ -1107,8 +1104,8 @@ class EventRepicker(object):
         output_dir.mkdir(parents=True, exist_ok=True)
         provenance_colors = {
             "both_groups": "#2878B5",
-            "pos_neg_only": "#6F4E9C",
-            "pos_only": "#3A923A",
+            "local_only": "#6F4E9C",
+            "global_only": "#3A923A",
             "initial": "#CC741D",
         }
         plotted = 0
@@ -1261,9 +1258,9 @@ class EventRepicker(object):
             legend = [
                 Line2D([0], [0], color=color, lw=2, label=label)
                 for label, color in (
-                    ("POS_NEG + POS", provenance_colors["both_groups"]),
-                    ("POS_NEG only", provenance_colors["pos_neg_only"]),
-                    ("POS only", provenance_colors["pos_only"]),
+                    ("Local + Global", provenance_colors["both_groups"]),
+                    ("Local only", provenance_colors["local_only"]),
+                    ("Global only", provenance_colors["global_only"]),
                     ("Initial/reference", provenance_colors["initial"]),
                 )
             ]
@@ -1273,7 +1270,7 @@ class EventRepicker(object):
             ])
             ax.legend(handles=legend, loc="upper right", frameon=False, ncol=6)
             fig.tight_layout()
-            output_path = output_dir / _safe_event_filename(origin)
+            output_path = output_dir / _safe_event_filename(origin, event["lat"], event["lon"])
             partial_path = output_path.with_name(
                 output_path.stem + ".partial.png"
             )
@@ -1569,8 +1566,8 @@ class EventRepicker(object):
                     p_votes, s_votes = picker.picker.decode_one_window(
                         probability, float(window_starts[flat_index])
                     )
-                    votes[name][owner][0].extend(p_votes)
-                    votes[name][owner][1].extend(s_votes)
+                    votes[name][owner][0].extend((t, p, flat_index) for t, p in p_votes)
+                    votes[name][owner][1].extend((t, p, flat_index) for t, p in s_votes)
                 seconds[name] += time.perf_counter() - picker_started
         results = {}
         for name, picker in members:
@@ -1603,6 +1600,7 @@ class EventRepicker(object):
         }
 
     def _cluster_group_pairs(self, per_picker, group_name, tp_pred, ts_pred):
+        """Merge all model pairs; predicted times are unused compatibility arguments."""
         prefix = group_name + ":"
         records = []
         for key, pairs in per_picker.items():
@@ -1610,50 +1608,23 @@ class EventRepicker(object):
                 continue
             model_name = key[len(prefix):]
             for pair in pairs:
-                residual = abs(pair["tp"] - tp_pred) / float(self.cfg.tp_dev)
-                residual += abs(pair["ts"] - ts_pred) / float(self.cfg.ts_dev)
-                records.append((residual, model_name, pair))
-        records.sort(key=lambda item: item[0])
-        consumed = set()
-        outputs = []
-        required = int(self.cfg.repick_group_min_picker_support)
-        for seed_index, (_, seed_model, seed) in enumerate(records):
-            if seed_index in consumed:
-                continue
-            members = {seed_model: seed}
-            member_indices = {seed_index}
-            for model_name in sorted({item[1] for item in records} - {seed_model}):
-                matches = [
-                    (index, item)
-                    for index, (_, name, item) in enumerate(records)
-                    if index not in consumed and name == model_name
-                    and abs(item["tp"] - seed["tp"]) < float(self.cfg.tp_dev)
-                    and abs(item["ts"] - seed["ts"]) < float(self.cfg.ts_dev)
-                ]
-                if matches:
-                    index, item = min(matches, key=lambda value: (
-                        abs(value[1]["tp"] - seed["tp"])
-                        + abs(value[1]["ts"] - seed["ts"])
-                    ))
-                    members[model_name] = item
-                    member_indices.add(index)
-            if len(members) < required:
-                continue
-            consumed.update(member_indices)
-            outputs.append(self._make_group_pick(group_name, members))
-        return outputs
+                records.append(dict(pair, source=model_name))
+        clusters = cluster_pair_votes(
+            records, self.cfg.tp_dev, self.cfg.ts_dev,
+            min_support=int(self.cfg.repick_group_min_picker_support), include_members=True)
+        return [self._make_group_pick(group_name, cluster["members"]) for cluster in clusters]
 
     def _cluster_repicker_groups(self, per_picker, tp_pred, ts_pred):
         return {
             group_name: self._cluster_group_pairs(
                 per_picker, group_name, tp_pred, ts_pred
             )
-            for group_name in ("POS_NEG", "POS")
+            for group_name in ("Local", "Global")
         }
 
     def _output_repicker_pick(self, job, selected, provenance, groups):
         # Positive-only models are the timing authority when both groups agree.
-        timing = selected["POS"] if "POS" in selected else next(
+        timing = selected["Global"] if "Global" in selected else next(
             iter(selected.values())
         )
         tp, ts = timing["tp"], timing["ts"]
@@ -1693,8 +1664,8 @@ class EventRepicker(object):
         return output
 
     def _combine_repicker_groups(self, job, group_results):
-        pos_neg = list(group_results["POS_NEG"])
-        pos = list(group_results["POS"])
+        pos_neg = list(group_results["Local"])
+        pos = list(group_results["Global"])
         outputs = []
         used_pos = set()
         for pos_neg_pick in pos_neg:
@@ -1714,17 +1685,17 @@ class EventRepicker(object):
                 ))
                 used_pos.add(index)
                 outputs.append(self._output_repicker_pick(
-                    job, {"POS_NEG": pos_neg_pick, "POS": pos_pick},
-                    "both_groups", ["POS_NEG", "POS"],
+                    job, {"Local": pos_neg_pick, "Global": pos_pick},
+                    "both_groups", ["Local", "Global"],
                 ))
             else:
                 outputs.append(self._output_repicker_pick(
-                    job, {"POS_NEG": pos_neg_pick}, "pos_neg_only", ["POS_NEG"]
+                    job, {"Local": pos_neg_pick}, "local_only", ["Local"]
                 ))
         for index, pos_pick in enumerate(pos):
             if index not in used_pos:
                 outputs.append(self._output_repicker_pick(
-                    job, {"POS": pos_pick}, "pos_only", ["POS"]
+                    job, {"Global": pos_pick}, "global_only", ["Global"]
                 ))
         return outputs
 
@@ -1883,6 +1854,7 @@ class EventRepicker(object):
                 stream.append(trace.copy())
         if not stream:
             return None
+        gain_missing = any(tr.stats.get('gain_missing', False) for tr in stream)
         try:
             stream.merge(method=1, fill_value=0)
         except Exception as exc:
@@ -1890,6 +1862,9 @@ class EventRepicker(object):
             return None
         if len(stream) != int(self.cfg.num_chn):
             return None
+        if gain_missing:
+            for trace in stream:
+                trace.stats.gain_missing = True
         return stream
 
     def _predicted_phases(self, event, station):
@@ -1902,9 +1877,8 @@ class EventRepicker(object):
         )
 
     def _reassociate_event(self, event):
-        """Associate both-group anchors, then attach matching single-group picks."""
-        anchor_picks = []
-        supplemental_picks = []
+        """Associate all QC-accepted repicks; retain only PAL-selected pairs."""
+        repicked_picks = []
         for pick in event["picks"]:
             station = self._station_geometry_key(pick["sta"])
             if station is None:
@@ -1912,10 +1886,8 @@ class EventRepicker(object):
             provenance = resolve_pick_provenance([
                 pick.get("pick_provenance", "initial")
             ])
-            if provenance in {"both_groups", "repicked"}:
-                anchor_picks.append((station, pick))
-            elif provenance in {"pos_neg_only", "pos_only"}:
-                supplemental_picks.append((station, pick))
+            if provenance in {"both_groups", "repicked", "local_only", "global_only"}:
+                repicked_picks.append((station, pick))
 
         dtype = np.dtype([
             ("net_sta", object),
@@ -1930,7 +1902,7 @@ class EventRepicker(object):
         vp = float(getattr(self.cfg, "vp", 6.0))
         vs = float(getattr(self.cfg, "vs", 3.45))
         for station, pick in sorted(
-            anchor_picks,
+            repicked_picks,
             key=lambda item: (item[0], item[1]["p"], item[1]["s"]),
         ):
             tp = UTCDateTime(pick["p"])
@@ -1971,24 +1943,9 @@ class EventRepicker(object):
                 "lat": float(location["evt_lat"]),
                 "lon": float(location["evt_lon"]),
                 "depth": float(location["evt_dep"]),
-                "mag": float(location.get("mag", event.get("mag", -1.0))),
+                "mag": float(location.get("mag", event.get("mag", float("nan")))),
                 "picks": list(selected_picks),
             }
-            anchor_stations = {
-                self._station_geometry_key(pick["sta"])
-                for pick in selected_picks
-            }
-            for station, pick in supplemental_picks:
-                if station in anchor_stations:
-                    continue
-                tp_pred, ts_pred = self._predicted_phases(candidate, station)
-                if (
-                    abs(UTCDateTime(pick["p"]) - tp_pred)
-                    <= float(self.cfg.tp_dev)
-                    and abs(UTCDateTime(pick["s"]) - ts_pred)
-                    <= float(self.cfg.ts_dev)
-                ):
-                    candidate["picks"].append(pick)
             candidate["picks"].sort(
                 key=lambda pick: (pick["sta"], pick["p"], pick["s"])
             )
@@ -2015,6 +1972,7 @@ class EventRepicker(object):
             amplitude = -1.0
             p_snr = (-1.0, -1.0, -1.0)
             if stream is not None:
+                pick["sta"] = waveform_station_selector(stream, station, pick["p"])
                 amplitude = self._displacement_amplitude(
                     stream, UTCDateTime(pick["p"]), UTCDateTime(pick["s"])
                 )
@@ -2031,13 +1989,13 @@ class EventRepicker(object):
             "evt_lat": float(event["lat"]),
             "evt_lon": float(event["lon"]),
             "evt_dep": float(event["depth"]),
-            "mag": -1.0,
+            "mag": float("nan"),
         }
         if amplitude_rows:
             event_location = self.reassociator.calc_mag(
                 np.asarray(amplitude_rows, dtype=dtype), event_location
             )
-        event["mag"] = float(event_location.get("mag", -1.0))
+        event["mag"] = float(event_location.get("mag", float("nan")))
 
     @staticmethod
     def _pal_energy_sta_lta(data, win_lta_npts, win_sta_npts):
@@ -2296,7 +2254,7 @@ class RealtimeEventRepickCoordinator(object):
                 # status row stale.
                 if all(
                     pick.get("pick_provenance") in {
-                        "both_groups", "pos_neg_only", "pos_only",
+                        "both_groups", "local_only", "global_only",
                     }
                     for event in events for pick in event.get("picks", [])
                 ):

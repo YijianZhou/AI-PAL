@@ -37,13 +37,15 @@ def _metadata_key(metadata):
 
 
 @lru_cache(maxsize=5)
-def _daily_records(station_file, date_text):
+def _daily_records(station_file, date_text, channels, locations, order):
     observed = UTCDateTime(date_text)
     active = scedc.get_sta_dict_aws(station_file, observed)
     selected = scedc.get_data_dict_aws(
         observed,
         active,
         _client(),
+        channel_priority=channels, location_priority=locations,
+        station_selection_order=order,
         bucket=os.environ.get("SCEDC_BUCKET", "scedc-pds"),
         root_prefix=os.environ.get(
             "SCEDC_ROOT_PREFIX", "continuous_waveforms"
@@ -60,6 +62,9 @@ def _daily_records(station_file, date_text):
 
 def get_data_dict(
     date, station_file, normalize_to_three_channels=True,
+    channel_priority=scedc.CHANNEL_PRIORITY,
+    location_priority=("10", "20", "01", "02", "00", ""),
+    station_selection_order="channel_first",
 ):
     """Return selected SCEDC objects for one station-file epoch and UTC day."""
     del normalize_to_three_channels
@@ -67,7 +72,8 @@ def get_data_dict(
     return {
         net_sta: [dict(record) for record in records]
         for net_sta, records in _daily_records(
-            path, str(UTCDateTime(date).date)
+            path, str(UTCDateTime(date).date), tuple(channel_priority),
+            tuple(location_priority), station_selection_order
         ).items()
     }
 
@@ -75,10 +81,12 @@ def get_data_dict(
 def get_buffered_data_dict(
     date, station_file, buffer_seconds=60.0,
     normalize_to_three_channels=True,
+    **selection,
 ):
     """Return current-day selections plus adjacent-day S3 buffer objects."""
     current = get_data_dict(
         date, station_file,
+        **selection,
         normalize_to_three_channels=normalize_to_three_channels,
     )
     if float(buffer_seconds) <= 0:
@@ -88,6 +96,7 @@ def get_buffered_data_dict(
         nearby = get_data_dict(
             UTCDateTime(date) + offset * 86400,
             station_file,
+            **selection,
             normalize_to_three_channels=normalize_to_three_channels,
         )
         for net_sta in buffered:
@@ -97,12 +106,14 @@ def get_buffered_data_dict(
 
 def load_station_stream(
     date, station_file, net_sta, normalize_to_three_channels=True,
+    **selection,
 ):
     """Load one buffered station stream through the inference adapter."""
     buffer_seconds = float(os.environ.get("AI_PAL_DATA_BUFFER_SEC", "60"))
     records = get_buffered_data_dict(
         date,
         station_file,
+        **selection,
         buffer_seconds=buffer_seconds,
         normalize_to_three_channels=normalize_to_three_channels,
     ).get(net_sta, [])
@@ -157,14 +168,18 @@ def _merge_gain_corrected_streams(streams, start_time, end_time):
 def read_data(
     records, stations, start_time=None, end_time=None,
     normalize_to_three_channels=True,
-    to_prep=True,
+    to_clean=None,
     location_priority=None,
     channel_priority=None,
+    station_selection_order="channel_first",
+    *, to_prep=None,
 ):
     """Read buffered records with the gain active for each record's day."""
+    if to_clean is None:
+        to_clean = True if to_prep is None else to_prep
     del stations, normalize_to_three_channels, location_priority, channel_priority
-    if not to_prep:
-        raise ValueError("AWS raw waveform objects require to_prep=True")
+    if not to_clean:
+        raise ValueError("AWS raw waveform objects require to_clean=True")
     if not records:
         return Stream()
     try:

@@ -1,20 +1,40 @@
 """Merge duplicate PAL events detected by multiple station subnetworks."""
 
 import csv
+from collections import Counter
 from datetime import datetime, timedelta
-from math import cos, hypot, pi
+from math import cos, hypot, pi, isfinite
 from pathlib import Path
 from statistics import median
+from phase_qc import load_qc_details, expand_phase_row
 
 from pick_ensemble import (
     format_picker_window_vote_ratios, merge_picker_window_vote_ratios,
     repick_quality_code,
+    parse_picker_window_vote_ratios,
 )
 
 
 PICK_PROVENANCE_PRIORITY = (
-    "both_groups", "pos_only", "pos_neg_only", "initial",
+    "both_groups", "global_only", "local_only", "initial",
 )
+
+
+def station_identity(selector):
+    return '.'.join(str(selector).split('.')[:2])
+
+
+def merged_station_selector(picks):
+    """Keep a real contributing selector; prefer detailed, then most frequent."""
+    counts = Counter(str(pick['sta']) for pick in picks)
+    return min(counts, key=lambda value: (-len(value.split('.')), -counts[value], value))
+
+
+def merged_picker_support(picks):
+    names = set()
+    for pick in picks:
+        names.update(parse_picker_window_vote_ratios(pick.get('picker_window_vote_ratios', '')))
+    return len(names) if names else max(pick['num_support'] for pick in picks)
 
 
 def resolve_pick_provenance(values):
@@ -25,6 +45,8 @@ def resolve_pick_provenance(values):
         for token in str(value or "initial").split("|")
         if token.strip()
     }
+    aliases = {'pos_neg_only': 'local_only', 'pos_only': 'global_only'}
+    tokens = {aliases.get(token, token) for token in tokens}
     for provenance in PICK_PROVENANCE_PRIORITY:
         if provenance in tokens:
             return provenance
@@ -82,6 +104,12 @@ def median_valid(values, default=-1.0):
     return median(valid) if valid else default
 
 
+def median_magnitude(values):
+    """Magnitudes may be negative; only nonfinite values are unavailable."""
+    valid = [float(value) for value in values if isfinite(float(value))]
+    return median(valid) if valid else float("nan")
+
+
 def horizontal_distance_km(left, right):
     lat0 = 0.5 * (left["lat"] + right["lat"])
     dx = (right["lon"] - left["lon"]) * 111.32 * cos(lat0 * pi / 180.0)
@@ -103,6 +131,8 @@ def read_phase_file(path, source=None):
     path = Path(path)
     events = []
     current = None
+    details = load_qc_details(path)
+    header = []
     with path.open(encoding="utf-8") as fp:
         for line_number, line in enumerate(fp, start=1):
             text = line.strip()
@@ -110,6 +140,7 @@ def read_phase_file(path, source=None):
                 continue
             codes = [value.strip() for value in text.split(",")]
             if is_event_header(codes):
+                header = codes
                 if current is not None:
                     events.append(current)
                 current = {
@@ -124,6 +155,7 @@ def read_phase_file(path, source=None):
                 continue
             if current is None or len(codes) < 4:
                 raise ValueError("bad phase row {}:{}: {}".format(path, line_number, text))
+            codes = expand_phase_row(codes, line_number, header, details)
             is_new_schema = len(codes) == 19
             is_old_extended_schema = len(codes) >= 22
             offset = 1 if is_new_schema else 0
@@ -267,7 +299,7 @@ def group_events(events, origin_tol, epicenter_tol, depth_tol,
         by_station = {}
         for event_index, event in enumerate(events):
             for pick in event["picks"]:
-                by_station.setdefault(pick["sta"], {}).setdefault(
+                by_station.setdefault(station_identity(pick["sta"]), {}).setdefault(
                     event_index, []
                 ).append(pick)
         shared_counts = {}
@@ -330,7 +362,7 @@ def merge_group(events, phase_pick_tol=1.0, cfg=None):
     picks_by_station = {}
     for event in events:
         for pick in event["picks"]:
-            picks_by_station.setdefault(pick["sta"], []).append(pick)
+            picks_by_station.setdefault(station_identity(pick["sta"]), []).append(pick)
     picks = []
     for station in sorted(picks_by_station):
         for phase_group in _cluster_station_picks(
@@ -340,7 +372,7 @@ def merge_group(events, phase_pick_tol=1.0, cfg=None):
                 phase_group
             )
             picks.append({
-            "sta": station,
+            "sta": merged_station_selector(station_picks),
             "p": median_time([pick["p"] for pick in station_picks]),
             "s": median_time([pick["s"] for pick in station_picks]),
             "score": median([pick["score"] for pick in station_picks]),
@@ -351,7 +383,7 @@ def merge_group(events, phase_pick_tol=1.0, cfg=None):
             "p_prob_std": median([pick["p_prob_std"] for pick in station_picks]),
             "s_prob_std": median([pick["s_prob_std"] for pick in station_picks]),
             # Identical ensemble picks may occur in several subnet events.
-            "num_support": max(pick["num_support"] for pick in station_picks),
+            "num_support": merged_picker_support(station_picks),
             "sources": "|".join(sorted({
                 source
                 for pick in station_picks
@@ -396,7 +428,7 @@ def merge_group(events, phase_pick_tol=1.0, cfg=None):
         "lat": median([event["lat"] for event in events]),
         "lon": median([event["lon"] for event in events]),
         "depth": median([event["depth"] for event in events]),
-        "mag": median_valid([event["mag"] for event in events]),
+        "mag": median_magnitude([event["mag"] for event in events]),
         "picks": picks,
         "num_input_events": len(events),
         "sources": sorted({event["source"] for event in events}),

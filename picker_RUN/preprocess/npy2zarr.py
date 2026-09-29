@@ -107,15 +107,17 @@ if __name__ == '__main__':
     parser.add_argument('--prefetch_factor', type=int, default=1)
     parser.add_argument('--compressor', type=str, default='lz4', choices=['none', 'lz4', 'zstd'])
     parser.add_argument('--log_interval', type=int, default=100000)
-    parser.add_argument('--positive_only', action='store_true')
+    parser.add_argument('--sample_types', nargs='+', choices=['positive', 'negative'],
+                        default=['positive', 'negative'])
     args = parser.parse_args()
     out_path = args.out_path
     compressor = get_compressor(args.compressor)
-    train_loader = make_loader(os.path.join(args.npy_root, 'train_pos.npy'), args.num_workers, args.write_batch_size, args.prefetch_factor)
-    valid_loader = make_loader(os.path.join(args.npy_root, 'valid_pos.npy'), args.num_workers, args.write_batch_size, args.prefetch_factor)
-    write_sequence('train/positive', train_loader, args.chunk_size, compressor, args.log_interval)
-    write_sequence('valid/positive', valid_loader, args.chunk_size, compressor, args.log_interval)
-    if not args.positive_only:
+    if 'positive' in args.sample_types:
+        train_loader = make_loader(os.path.join(args.npy_root, 'train_pos.npy'), args.num_workers, args.write_batch_size, args.prefetch_factor)
+        valid_loader = make_loader(os.path.join(args.npy_root, 'valid_pos.npy'), args.num_workers, args.write_batch_size, args.prefetch_factor)
+        write_sequence('train/positive', train_loader, args.chunk_size, compressor, args.log_interval)
+        write_sequence('valid/positive', valid_loader, args.chunk_size, compressor, args.log_interval)
+    if 'negative' in args.sample_types:
         train_neg_loader = make_loader(os.path.join(args.npy_root, 'train_neg.npy'), args.num_workers, args.write_batch_size, args.prefetch_factor)
         valid_neg_loader = make_loader(os.path.join(args.npy_root, 'valid_neg.npy'), args.num_workers, args.write_batch_size, args.prefetch_factor)
         write_sequence('train/negative', train_neg_loader, args.chunk_size, compressor, args.log_interval)

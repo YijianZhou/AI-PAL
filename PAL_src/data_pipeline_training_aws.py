@@ -20,7 +20,7 @@ def _client():
     return _s3_client
 
 
-def load_station_stream(when, station_file, net_sta):
+def load_station_stream(when, station_file, net_sta, **selection):
     """Return one selected, gain-corrected E/N/Z station-day stream."""
     try:
         active = scedc.get_sta_dict_aws(station_file, when)
@@ -36,7 +36,7 @@ def load_station_stream(when, station_file, net_sta):
             root_prefix=os.environ.get(
                 "SCEDC_ROOT_PREFIX", "continuous_waveforms"
             ),
-            location_priority=(),
+            **selection,
         )
         records = selected.get(net_sta)
         if not records:

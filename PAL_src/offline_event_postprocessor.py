@@ -13,16 +13,34 @@ from obspy import UTCDateTime
 
 from association_runner import (
     load_station_geometry, merge_canonical_interval, parse_date_range,
-    processing_day_bounds,
+    processing_day_bounds, _combine_files,
 )
 from event_repicker import EVENT_REPICK_VERSION, EventRepicker
 from phase_merge import group_events, is_event_header, read_phase_file
 from picker_stream import RetainedStationWaveform, configure_torch_backends
 from data_pipeline import preprocess_picker_stream
 import runtime_console
+from phase_qc import export_phase_qc
 
 
 PROGRESS_EVERY_EVENTS = 1000
+
+
+def _publish_range_outputs(daily_phase_paths, final_root, time_range):
+    missing = [path for path in daily_phase_paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(missing[0])
+    output_phase = final_root / "phase_{}.dat".format(time_range)
+    output_catalog = final_root / "catalog_{}.dat".format(time_range)
+    _combine_files(daily_phase_paths, output_phase)
+    partial_catalog = output_catalog.with_suffix(".dat.partial")
+    with output_phase.open(encoding="utf-8") as source, partial_catalog.open("w", encoding="utf-8") as target:
+        for line in source:
+            if is_event_header([value.strip() for value in line.strip().split(",")]):
+                target.write(line)
+    partial_catalog.replace(output_catalog)
+    export_phase_qc(output_phase)
+    return output_phase, output_catalog
 
 
 def _count_phase_events(path):
@@ -101,7 +119,8 @@ def _read_preprocessed_station(
         normalize_to_three_channels=bool(getattr(
             cfg, "normalize_to_three_channels", True
         )),
-        to_prep=bool(getattr(cfg, "to_prep", True)),
+        to_clean=bool(getattr(cfg, "to_clean", getattr(cfg, "to_prep", True))),
+        station_selection_order=getattr(cfg, "station_selection_order", "channel_first"),
         location_priority=getattr(
             cfg, "location_priority", ("10", "20", "01", "02", "00", "")
         ),
@@ -194,7 +213,7 @@ def _release_snapshots(snapshots):
 
 
 def run_offline_event_postprocessing(
-    ai_pal_root, cfg, repicker_pos_neg_specs, repicker_pos_specs,
+    ai_pal_root, cfg, repicker_local_specs, repicker_global_specs,
     data_dir, station_file,
     initial_phase_dir, final_root, time_range, num_workers=1,
     overwrite=False, day_complete_callback=None,
@@ -205,7 +224,7 @@ def run_offline_event_postprocessing(
         raise ValueError(
             "2.3 postprocessing requires enable_post_process=True"
         )
-    if not repicker_pos_neg_specs or not repicker_pos_specs:
+    if not repicker_local_specs or not repicker_global_specs:
         raise ValueError("both event repicker groups must be selected")
     cfg.repick_num_workers = max(1, int(num_workers))
     configure_torch_backends(cfg)
@@ -214,11 +233,15 @@ def run_offline_event_postprocessing(
     station_file = Path(station_file)
     initial_phase_dir = Path(initial_phase_dir)
     final_root = Path(final_root)
-    status_root = final_root / "postprocess_status"
-    plot_root = final_root / "event_waveform"
+    work_root = final_root.parent / "_internal" / "postprocess_AI-PAL"
+    status_root = work_root / "postprocess_status"
+    if (final_root / "postprocess_status").is_dir() and not status_root.exists():
+        status_root = final_root / "postprocess_status"
+    plot_root = final_root / "event_waveform_plot"
     waveform_root = final_root / "event_waveforms"
-    internal_root = final_root / "_internal" / "event_postprocess"
-    for path in (final_root, status_root, internal_root):
+    internal_root = work_root / "event_postprocess"
+    daily_root = work_root / "daily"
+    for path in (final_root, status_root, internal_root, daily_root):
         path.mkdir(parents=True, exist_ok=True)
     cfg.out_root = str(final_root)
 
@@ -228,9 +251,9 @@ def run_offline_event_postprocessing(
         for index in range((end_date - start_date).days)
     ]
     repicker = EventRepicker(
-        ai_pal_root, cfg, repicker_pos_neg_specs, station_file,
+        ai_pal_root, cfg, repicker_local_specs, station_file,
         station_dict=load_station_geometry(cfg, station_file, start_date),
-        repicker_pos_specs=repicker_pos_specs,
+        repicker_global_specs=repicker_global_specs,
     )
     repicker.load_pickers()
     initial_phase_paths = {
@@ -277,9 +300,12 @@ def run_offline_event_postprocessing(
             initial_phase = initial_phase_paths[current_date]
             initial_events = read_phase_file(initial_phase)
             day_start, day_end = processing_day_bounds(cfg, current_date)
-            daily_phase = final_root / (
+            daily_phase = daily_root / (
                 "phase_{}.dat".format(current_date.isoformat())
             )
+            legacy_phase = final_root / daily_phase.name
+            if legacy_phase.exists() and not daily_phase.exists():
+                daily_phase = legacy_phase
             status_path = status_root / (
                 "{}.json".format(current_date.isoformat())
             )
@@ -330,8 +356,8 @@ def run_offline_event_postprocessing(
                 "num_events_reassociated": 0,
                 "num_events_reassociation_rejected": 0,
                 "num_phase_pairs_both_groups": 0,
-                "num_phase_pairs_pos_neg_only": 0,
-                "num_phase_pairs_pos_only": 0,
+                "num_phase_pairs_local_only": 0,
+                "num_phase_pairs_global_only": 0,
             }
             with tempfile.TemporaryDirectory(
                 prefix="{}_".format(current_date.isoformat()),
@@ -367,14 +393,14 @@ def run_offline_event_postprocessing(
                             "num_events_reassociated",
                             "num_events_reassociation_rejected",
                             "num_phase_pairs_both_groups",
-                            "num_phase_pairs_pos_neg_only",
-                            "num_phase_pairs_pos_only",
+                            "num_phase_pairs_local_only",
+                            "num_phase_pairs_global_only",
                         ):
                             day_summary[key] += int(summary.get(key, 0))
                         if bool(getattr(
                             cfg, "enable_event_waveform_plot", False
                         )) or bool(getattr(
-                            cfg, "save_filtered_event_waveforms", False
+                            cfg, "save_filtered_event_waveform", getattr(cfg, "save_filtered_event_waveforms", False)
                         )):
                             new_snapshots = repicker.capture_event_waveforms(
                                 event_outputs, context
@@ -395,7 +421,7 @@ def run_offline_event_postprocessing(
 
                 candidate_phase = temp_dir / "daily_candidates.dat"
                 candidate_catalog = temp_dir / "daily_candidates_catalog.dat"
-                groups_path = temp_dir / "daily_event_groups.csv"
+                groups_path = daily_root / "event_groups_{}.csv".format(current_date.isoformat())
                 repicker.write_events(
                     reassociated_events, candidate_phase, candidate_catalog
                 )
@@ -404,7 +430,7 @@ def run_offline_event_postprocessing(
                     day_end,
                     {"post_reassociation": candidate_phase},
                     daily_phase,
-                    candidate_catalog,
+                    daily_root / "catalog_{}.dat".format(current_date.isoformat()),
                     groups_path,
                     cfg,
                 )
@@ -428,7 +454,7 @@ def run_offline_event_postprocessing(
                             [final_event], matched, plot_root
                         )
                     if bool(getattr(
-                        cfg, "save_filtered_event_waveforms", False
+                        cfg, "save_filtered_event_waveform", getattr(cfg, "save_filtered_event_waveforms", False)
                     )):
                         result = repicker.save_filtered_event_waveforms(
                             [final_event], matched, waveform_root
@@ -482,6 +508,8 @@ def run_offline_event_postprocessing(
         num_done_events, num_all_events, progress_started, final=True
     )
 
+    output_phase, output_catalog = _publish_range_outputs(daily_phase_paths, final_root, time_range)
+    runtime_console.log("output", "final phase | {} | catalog | {}".format(output_phase, output_catalog))
     print(
         "daily postprocessed phase files: {}".format(len(daily_phase_paths)),
         flush=True,

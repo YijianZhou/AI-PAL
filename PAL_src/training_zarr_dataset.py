@@ -6,6 +6,121 @@ from pathlib import Path
 import numpy as np
 import zarr
 from torch.utils.data import Dataset
+from torch.utils.data import default_convert
+from torch.utils.data import get_worker_info
+from numbers import Integral
+
+
+def training_batch_sizes(value):
+  """Validate class counts; a zero negative count selects positive-only training."""
+  if (not isinstance(value, (list, tuple)) or len(value) != 2 or
+      any(isinstance(x, bool) or not isinstance(x, Integral) for x in value) or
+      value[0] <= 0 or value[1] < 0):
+    raise ValueError('batch_size must be [bs_pos, bs_neg] integers with bs_pos > 0 and bs_neg >= 0')
+  return int(value[0]), int(value[1])
+
+
+def collate_training_batch(batch):
+  """Convert a prebatched Zarr read without stacking a second batch dimension."""
+  return default_convert(batch)
+
+
+class ExplicitTrainingBatch(Dataset):
+  """Positive-driven epochs with persistent, chunk-buffered negative traversal.
+
+  Workers own disjoint negative ranges and reshuffle only after consuming their
+  complete partition. Persistent loader workers retain progress across epochs.
+  """
+  def __init__(self, dataset, batch_sizes):
+    self.dataset = dataset
+    self.bs_pos, self.bs_neg = training_batch_sizes(batch_sizes)
+    self._negative_seed = int(np.random.randint(0, 2**31)) if self.bs_neg else None
+    self._negative_ranges = None
+    self._negative_buffer = None
+
+  def _initialize_negatives(self):
+    source = self.dataset
+    worker = get_worker_info()
+    worker_id, workers = (worker.id, worker.num_workers) if worker else (0, 1)
+    ends = source.neg_ends
+    if int(ends[-1]) < workers:
+      raise ValueError('num_workers must not exceed the number of negative samples')
+    starts = np.concatenate(([0], ends[:-1]))
+    chunks = source.neg_chunks
+    ranges = [(int(start + offset), int(min(start + offset + chunk, end)))
+              for start, end, chunk in zip(starts, ends, chunks)
+              for offset in range(0, int(end - start), int(chunk))]
+    shared_rng = np.random.default_rng(self._negative_seed)
+    order = shared_rng.permutation(len(ranges))
+    # Balance by rows, not chunk count (archive chunks can differ in size).
+    # Only partition boundaries split storage chunks; no row belongs to two workers.
+    lower = int(ends[-1]) * worker_id // workers
+    upper = int(ends[-1]) * (worker_id + 1) // workers
+    self._negative_ranges = []
+    cursor = 0
+    for index in order:
+      lo, hi = ranges[index]
+      overlap_lo, overlap_hi = max(lower, cursor), min(upper, cursor + hi - lo)
+      if overlap_lo < overlap_hi:
+        self._negative_ranges.append((lo + overlap_lo - cursor, lo + overlap_hi - cursor))
+      cursor += hi - lo
+    self._negative_rng = np.random.default_rng(self._negative_seed + worker_id + 1)
+    self._negative_order = []
+    self._negative_range_cursor = 0
+    self._negative_row_cursor = 0
+
+  def _next_negative_chunk(self):
+    if self._negative_range_cursor == len(self._negative_order):
+      self._negative_order = self._negative_rng.permutation(len(self._negative_ranges))
+      self._negative_range_cursor = 0
+    index = self._negative_order[self._negative_range_cursor]
+    self._negative_range_cursor += 1
+    lo, hi = self._negative_ranges[index]
+    indices = np.arange(lo, hi, dtype=np.int64)
+    source = self.dataset
+    self._negative_buffer = None
+    data = source._fetch_many('negative', 'data', indices, source.neg_ends)
+    target = source._fetch_many('negative', 'target', indices, source.neg_ends)
+    self._negative_buffer = (data, target)
+    self._negative_row_order = self._negative_rng.permutation(hi - lo)
+    self._negative_row_cursor = 0
+
+  def _take_negatives(self, count):
+    if self._negative_ranges is None:
+      self._initialize_negatives()
+    data_parts, target_parts = [], []
+    while count:
+      if self._negative_buffer is None or self._negative_row_cursor == len(self._negative_row_order):
+        self._next_negative_chunk()
+      take = min(count, len(self._negative_row_order) - self._negative_row_cursor)
+      rows = self._negative_row_order[self._negative_row_cursor:self._negative_row_cursor + take]
+      data_parts.append(self._negative_buffer[0][rows])
+      target_parts.append(self._negative_buffer[1][rows])
+      self._negative_row_cursor += take
+      count -= take
+    return (np.concatenate(data_parts, axis=0), np.concatenate(target_parts, axis=0))
+
+  def __len__(self):
+    return len(self.dataset)
+
+  def chunk_size(self):
+    return self.dataset.chunk_size()
+
+  def __getitem__(self, index):
+    return self.__getitems__([index])
+
+  def __getitems__(self, indices):
+    source = self.dataset
+    num_pos = len(indices)
+    data = source._fetch_many('positive', 'data', indices, source.pos_ends)
+    target = source._fetch_many('positive', 'target', indices, source.pos_ends)
+    # Scale the final/chunk-tail batch, rounding to nearest with a minimum of 1.
+    num_neg = max(1, (num_pos * self.bs_neg + self.bs_pos // 2) // self.bs_pos) if self.bs_neg else 0
+    if num_neg:
+      negative_data, negative_target = self._take_negatives(num_neg)
+      data = np.concatenate((data, negative_data), axis=0)
+      target = np.concatenate((target, negative_target), axis=0)
+    return data, target, num_pos
 
 
 def parse_training_blocks(blocks=None):
@@ -76,6 +191,9 @@ class _TrainingZarrArrays(Dataset):
     self.target_name = str(target_name)
     self.blocks = parse_training_blocks(blocks)
     self.stores = discover_zarr_stores(zarr_path, self.blocks)
+    for _, store in self.stores:
+      if (store / '.negative_transfer_in_progress').exists():
+        raise RuntimeError('Negative transfer is incomplete; do not train: ' + str(store))
     self._arrays = None
 
   def _metadata(self, sample_kind):
@@ -164,12 +282,27 @@ class _TrainingZarrArrays(Dataset):
     return np.asarray(result)
 
 
+def positive_chunk_ranges(dataset):
+  """Logical row ranges aligned to each positive store's physical chunks."""
+  source = dataset.dataset if isinstance(dataset, ExplicitTrainingBatch) else dataset
+  offset = 0
+  ranges = []
+  for length, chunk in zip(source.pos_lengths, source.pos_chunks):
+    length, chunk = int(length), int(chunk)
+    ranges.extend((offset + start, offset + min(start + chunk, length))
+                  for start in range(0, length, chunk))
+    offset += length
+  return ranges
+
+
 class PositiveNegativeZarr(_TrainingZarrArrays):
   """Positive/negative pairs drawn from a virtual concatenation of blocks."""
   def __init__(self, zarr_path, zarr_group, target_name, blocks=None):
     super().__init__(zarr_path, zarr_group, target_name, blocks)
     self.pos_lengths, pos_chunks = self._metadata('positive')
+    self.pos_chunks = pos_chunks
     self.neg_lengths, neg_chunks = self._metadata('negative')
+    self.neg_chunks = neg_chunks
     self.pos_ends = np.cumsum(self.pos_lengths)
     self.neg_ends = np.cumsum(self.neg_lengths)
     self._length = int(self.pos_ends[-1])
@@ -204,10 +337,38 @@ class PositiveNegativeZarr(_TrainingZarrArrays):
     return self._length
 
 
+class ValidationZarr(_TrainingZarrArrays):
+  """One full validation class, in stable archive/sample order."""
+  def __init__(self, zarr_path, target_name, sample_kind):
+    super().__init__(zarr_path, 'valid', target_name)
+    self.sample_kind = sample_kind
+    lengths, chunks = self._metadata(sample_kind)
+    self.ends = np.cumsum(lengths)
+    self._length = int(self.ends[-1])
+    self._chunk_size = min(chunks)
+    if not self._length:
+      raise ValueError('empty {} validation set'.format(sample_kind))
+
+  def __len__(self):
+    return self._length
+
+  def __getitem__(self, index):
+    return self.__getitems__([index])[0]
+
+  def __getitems__(self, indices):
+    data = self._fetch_many(self.sample_kind, 'data', indices, self.ends)
+    target = self._fetch_many(self.sample_kind, 'target', indices, self.ends)
+    return list(zip(data, target))
+
+  def chunk_size(self):
+    return self._chunk_size
+
+
 class PositiveOnlyZarr(_TrainingZarrArrays):
   def __init__(self, zarr_path, zarr_group, target_name, years=None):
     super().__init__(zarr_path, zarr_group, target_name, years)
     self.pos_lengths, chunks = self._metadata('positive')
+    self.pos_chunks = chunks
     self.pos_ends = np.cumsum(self.pos_lengths)
     self._length = int(self.pos_ends[-1])
     self._chunk_size = min(chunks)

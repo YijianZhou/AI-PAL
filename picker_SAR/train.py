@@ -11,6 +11,11 @@ from models import SAR
 import config
 from tensorboardX import SummaryWriter
 from training_monitor import TrainingMonitor
+from training_validation import validate_classes, validation_due
+from training_loss import negative_loss_weight, describe_training_loss, weighted_window_loss, log_training_losses
+from training_zarr_dataset import ValidationZarr
+from training_zarr_dataset import positive_chunk_ranges
+from training_zarr_dataset import ExplicitTrainingBatch, collate_training_batch, training_batch_sizes
 from torch_backends import configure_torch_backends
 
 # Also runs when spawned DataLoader workers import this module.
@@ -38,12 +43,12 @@ class ChunkBatchSampler(Sampler):
         self.drop_last = bool(drop_last)
         self.num_samples = len(dataset)
         self.chunk_size = max(1, int(dataset.chunk_size()))
+        self.chunk_ranges = positive_chunk_ranges(dataset)
 
     def __iter__(self):
-        chunk_starts = list(range(0, self.num_samples, self.chunk_size))
+        chunk_starts = self.chunk_ranges
         for chunk_idx in torch.randperm(len(chunk_starts)).tolist():
-            start = chunk_starts[chunk_idx]
-            end = min(start + self.chunk_size, self.num_samples)
+            start, end = chunk_starts[chunk_idx]
             batch = []
             for offset in torch.randperm(end - start).tolist():
                 batch.append(start + offset)
@@ -55,8 +60,8 @@ class ChunkBatchSampler(Sampler):
 
     def __len__(self):
         total = 0
-        for start in range(0, self.num_samples, self.chunk_size):
-            count = min(self.chunk_size, self.num_samples - start)
+        for start, end in self.chunk_ranges:
+            count = end - start
             total += count // self.batch_size if self.drop_last else (
                 count + self.batch_size - 1
             ) // self.batch_size
@@ -65,6 +70,8 @@ class ChunkBatchSampler(Sampler):
 
 def make_loader(dataset, batch_size, shuffle):
     kwargs = dict(num_workers=args.num_workers, pin_memory=True)
+    if isinstance(dataset, ExplicitTrainingBatch):
+        kwargs['collate_fn'] = collate_training_batch
     if args.num_workers > 0:
         kwargs.update(
             persistent_workers=True,
@@ -87,31 +94,21 @@ def main():
     summary_step = cfg.summary_step
     valid_step_interval = cfg.valid_step
     max_checkpoints = int(getattr(cfg, 'max_checkpoints', 20))
-    batch_size = cfg.batch_size
-    dataset_class = PositiveOnly if args.positive_only else Positive_Negative
+    bs_pos, bs_neg = training_batch_sizes(cfg.batch_size)
+    describe_training_loss(cfg, bs_pos, bs_neg)
+    train_loss_details = {}
+    positive_only = bs_neg == 0
+    dataset_class = PositiveOnly if positive_only else Positive_Negative
     train_set = dataset_class(args.zarr_path, 'train')
-    valid_set = dataset_class(args.zarr_path, 'valid')
-    train_loader = make_loader(train_set, batch_size, True)
-    valid_loader = make_loader(valid_set, batch_size, False)
-    stored_neg_ratio = None if args.positive_only else train_set.neg_ratio
-    neg_reduction_ratio = float(getattr(cfg, 'neg_reduction_ratio', 1.0))
-    if not 0.0 < neg_reduction_ratio <= 1.0:
-        raise ValueError('neg_reduction_ratio must be in (0, 1]')
-    neg_ratio = (
-        None if stored_neg_ratio is None
-        else stored_neg_ratio * neg_reduction_ratio
-    )
-    if neg_ratio is not None:
-        effective_neg = min(batch_size, max(1, int(batch_size * neg_ratio)))
-        print(
-            'training mix: {} positive + {} negative windows/batch | '
-            'stored neg/pos {:.3f} | reduction {:.3f} | '
-            'effective neg/pos {:.3f} | Zarr chunk {}'.format(
-                batch_size, effective_neg, stored_neg_ratio,
-                neg_reduction_ratio, neg_ratio, train_set.chunk_size()
-            ),
-            flush=True,
-        )
+    train_batches = ExplicitTrainingBatch(train_set, cfg.batch_size)
+    train_loader = make_loader(train_batches, bs_pos, True)
+    valid_loader = {kind: make_loader(
+        ValidationZarr(args.zarr_path, 'frame', kind), bs_pos, False)
+        for kind in ('positive', 'negative')}
+    print('validation samples: ' + ', '.join(
+        '{}={:,}'.format(kind, len(loader.dataset)) for kind, loader in valid_loader.items()), flush=True)
+    print('training mix: {} positive + {} negative windows/batch | Zarr chunk {}'.format(
+        bs_pos, bs_neg, train_set.chunk_size()), flush=True)
     num_batch = len(train_loader)
     model = SAR()
     device = torch.device("cuda:%s" % args.gpu_idx if torch.cuda.is_available() else "cpu")
@@ -124,17 +121,14 @@ def main():
     best_valid_loss = float('inf')
     try:
         for epoch_idx in range(num_epochs):
-          for iter_idx, (data, target) in enumerate(train_loader):
+          for iter_idx, (data, target, num_pos) in enumerate(train_loader):
             global_step = num_batch * epoch_idx + iter_idx
             data = data.to(device, non_blocking=True).float()
             target = target.to(device, non_blocking=True).long()
-            if args.positive_only:
-                num_pos = data.size(0)
-            else:
-                data, target, num_pos = reshape_paired_batch(data, target)
             data = unfold_sar_batch(data, cfg)
             train_acc_list, train_loss = train_step(
-                model, data, target, num_pos, neg_ratio, criterion, optimizer
+                model, data, target, num_pos, criterion, optimizer,
+                negative_loss_weight(cfg), train_loss_details
             )
             if global_step % summary_step == 0:
                 print('step {} ({}/{}) | train loss {:.2f} | {:.2f}s'.format(
@@ -142,46 +136,53 @@ def main():
                 metric_text = '   frame acc. {:.2f}% | pos acc. {:.2f}%'.format(
                     100*train_acc_list[0], 100*train_acc_list[1]
                 )
-                if not args.positive_only:
+                if bs_neg > 0:
                     metric_text += ' | neg acc. {:.2f}%'.format(100*train_acc_list[2])
                 print(metric_text, flush=True)
                 writer.add_scalar('loss/train_loss', train_loss, global_step)
+                loss_metrics = log_training_losses(train_loss_details, writer, global_step)
                 writer.add_scalar('frame_acc/train_acc_frame', 100*train_acc_list[0], global_step)
                 writer.add_scalar('pos_acc/train_acc_pos', 100*train_acc_list[1], global_step)
-                if not args.positive_only:
+                if bs_neg > 0:
                     writer.add_scalar('neg_acc/train_acc_neg', 100*train_acc_list[2], global_step)
                 monitor.update(global_step, {
                     'loss/train_loss': train_loss,
+                    **loss_metrics,
                     'frame_acc/train_acc_frame': 100*train_acc_list[0],
                     'pos_acc/train_acc_pos': 100*train_acc_list[1],
                     'neg_acc/train_acc_neg': (
-                        None if args.positive_only else 100*train_acc_list[2]
+                        None if bs_neg == 0 else 100*train_acc_list[2]
                     ),
                 })
-            if global_step % valid_step_interval != 0:
+            if not validation_due(global_step, num_epochs * num_batch, valid_step_interval):
                 continue
-            valid_acc_list, valid_loss = validate_full(
-                model, valid_loader, device, cfg, criterion, args.positive_only
+            valid_acc_list, valid_loss, valid_losses = validate_full(
+                model, valid_loader, device, cfg, criterion, positive_only
             )
             print('validation step {} | full-set loss {:.4f}'.format(
                 global_step, valid_loss), flush=True)
             metric_text = '   frame acc. {:.2f}% | pos acc. {:.2f}%'.format(
                 100*valid_acc_list[0], 100*valid_acc_list[1]
             )
-            if not args.positive_only:
+            if 'negative' in valid_loader:
                 metric_text += ' | neg acc. {:.2f}%'.format(100*valid_acc_list[2])
             print(metric_text, flush=True)
+            for metric, value in valid_losses.items():
+                writer.add_scalar(metric, value, global_step)
+            print('   ' + ' | '.join('{} {:.4f}'.format(key.split('/')[-1], value)
+                                      for key, value in valid_losses.items()), flush=True)
             writer.add_scalar('loss/valid_loss', valid_loss, global_step)
             writer.add_scalar('frame_acc/valid_acc_frame', 100*valid_acc_list[0], global_step)
             writer.add_scalar('pos_acc/valid_acc_pos', 100*valid_acc_list[1], global_step)
-            if not args.positive_only:
+            if 'negative' in valid_loader:
                 writer.add_scalar('neg_acc/valid_acc_neg', 100*valid_acc_list[2], global_step)
             monitor.update(global_step, {
                 'loss/valid_loss': valid_loss,
+                **valid_losses,
                 'frame_acc/valid_acc_frame': 100*valid_acc_list[0],
                 'pos_acc/valid_acc_pos': 100*valid_acc_list[1],
                 'neg_acc/valid_acc_neg': (
-                    None if args.positive_only else 100*valid_acc_list[2]
+                    100*valid_acc_list[2]
                 ),
             })
             checkpoint = os.path.join(
@@ -213,7 +214,7 @@ def unfold_sar_batch(data, cfg):
 def detection_metrics(pred_class, target, num_pos):
     frame_acc = pred_class.eq(target).float().mean().item()
     detected = (pred_class == 1).any(dim=1) & (pred_class == 2).any(dim=1)
-    pos_acc = detected[:num_pos].float().mean().item()
+    pos_acc = detected[:num_pos].float().mean().item() if num_pos else None
     num_neg = pred_class.size(0) - num_pos
     neg_acc = None
     if num_neg:
@@ -221,17 +222,14 @@ def detection_metrics(pred_class, target, num_pos):
     return [frame_acc, pos_acc, neg_acc]
 
 
-def train_step(model, data, target, num_pos, neg_ratio, criterion, optimizer):
+def train_step(model, data, target, num_pos, criterion, optimizer, negative_weight=1.0, loss_details=None):
     model.train()
-    available_neg = data.size(0) - num_pos
-    num_neg = available_neg
-    if neg_ratio is not None:
-        num_neg = min(available_neg, max(1, int(num_pos * neg_ratio)))
-        data = data[:num_pos + num_neg]
-        target = target[:num_pos + num_neg]
+    num_neg = data.size(0) - num_pos
     pred_logits = model(data)
     pred_class = torch.argmax(pred_logits, 2)
-    loss = criterion(pred_logits.reshape(-1, 3), target.reshape(-1))
+    loss = weighted_window_loss(pred_logits, target, num_pos,
+        lambda logits, labels: criterion(logits.reshape(-1, 3), labels.reshape(-1)),
+        negative_weight, loss_details)
     acc_list = detection_metrics(pred_class, target, num_pos)
     optimizer.zero_grad()
     loss.backward()
@@ -250,42 +248,15 @@ def valid_step(model, data, target, num_pos, criterion):
 
 
 def validate_full(model, valid_loader, device, cfg, criterion, positive_only):
-    frame_sum = 0.0
-    pos_sum = 0.0
-    neg_sum = 0.0
-    weighted_loss = 0.0
-    total_samples = 0
-    total_pos = 0
-    total_neg = 0
-    for data, target in valid_loader:
+    def evaluate(data, target, kind):
         data = data.to(device, non_blocking=True).float()
         target = target.to(device, non_blocking=True).long()
-        if positive_only:
-            num_pos = data.size(0)
-        else:
-            data, target, num_pos = reshape_paired_batch(data, target)
+        num_pos = len(data) if kind == 'positive' else 0
         data = unfold_sar_batch(data, cfg)
-        acc_list, loss = valid_step(model, data, target, num_pos, criterion)
-        batch_samples = target.size(0)
-        num_neg = batch_samples - num_pos
-        total_samples += batch_samples
-        total_pos += num_pos
-        total_neg += num_neg
-        weighted_loss += loss * batch_samples
-        frame_sum += acc_list[0] * batch_samples
-        pos_sum += acc_list[1] * num_pos
-        if num_neg:
-            neg_sum += acc_list[2] * num_neg
-    if total_samples == 0:
-        raise ValueError('validation set is empty')
-    return (
-        [
-            frame_sum / total_samples,
-            pos_sum / total_pos,
-            None if total_neg == 0 else neg_sum / total_neg,
-        ],
-        weighted_loss / total_samples,
-    )
+        accuracy, loss = valid_step(model, data, target, num_pos, criterion)
+        return accuracy[0], accuracy[1 if kind == 'positive' else 2], loss
+    diagnostic, pos, neg, loss, details = validate_classes(valid_loader, evaluate)
+    return [diagnostic, pos, neg], loss, details
 
 
 def reshape_paired_batch(data, target):
@@ -310,7 +281,6 @@ if __name__ == '__main__':
     )
     parser.add_argument('--zarr_path', type=str, required=True)
     parser.add_argument('--ckpt_dir', type=str, required=True)
-    parser.add_argument('--positive_only', action='store_true')
     args = parser.parse_args()
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu_idx)

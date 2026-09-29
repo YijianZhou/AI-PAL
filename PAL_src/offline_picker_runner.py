@@ -233,7 +233,8 @@ def _read_current_station_stream(
         start_time=start_time,
         end_time=end_time,
         normalize_to_three_channels=normalize_to_three_channels,
-        to_prep=bool(getattr(cfg, "to_prep", True)),
+        to_clean=bool(getattr(cfg, "to_clean", getattr(cfg, "to_prep", True))),
+        station_selection_order=getattr(cfg, "station_selection_order", "channel_first"),
         location_priority=getattr(
             cfg, "location_priority", ("10", "20", "01", "02", "00", "")
         ),
@@ -508,7 +509,7 @@ def _ownership_path(ensemble_path):
     return Path(str(ensemble_path) + ".ownership.json")
 
 
-def _has_current_ownership(ensemble_path, buffer_sec):
+def _has_current_ownership(ensemble_path, buffer_sec, selection_signature=None):
     path = _ownership_path(ensemble_path)
     if not path.exists():
         return False
@@ -516,6 +517,7 @@ def _has_current_ownership(ensemble_path, buffer_sec):
         metadata = json.loads(path.read_text(encoding="utf-8"))
         return (
             int(metadata.get("version", -1)) == PICK_OWNERSHIP_VERSION
+            and metadata.get("selection_signature") == selection_signature
             and float(metadata.get("data_buffer_sec")) == float(buffer_sec)
             and metadata.get("interval")
             == "[D-data_buffer_sec,D+1day-data_buffer_sec)"
@@ -524,12 +526,13 @@ def _has_current_ownership(ensemble_path, buffer_sec):
         return False
 
 
-def _write_ownership(ensemble_path, buffer_sec):
+def _write_ownership(ensemble_path, buffer_sec, selection_signature=None):
     path = _ownership_path(ensemble_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_suffix(path.suffix + ".partial")
     partial.write_text(json.dumps({
         "version": PICK_OWNERSHIP_VERSION,
+        "selection_signature": selection_signature,
         "data_buffer_sec": float(buffer_sec),
         "interval": "[D-data_buffer_sec,D+1day-data_buffer_sec)",
     }, indent=2) + "\n", encoding="utf-8")
@@ -550,12 +553,14 @@ def run_offline_picker_ensemble(
     _validate_inputs(
         ai_pal_root, picker_specs, data_dir, station_file
     )
-    if any(spec.get("group", "POS_NEG") != "POS_NEG" for spec in picker_specs.values()):
-        raise ValueError("continuous picking only supports POS_NEG models")
-    required = int(cfg.picker_pos_neg_group_min_picker_support)
-    if required <= 0 or required > len(picker_specs):
-        raise ValueError("POS_NEG continuous picker support {} is invalid for {} models".format(
-            required, len(picker_specs)))
+    if any(spec.get("group", "Local") not in ("Local", "Global") for spec in picker_specs.values()):
+        raise ValueError("unsupported continuous picker group")
+    from pick_ensemble import validate_picker_support
+    required = validate_picker_support(cfg.picker_group_min_picker_support, picker_specs)
+    selection_signature = json.dumps({
+        "specs": picker_specs, "min_support": required,
+        "tp_dev": cfg.tp_dev, "ts_dev": cfg.ts_dev,
+    }, sort_keys=True, default=str)
     dates = _date_list(time_range)
     runtime_console.log(
         "AI-PAL",
@@ -565,10 +570,11 @@ def run_offline_picker_ensemble(
     )
     pickers = _load_pickers(ai_pal_root, picker_specs)
     if pickers_loaded_callback is not None:
-        pickers_loaded_callback({"POS_NEG": {
-            picker_specs[name].get("model", name): picker
+        pickers_loaded_callback({group: {
+            picker_specs[name].get("identity", picker_specs[name].get("model", name)): picker
             for name, picker in pickers.items()
-        }})
+            if picker_specs[name].get("group", "Local") == group
+        } for group in ("Local", "Global")})
     device_groups = _group_by_device(pickers)
     num_workers = max(1, int(num_workers))
     device_locks = {device: Lock() for device in device_groups}
@@ -606,9 +612,9 @@ def run_offline_picker_ensemble(
         pick_dirs = {}
         for index, name in enumerate(pickers, start=1):
             spec = picker_specs[name]
-            model_name = spec.get("model", name)
-            indexed_name = "1.1.{}_picks_pos_neg_{}".format(
-                index, model_name
+            model_name = spec.get("identity", spec.get("model", name))
+            indexed_name = "1.1.{}_picks_{}_{}".format(
+                index, spec.get("group", "Local").lower(), model_name
             )
             indexed_path = Path(individual_root) / indexed_name
             legacy_path = Path(individual_root) / "picks_{}".format(name)
@@ -647,7 +653,7 @@ def run_offline_picker_ensemble(
             complete = not overwrite and ensemble_path.exists() and (
                 not cfg.save_individual_picker_outputs
                 or individual_complete
-            ) and _has_current_ownership(ensemble_path, buffer_sec)
+            ) and _has_current_ownership(ensemble_path, buffer_sec, selection_signature)
             retained_waveforms = {}
             next_raw_tails = {}
             if complete:
@@ -677,13 +683,13 @@ def run_offline_picker_ensemble(
             elif (
                 not overwrite
                 and individual_complete
-                and _has_current_ownership(ensemble_path, buffer_sec)
+                and _has_current_ownership(ensemble_path, buffer_sec, selection_signature)
             ):
                 day_summaries = [merge_picker_pick_files(
                     {name: path / filename for name, path in pick_dirs.items()},
                     ensemble_path, cfg.tp_dev, cfg.ts_dev, min_support=required,
                 )]
-                _write_ownership(ensemble_path, buffer_sec)
+                _write_ownership(ensemble_path, buffer_sec, selection_signature)
                 if need_retained_waveforms:
                     retained_waveforms, next_raw_tails = _prepare_day_waveforms(
                         date, cfg, data_dir, stations, num_workers,
@@ -709,12 +715,12 @@ def run_offline_picker_ensemble(
                 )
                 # Mark the finalized individual files before ensemble merging,
                 # so a merge-only retry can distinguish them from legacy picks.
-                _write_ownership(ensemble_path, buffer_sec)
+                _write_ownership(ensemble_path, buffer_sec, selection_signature)
                 day_summaries = [merge_picker_pick_files(
                     {name: path / filename for name, path in pick_dirs.items()},
                     ensemble_path, cfg.tp_dev, cfg.ts_dev, min_support=required,
                 )]
-                _write_ownership(ensemble_path, buffer_sec)
+                _write_ownership(ensemble_path, buffer_sec, selection_signature)
             summaries.extend(day_summaries)
             runtime_console.log(
                 "day",

@@ -159,8 +159,10 @@ class SeisBenchPhaseNetPicker(object):
         )
         picks = []
         phase_pairs, num_p, num_s = self._pair_phases(phase_picks)
+        amplitude = (float('nan') if any(tr.stats.get('gain_missing', False)
+                                       for tr in stream) else -1.0)
         for tp, ts, p_prob, s_prob in phase_pairs:
-            picks.append([net_sta, tp, ts, -1.0, p_prob, s_prob])
+            picks.append([net_sta, tp, ts, amplitude, p_prob, s_prob])
         print(
             "PHN-SB: {} P/S pairs from {} merged P + {} merged S "
             "({} raw phase picks) | {:.2f}s".format(

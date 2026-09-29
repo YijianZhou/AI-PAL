@@ -115,12 +115,14 @@ if __name__ == '__main__':
     parser.add_argument('--prefetch_factor', type=int, default=1)
     parser.add_argument('--compressor', type=str, default='lz4', choices=['none', 'lz4', 'zstd'])
     parser.add_argument('--log_interval', type=int, default=100000)
-    parser.add_argument('--positive_only', action='store_true')
+    parser.add_argument('--sample_types', nargs='+', choices=['positive', 'negative'],
+                        default=['positive', 'negative'])
     args = parser.parse_args()
     out_path = args.out_path
     compressor = get_compressor(args.compressor)
-    write_sequence('train/positive', os.path.join(args.npy_root, 'train_pos.npy'), args.chunk_size, compressor, args.log_interval, args)
-    write_sequence('valid/positive', os.path.join(args.npy_root, 'valid_pos.npy'), args.chunk_size, compressor, args.log_interval, args)
-    if not args.positive_only:
+    if 'positive' in args.sample_types:
+        write_sequence('train/positive', os.path.join(args.npy_root, 'train_pos.npy'), args.chunk_size, compressor, args.log_interval, args)
+        write_sequence('valid/positive', os.path.join(args.npy_root, 'valid_pos.npy'), args.chunk_size, compressor, args.log_interval, args)
+    if 'negative' in args.sample_types:
         write_sequence('train/negative', os.path.join(args.npy_root, 'train_neg.npy'), args.chunk_size, compressor, args.log_interval, args)
         write_sequence('valid/negative', os.path.join(args.npy_root, 'valid_neg.npy'), args.chunk_size, compressor, args.log_interval, args)

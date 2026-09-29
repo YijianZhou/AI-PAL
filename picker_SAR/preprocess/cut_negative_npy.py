@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore")
 
 cfg = config.Config()
 dtime2str = cfg.dtime2str
-to_prep = cfg.to_prep
+to_clean = getattr(cfg, "to_clean", getattr(cfg, "to_prep", True))
 samp_rate = cfg.samp_rate
 freq_band = cfg.freq_band
 global_max_norm = cfg.global_max_norm
@@ -80,7 +80,7 @@ def cut_event_window(day_stream, t0, t1):
     st = day_stream.copy().slice(t0-win_len/2, t1+win_len/2)
     if 0 in st.max() or len(st) != 3:
         return None
-    if to_prep:
+    if to_clean:
         st = preprocess(st, samp_rate, freq_band)
     st = st.slice(t0, t1)
     if 0 in st.max() or len(st) != 3:

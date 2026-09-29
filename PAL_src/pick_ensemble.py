@@ -15,6 +15,36 @@ EXTENDED_PICK_COLUMNS = (
 _PICKER_ORDER = {"SAR": 0, "FT": 1, "PHN": 2, "RUN": 3}
 
 
+def normalize_picker_support(value):
+    """Return Local, Global, total minima; accept legacy total-only integers."""
+    values = value if isinstance(value, (list, tuple)) else [0, 0, value]
+    if len(values) != 3 or any(
+        isinstance(item, bool) or not isinstance(item, int) or item < 0
+        for item in values
+    ) or values[2] < 1:
+        raise ValueError('Picker support must be [min_local, min_global, min_total], '
+                         'with nonnegative integers and min_total >= 1')
+    return list(values)
+
+
+def validate_picker_support(value, specs):
+    limits = normalize_picker_support(value)
+    available = [sum(spec.get('group', 'Local') == group for spec in specs.values())
+                 for group in ('Local', 'Global')] + [len(specs)]
+    if any(required > count for required, count in zip(limits, available)):
+        raise ValueError('Invalid combined continuous picker support: {} for {} '
+                         'available Local, Global, total models'.format(limits, available))
+    return limits
+
+
+def picker_support_satisfied(sources, value):
+    local, global_min, total = normalize_picker_support(value)
+    sources = set(sources)
+    return (len(sources) >= total
+            and sum(str(name).startswith('Local_') for name in sources) >= local
+            and sum(str(name).startswith('Global_') for name in sources) >= global_min)
+
+
 def parse_picker_cluster_sizes(value):
     """Return ``MODEL:count`` provenance as a normalized dictionary."""
     if isinstance(value, dict):
@@ -103,6 +133,7 @@ def repick_quality_code(provenance, vote_ratios, cfg=None):
     """Map dual-group provenance and model vote ratios to quality 0-3."""
     both_code = getattr(cfg, "pick_quality_both_groups_code", 0)
     threshold = getattr(cfg, "pick_quality_strong_vote_ratio", 0.5)
+    code0_min = getattr(cfg, "pick_quality_code0_min_pickers", 3)
     code1_min = getattr(cfg, "pick_quality_code1_min_pickers", 2)
     code2_min = getattr(cfg, "pick_quality_code2_min_pickers", 1)
     if isinstance(both_code, bool) or both_code not in (0, 1, 2, 3):
@@ -112,12 +143,25 @@ def repick_quality_code(provenance, vote_ratios, cfg=None):
     if any(isinstance(value, bool) or not isinstance(value, int)
            for value in (code1_min, code2_min)) or not code1_min > code2_min >= 1:
         raise ValueError("pick quality counts must satisfy code1_min > code2_min >= 1")
+    if isinstance(code0_min, bool) or not isinstance(code0_min, int) or code0_min < 1:
+        raise ValueError("pick_quality_code0_min_pickers must be a positive integer")
     if str(provenance).strip().lower() == "both_groups":
         return int(both_code)
-    strong_pickers = sum(
-        ratio > threshold
-        for ratio in parse_picker_window_vote_ratios(vote_ratios).values()
-    )
+    strong_groups = {"Local": set(), "Global": set()}
+    for name, ratio in parse_picker_window_vote_ratios(vote_ratios).items():
+        if ratio < threshold:
+            continue
+        group, separator, model = name.partition(":")
+        group = {"POS_NEG": "Local", "POS": "Global"}.get(group, group)
+        if not separator or group not in strong_groups:
+            model = name
+            # Compact phase files omit group prefixes; older single-group
+            # records can also contain unqualified Global architecture names.
+            group = "Global" if "_" in name or str(provenance).strip().lower() == "global_only" else "Local"
+        strong_groups[group].add(model)
+    if any(len(models) >= code0_min for models in strong_groups.values()):
+        return 0
+    strong_pickers = sum(len(models) for models in strong_groups.values())
     if strong_pickers >= code1_min:
         return 1
     if strong_pickers >= code2_min:
@@ -186,7 +230,7 @@ def _std(values):
 
 
 def cluster_pair_votes(
-    records, tp_dev, ts_dev, min_support=1, source_field="source",
+    records, tp_dev, ts_dev, min_support=1, source_field="source", include_members=False,
 ):
     """Cluster records only when both P and S arrivals match.
 
@@ -212,6 +256,7 @@ def cluster_pair_votes(
                 _field(record, "picker_cluster_sizes", "")
             ),
             "source": source,
+            "record": record,
         })
     if not normalized:
         return []
@@ -252,7 +297,7 @@ def cluster_pair_votes(
             if current is None or score > current[0]:
                 by_source[record["source"]] = (score, record)
         votes = [item[1] for item in by_source.values()]
-        if len(votes) < int(min_support):
+        if not picker_support_satisfied(by_source, min_support):
             continue
         tp_values = [record["tp"] for record in votes]
         ts_values = [record["ts"] for record in votes]
@@ -262,7 +307,8 @@ def cluster_pair_votes(
             "tp": float(median(tp_values)),
             "ts": float(median(ts_values)),
             "s_amp": _median_or(
-                [record["s_amp"] for record in votes], minimum=0.0
+                [record["s_amp"] for record in votes], minimum=0.0,
+                default=float('nan') if any(math.isnan(float(record["s_amp"])) for record in votes) else -1.0
             ),
             "p_prob": float(median(p_prob_values)),
             "s_prob": float(median(s_prob_values)),
@@ -280,7 +326,29 @@ def cluster_pair_votes(
                 if record["source"]
             ]),
         })
+        if include_members:
+            consensus[-1]["members"] = {
+                record["source"]: record["record"] for record in votes
+            }
     return sorted(consensus, key=lambda item: (item["tp"], item["ts"]))
+
+
+def cluster_window_pairs(p_votes, s_votes, tp_dev, ts_dev, min_support):
+    """Pair arrivals within each window, then count distinct-window support.
+
+    Votes are (relative time, probability, window ID). A window can support
+    multiple clusters, but contributes only one pair to each cluster.
+    """
+    s_by_window = {}
+    for ts, probability, window in s_votes:
+        s_by_window.setdefault(window, []).append((ts, probability))
+    pairs = []
+    for tp, probability, window in p_votes:
+        for ts, s_probability in s_by_window.get(window, ()):
+            if tp < ts:
+                pairs.append(dict(tp=tp, ts=ts, p_prob=probability,
+                                  s_prob=s_probability, source=str(window)))
+    return cluster_pair_votes(pairs, tp_dev, ts_dev, min_support=min_support)
 
 
 def format_pick_row(record, time_digits=6):

@@ -133,6 +133,8 @@ def is_glitch(stream, tp, ts, cfg):
 
 def displacement_amplitude(stream, tp, ts, amp_win, num_channels=3):
     """Measure PAL vector displacement amplitude from filtered velocity."""
+    if any(tr.stats.get('gain_missing', False) for tr in stream):
+        return float('nan')
     window_start = tp - float(amp_win[0])
     window_end = ts + float(amp_win[1])
     window = stream.slice(window_start, window_end)

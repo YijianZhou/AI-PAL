@@ -4,6 +4,8 @@ It adapts the shared waveform ingest, native/reference picker inference, picker
 consensus, and PAL output layers for all-network miniSEED files.
 """
 import csv
+from station_inventory import read_inventory, selection_rank, calibrate_trace, CHANNEL_PRIORITY, location_code
+from station_inventory import waveform_station_selector
 import ctypes
 import gc
 import glob
@@ -27,10 +29,12 @@ from data_pipeline import is_acceleration_channel, select_gain_for_time
 from phase_merge import (
     _cluster_station_picks, event_both_group_pick_ratio,
     select_preferred_provenance_picks, write_phase_file,
+    station_identity, merged_station_selector, merged_picker_support,
 )
 from picker_stream import PreparedPickerStream
 import runtime_console
 from waveform_qc import displacement_amplitude, is_glitch
+from phase_qc import export_phase_qc, load_qc_details, expand_phase_row, is_compact_phase_row
 
 
 PREFERRED_ENSEMBLE_BRANCH = "AI-PAL"
@@ -103,7 +107,7 @@ def _initial_event_magnitude(event, station_dict):
         values = np.delete(values, np.argmax(abs(values - np.median(values))))
         magnitudes = values.tolist()
     event["mag"] = (
-        round(float(np.median(magnitudes)), 2) if magnitudes else -1.0
+        round(float(np.median(magnitudes)), 2) if magnitudes else float("nan")
     )
 
 
@@ -124,6 +128,7 @@ def qc_initial_phase_file(
         stream = holder.stream if holder is not None else None
         try:
             for pick in picks:
+                pick["sta"] = waveform_station_selector(stream, station, pick["p"])
                 key = (
                     str(station),
                     round(pick["p"].timestamp(), 4),
@@ -505,9 +510,11 @@ def prepare_station_waveform(
     st_all, sta_key, sta_info, location_priority, preprocess_cfg,
 ):
     """Prepare one station without invoking a picker."""
-    st = traces_for_station(st_all, sta_key, location_priority)
+    st = traces_for_station(st_all, sta_key, location_priority,
+        getattr(preprocess_cfg, 'channel_priority', CHANNEL_PRIORITY),
+        getattr(preprocess_cfg, 'station_selection_order', 'channel_first'))
     if len(st) != 0:
-        if bool(getattr(preprocess_cfg, "to_prep", True)):
+        if bool(getattr(preprocess_cfg, "to_clean", getattr(preprocess_cfg, "to_prep", True))):
             st = normalize_station_stream(st, sta_key, sta_info)
         elif len(st) == 3:
             st = apply_gain_and_units(st.copy(), sta_key, sta_info)
@@ -529,7 +536,7 @@ def prepare_realtime_segment_waveforms(mseed_path, sta_dict, cfg):
         mseed_path,
         timing,
         expected_sampling_rate=cfg.samp_rate,
-        to_prep=bool(getattr(cfg, "to_prep", True)),
+        to_clean=bool(getattr(cfg, "to_clean", getattr(cfg, "to_prep", True))),
     )
     timing["rss_after_mseed_mb"] = process_rss_mb()
     station_keys = sorted(sta_dict)
@@ -575,38 +582,9 @@ def prepare_realtime_segment_waveforms(mseed_path, sta_dict, cfg):
     return waveforms, timing
 
 def get_realtime_sta_dict(fsta):
-    """Read station metadata keyed by NET.STA.CH_PREFIX.
+    """Use NET.STA identity while preserving complete gain alternatives."""
+    return read_inventory(fsta)
 
-    The first field is expected to be like ``CI.WWB.HH`` or ``CI.WWB.HN``.
-    Gain fields follow the PAL station format and are used to convert counts
-    to velocity before either picker runs and before amplitude measurement.
-    """
-    sta_dict = {}
-    with open(fsta) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            codes = [code.strip() for code in line.split(",")]
-            if len(codes) < 4:
-                print("bad station line: {}".format(line))
-                continue
-            sta_key = codes[0]
-            lat, lon, ele = [float(code) for code in codes[1:4]]
-            gain_codes = codes[4:]
-            gain = 1.0
-            if len(gain_codes) == 1:
-                gain = float(gain_codes[0])
-            elif len(gain_codes) == 3:
-                gain = [float(code) for code in gain_codes]
-            elif len(gain_codes) == 5:
-                gain = [[float(code) for code in gain_codes[0:3]] + gain_codes[3:5]]
-            elif len(gain_codes) > 5 and len(gain_codes) % 5 == 0:
-                gain = []
-                for ii in range(0, len(gain_codes), 5):
-                    gain.append([float(code) for code in gain_codes[ii:ii+3]] + gain_codes[ii+3:ii+5])
-            sta_dict[sta_key] = [lat, lon, ele, gain]
-    return sta_dict
 
 
 def parse_sta_key(sta_key):
@@ -701,11 +679,13 @@ def cleanup_sampling_rates(st, expected_sampling_rate=None, tolerance=0.01):
     return out, dropped
 
 
-def read_realtime_mseed(mseed_path, expected_sampling_rate=None, to_prep=True):
+def read_realtime_mseed(mseed_path, expected_sampling_rate=None, to_clean=None, *, to_prep=None):
     """Read and merge an all-station miniSEED segment."""
+    if to_clean is None:
+        to_clean = True if to_prep is None else to_prep
     print("reading realtime mseed: {}".format(mseed_path))
     st = read(mseed_path)
-    if to_prep:
+    if to_clean:
         st, _ = cleanup_sampling_rates(
             st, expected_sampling_rate=expected_sampling_rate
         )
@@ -714,9 +694,12 @@ def read_realtime_mseed(mseed_path, expected_sampling_rate=None, to_prep=True):
 
 
 def read_realtime_mseed_timed(
-    mseed_path, timing, expected_sampling_rate=None, to_prep=True,
+    mseed_path, timing, expected_sampling_rate=None, to_clean=None,
+    *, to_prep=None,
 ):
     """Read and merge an all-station miniSEED segment with timing."""
+    if to_clean is None:
+        to_clean = True if to_prep is None else to_prep
     print("reading realtime mseed: {}".format(mseed_path))
     t0 = time.perf_counter()
     try:
@@ -728,7 +711,7 @@ def read_realtime_mseed_timed(
     timing["data_read_sec"] = time.perf_counter() - t0
     timing["num_raw_traces"] = len(st)
 
-    if not to_prep:
+    if not to_clean:
         timing["sampling_rate_cleanup_sec"] = 0.0
         timing["num_bad_sampling_rate_traces"] = 0
         timing["data_merge_sec"] = 0.0
@@ -778,20 +761,21 @@ def read_realtime_mseed_timed(
     return st
 
 
-def traces_for_station(st_all, sta_key, location_priority):
-    net, sta, ch_prefix = parse_sta_key(sta_key)
-    st_sel = st_all.select(network=net, station=sta)
-    if ch_prefix:
-        st_sel = Stream([tr for tr in st_sel if tr.stats.channel.startswith(ch_prefix)])
-    if len(st_sel) == 0:
+def traces_for_station(st_all, sta_key, location_priority,
+                       channel_priority=CHANNEL_PRIORITY, station_selection_order='channel_first'):
+    net, sta = sta_key.split('.')[:2]
+    groups = {}
+    for trace in st_all.select(network=net, station=sta):
+        if trace.stats.channel[-1:] not in 'ENZ123':
+            continue
+        key = trace.stats.channel[:2], location_code(trace.stats.location)
+        groups.setdefault(key, Stream()).append(trace)
+    if not groups:
         return Stream()
+    chosen = min(groups, key=lambda key: selection_rank(key[0], key[1],
+                 channel_priority, location_priority, station_selection_order))
+    return groups[chosen].copy()
 
-    loc_groups = {}
-    for tr in st_sel:
-        loc = tr.stats.location or ""
-        loc_groups.setdefault(loc, Stream()).append(tr)
-    loc = choose_location(loc_groups, location_priority)
-    return loc_groups[loc].copy()
 
 
 def choose_location(loc_groups, location_priority):
@@ -817,6 +801,11 @@ def select_gain(gain, stream, station=None):
 
 def apply_gain_and_units(stream, sta_key, sta_info):
     """Convert counts to velocity units expected by SAR/PAL magnitude."""
+    if isinstance(sta_info[3], dict):
+        from data_pipeline import convert_acc_to_vel
+        for trace in stream:
+            calibrate_trace(trace, sta_info[3], allow_fallback=True)
+        return convert_acc_to_vel(stream)
     gain = select_gain(sta_info[3], stream, station=sta_key)
     if isinstance(gain, float):
         gains = [gain, gain, gain]
@@ -850,6 +839,11 @@ def station_streams_from_mseed(st_all, sta_dict, location_priority=None):
 
 def normalize_station_stream(st, sta_key, sta_info):
     """Convert any nonempty station/location group into three model channels."""
+    if isinstance(sta_info[3], dict):
+        from data_pipeline import prepare_local_stream, convert_acc_to_vel
+        out, _ = prepare_local_stream(st, '.'.join(sta_key.split('.')[:2]),
+                                      gain=sta_info[3], allow_gain_fallback=True)
+        return convert_acc_to_vel(out)
     by_comp = {}
     for tr in st:
         comp = tr.stats.channel[-1].upper()
@@ -966,7 +960,7 @@ def pick_segment_timed(mseed_path, pickers, sta_dict, pick_dirs,
         mseed_path,
         timing,
         expected_sampling_rate=expected_sampling_rate,
-        to_prep=bool(getattr(preprocess_cfg, "to_prep", True)),
+        to_clean=bool(getattr(preprocess_cfg, "to_clean", getattr(preprocess_cfg, "to_prep", True))),
     )
     timing["rss_after_mseed_mb"] = process_rss_mb()
     if preprocess_cfg is None:
@@ -1145,7 +1139,7 @@ def build_association_branch_picks(
             records, input_counts = merge_picker_records(
                 {name: picks_by_picker[name] for name in members},
                 cfg.tp_dev, cfg.ts_dev,
-                min_support=cfg.picker_pos_neg_group_min_picker_support,
+                min_support=cfg.picker_group_min_picker_support,
             )
         else:
             records, input_counts = merge_picker_records(
@@ -1205,8 +1199,8 @@ def _record_event_repick_timing(timing, branch_key, summary, elapsed_sec):
         ),
         "num_event_repick_late_s_skipped": "num_late_s_events_skipped",
         "num_event_repick_pairs_both_groups": "num_phase_pairs_both_groups",
-        "num_event_repick_pairs_pos_neg_only": "num_phase_pairs_pos_neg_only",
-        "num_event_repick_pairs_pos_only": "num_phase_pairs_pos_only",
+        "num_event_repick_pairs_local_only": "num_phase_pairs_local_only",
+        "num_event_repick_pairs_global_only": "num_phase_pairs_global_only",
         "num_event_repick_windows": "num_repick_windows",
         "num_event_repick_attempts": "num_station_event_attempts",
         "num_event_waveform_plots": "num_event_plots",
@@ -1664,7 +1658,7 @@ def median_valid(values, default=-1, min_value=None):
             value = float(value)
         except (TypeError, ValueError):
             continue
-        if np.isnan(value):
+        if not np.isfinite(value):
             continue
         if min_value is not None and value < min_value:
             continue
@@ -1695,14 +1689,17 @@ def is_event_header(codes):
 def read_phase_file(fpha):
     events = []
     current = None
+    details = load_qc_details(fpha)
+    header = []
 
     with open(fpha) as fp:
-        for line in fp:
+        for line_number, line in enumerate(fp, 1):
             line = line.strip()
             if not line:
                 continue
             codes = [code.strip() for code in line.split(",")]
             if is_event_header(codes):
+                header = codes
                 if current is not None:
                     events.append(current)
                 current = {
@@ -1719,6 +1716,7 @@ def read_phase_file(fpha):
                     raise ValueError("Pick row before event header in {}: {}".format(fpha, line))
                 if len(codes) < 4:
                     raise ValueError("Bad pick row in {}: {}".format(fpha, line))
+                codes = expand_phase_row(codes, line_number, header, details)
                 is_new_schema = len(codes) == 19
                 is_old_extended_schema = len(codes) >= 22
                 offset = 1 if is_new_schema else 0
@@ -1837,7 +1835,7 @@ def enrich_phase_probabilities(fpha, picks, tolerance_sec=0.001):
                 out_lines.append(line)
                 continue
             p_prob, s_prob = probs
-            p_prob_index, s_prob_index = (5, 6) if len(codes) == 19 else (4, 5)
+            p_prob_index, s_prob_index = (5, 6) if len(codes) in (18, 19) or is_compact_phase_row(codes) else (4, 5)
             needs_fill = len(codes) <= s_prob_index
             if not needs_fill:
                 try:
@@ -1906,7 +1904,7 @@ def group_events(events, origin_time_tol_sec, epicenter_tol_km, depth_tol_km,
         entries_by_station = {}
         for event_idx, event in enumerate(events):
             for pick in event["picks"]:
-                entries_by_station.setdefault(pick["sta"], {}).setdefault(
+                entries_by_station.setdefault(station_identity(pick["sta"]), {}).setdefault(
                     event_idx, []
                 ).append(pick)
 
@@ -1969,7 +1967,7 @@ def merge_group(group, phase_pick_time_tol_sec=1.0, cfg=None):
         "lat": median([event["lat"] for event in events]),
         "lon": median([event["lon"] for event in events]),
         "depth": median([event["depth"] for event in events]),
-        "mag": median_valid([event["mag"] for event in events], default=-1, min_value=0),
+        "mag": median_valid([event["mag"] for event in events], default=float("nan")),
         "picks": [],
         "num_events": len(events),
         "sources": sorted({event["source"] for event in events}),
@@ -1978,7 +1976,7 @@ def merge_group(group, phase_pick_time_tol_sec=1.0, cfg=None):
     picks_by_sta = {}
     for event in events:
         for pick in event["picks"]:
-            picks_by_sta.setdefault(pick["sta"], []).append(pick)
+            picks_by_sta.setdefault(station_identity(pick["sta"]), []).append(pick)
 
     for sta in sorted(picks_by_sta):
       for phase_group in _cluster_station_picks(
@@ -1987,7 +1985,7 @@ def merge_group(group, phase_pick_time_tol_sec=1.0, cfg=None):
         provenance, picks = select_preferred_provenance_picks(phase_group)
         merged["picks"].append(
             {
-                "sta": sta,
+                "sta": merged_station_selector(picks),
                 "p": median_time([pick["p"] for pick in picks]),
                 "s": median_time([pick["s"] for pick in picks]),
                 "score": median([pick["score"] for pick in picks]),
@@ -1997,7 +1995,7 @@ def merge_group(group, phase_pick_time_tol_sec=1.0, cfg=None):
                 "ts_std": median([pick["ts_std"] for pick in picks]),
                 "p_prob_std": median([pick["p_prob_std"] for pick in picks]),
                 "s_prob_std": median([pick["s_prob_std"] for pick in picks]),
-                "num_support": max(pick["num_support"] for pick in picks),
+                "num_support": merged_picker_support(picks),
                 "pickers": "|".join(sorted({
                     picker
                     for pick in picks
@@ -2557,6 +2555,7 @@ def _publish_final_interval(previous, current, interval_start, interval_end, cfg
     if write_catalog:
         os.replace(catalog_tmp, catalog_path)
     os.replace(phase_tmp, phase_path)
+    export_phase_qc(phase_path)
     summary.update({
         "phase_path": phase_path,
         "catalog_path": catalog_path,
@@ -2959,6 +2958,7 @@ def _publish_corrected_tail(record, report_start, report_end, cfg):
         [record["phase_path"]], phase_path, merge_log_path,
         report_start, report_end, cfg,
     )
+    export_phase_qc(phase_path)
     if write_catalog:
         catalog_tmp = catalog_path + ".tmp"
         write_catalog_from_phase(phase_path, catalog_tmp)

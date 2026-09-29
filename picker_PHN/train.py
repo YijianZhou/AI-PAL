@@ -12,6 +12,11 @@ from models import UNet
 import config
 from tensorboardX import SummaryWriter
 from training_monitor import TrainingMonitor
+from training_validation import validate_classes, validation_due
+from training_loss import negative_loss_weight, describe_training_loss, weighted_window_loss, log_training_losses
+from training_zarr_dataset import ValidationZarr
+from training_zarr_dataset import positive_chunk_ranges
+from training_zarr_dataset import ExplicitTrainingBatch, collate_training_batch, training_batch_sizes
 from torch_backends import configure_torch_backends
 
 # Also runs when spawned DataLoader workers import this module.
@@ -43,13 +48,13 @@ class ChunkBatchSampler(Sampler):
         self.drop_last = drop_last
         self.num_samples = len(dataset)
         self.chunk_size = max(1, int(dataset.chunk_size()))
+        self.chunk_ranges = positive_chunk_ranges(dataset)
 
     def __iter__(self):
-        chunk_starts = list(range(0, self.num_samples, self.chunk_size))
+        chunk_starts = self.chunk_ranges
         perm = torch.randperm(len(chunk_starts)).tolist()
         for chunk_idx in perm:
-            start = chunk_starts[chunk_idx]
-            end = min(start + self.chunk_size, self.num_samples)
+            start, end = chunk_starts[chunk_idx]
             local = torch.randperm(end - start).tolist()
             batch = []
             for off in local:
@@ -62,8 +67,8 @@ class ChunkBatchSampler(Sampler):
 
     def __len__(self):
         total_batches = 0
-        for start in range(0, self.num_samples, self.chunk_size):
-            chunk_samples = min(self.chunk_size, self.num_samples - start)
+        for start, end in self.chunk_ranges:
+            chunk_samples = end - start
             if self.drop_last:
                 total_batches += chunk_samples // self.batch_size
             else:
@@ -75,6 +80,8 @@ class ChunkBatchSampler(Sampler):
 
 def make_loader(dataset, batch_size, shuffle, args):
     kwargs = dict(num_workers=args.num_workers, pin_memory=True)
+    if isinstance(dataset, ExplicitTrainingBatch):
+        kwargs['collate_fn'] = collate_training_batch
     if args.num_workers > 0:
         kwargs.update(persistent_workers=True, prefetch_factor=args.prefetch_factor)
     if shuffle and args.chunk_shuffle:
@@ -85,32 +92,21 @@ def make_loader(dataset, batch_size, shuffle, args):
 def main():
     torch.backends.cudnn.benchmark = True
     cfg = config.Config()
-    dataset_class = PositiveOnly if args.positive_only else Positive_Negative
+    bs_pos, bs_neg = training_batch_sizes(cfg.batch_size)
+    describe_training_loss(cfg, bs_pos, bs_neg)
+    train_loss_details = {}
+    positive_only = bs_neg == 0
+    dataset_class = PositiveOnly if positive_only else Positive_Negative
     train_set = dataset_class(args.zarr_path, 'train')
-    valid_set = dataset_class(args.zarr_path, 'valid')
-    train_loader = make_loader(train_set, cfg.batch_size, True, args)
-    valid_loader = make_loader(valid_set, cfg.batch_size, False, args)
-    stored_neg_ratio = None if args.positive_only else train_set.neg_ratio
-    neg_reduction_ratio = float(getattr(cfg, 'neg_reduction_ratio', 0.5))
-    if not 0.0 < neg_reduction_ratio <= 1.0:
-        raise ValueError('neg_reduction_ratio must be in (0, 1]')
-    neg_ratio = (
-        None if stored_neg_ratio is None
-        else stored_neg_ratio * neg_reduction_ratio
-    )
-    if neg_ratio is not None:
-        effective_neg = min(
-            int(cfg.batch_size), max(1, int(cfg.batch_size * neg_ratio))
-        )
-        print(
-            'training mix: {} positive + {} negative windows/batch | '
-            'stored neg/pos {:.3f} | reduction {:.3f} | effective neg/pos {:.3f} | '
-            'Zarr chunk {}'.format(
-                cfg.batch_size, effective_neg, stored_neg_ratio,
-                neg_reduction_ratio, neg_ratio, train_set.chunk_size()
-            ),
-            flush=True,
-        )
+    train_batches = ExplicitTrainingBatch(train_set, cfg.batch_size)
+    train_loader = make_loader(train_batches, bs_pos, True, args)
+    valid_loader = {kind: make_loader(
+        ValidationZarr(args.zarr_path, 'sample', kind), bs_pos, False, args)
+        for kind in ('positive', 'negative')}
+    print('validation samples: ' + ', '.join(
+        '{}={:,}'.format(kind, len(loader.dataset)) for kind, loader in valid_loader.items()), flush=True)
+    print('training mix: {} positive + {} negative windows/batch | Zarr chunk {}'.format(
+        bs_pos, bs_neg, train_set.chunk_size()), flush=True)
     model = UNet()
     device = torch.device(f"cuda:{args.gpu_idx}" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -127,16 +123,13 @@ def main():
     max_checkpoints = int(getattr(cfg, 'max_checkpoints', 20))
     try:
         for epoch_idx in range(cfg.num_epochs):
-          for iter_idx, (data, target) in enumerate(train_loader):
+          for iter_idx, (data, target, num_pos) in enumerate(train_loader):
             global_step = num_batch * epoch_idx + iter_idx
             data = data.to(device, non_blocking=True).float()
             target = target.to(device, non_blocking=True).float()
-            if args.positive_only:
-                num_pos = data.size(0)
-            else:
-                data, target, num_pos = reshape_paired_batch(data, target)
             train_sample_acc, train_pos_acc, train_neg_acc, train_loss = train_step(
-                model, data, target, num_pos, neg_ratio, optimizer
+                model, data, target, num_pos, optimizer,
+                negative_loss_weight(cfg), train_loss_details
             )
             if global_step % cfg.summary_step == 0:
                 print('step {} ({}/{}) | train loss {:.2f} | {:.2f}s'.format(
@@ -144,50 +137,57 @@ def main():
                 metric_text = '   sample acc. {:.2f}% | pos acc. {:.2f}%'.format(
                     100*train_sample_acc, 100*train_pos_acc
                 )
-                if not args.positive_only:
+                if bs_neg > 0:
                     metric_text += ' | neg acc. {:.2f}%'.format(100*train_neg_acc)
                 print(metric_text, flush=True)
                 writer.add_scalar('loss/train_loss', train_loss, global_step)
+                loss_metrics = log_training_losses(train_loss_details, writer, global_step)
                 writer.add_scalar(
                     'sample_acc/train_sample_acc', 100*train_sample_acc, global_step
                 )
                 writer.add_scalar('pos_acc/train_pos_acc', 100*train_pos_acc, global_step)
-                if not args.positive_only:
+                if bs_neg > 0:
                     writer.add_scalar('neg_acc/train_neg_acc', 100*train_neg_acc, global_step)
                 monitor.update(global_step, {
                     'loss/train_loss': train_loss,
+                    **loss_metrics,
                     'sample_acc/train_sample_acc': 100*train_sample_acc,
                     'pos_acc/train_pos_acc': 100*train_pos_acc,
                     'neg_acc/train_neg_acc': (
-                        None if args.positive_only else 100*train_neg_acc
+                        None if bs_neg == 0 else 100*train_neg_acc
                     ),
                 })
-            if global_step % cfg.valid_step != 0:
+            if not validation_due(global_step, cfg.num_epochs * num_batch, cfg.valid_step):
                 continue
-            valid_sample_acc, valid_pos_acc, valid_neg_acc, valid_loss = validate_full(
-                model, valid_loader, device, args.positive_only
+            valid_sample_acc, valid_pos_acc, valid_neg_acc, valid_loss, valid_losses = validate_full(
+                model, valid_loader, device, positive_only
             )
             print('validation step {} | full-set loss {:.4f}'.format(
                 global_step, valid_loss), flush=True)
             metric_text = '   sample acc. {:.2f}% | pos acc. {:.2f}%'.format(
                 100*valid_sample_acc, 100*valid_pos_acc
             )
-            if not args.positive_only:
+            if 'negative' in valid_loader:
                 metric_text += ' | neg acc. {:.2f}%'.format(100*valid_neg_acc)
             print(metric_text, flush=True)
+            for metric, value in valid_losses.items():
+                writer.add_scalar(metric, value, global_step)
+            print('   ' + ' | '.join('{} {:.4f}'.format(key.split('/')[-1], value)
+                                      for key, value in valid_losses.items()), flush=True)
             writer.add_scalar('loss/valid_loss', valid_loss, global_step)
             writer.add_scalar(
                 'sample_acc/valid_sample_acc', 100*valid_sample_acc, global_step
             )
             writer.add_scalar('pos_acc/valid_pos_acc', 100*valid_pos_acc, global_step)
-            if not args.positive_only:
+            if 'negative' in valid_loader:
                 writer.add_scalar('neg_acc/valid_neg_acc', 100*valid_neg_acc, global_step)
             monitor.update(global_step, {
                 'loss/valid_loss': valid_loss,
+                **valid_losses,
                 'sample_acc/valid_sample_acc': 100*valid_sample_acc,
                 'pos_acc/valid_pos_acc': 100*valid_pos_acc,
                 'neg_acc/valid_neg_acc': (
-                    None if args.positive_only else 100*valid_neg_acc
+                    100*valid_neg_acc
                 ),
             })
             checkpoint = os.path.join(
@@ -218,11 +218,11 @@ def detection_accuracies(logits, target, num_pos, num_neg):
     target_class = torch.argmax(target, 1)
     sample_accuracy = pred.eq(target_class).float().mean()
     detected = (pred == 1).any(dim=1) & (pred == 2).any(dim=1)
-    pos_accuracy = detected[:num_pos].float().mean()
+    pos_accuracy = detected[:num_pos].float().mean().item() if num_pos else None
     neg_accuracy = None
     if num_neg:
         neg_accuracy = (~detected[num_pos:num_pos + num_neg]).float().mean().item()
-    return sample_accuracy.item(), pos_accuracy.item(), neg_accuracy
+    return sample_accuracy.item(), pos_accuracy, neg_accuracy
 
 
 def reshape_paired_batch(data, target):
@@ -233,16 +233,12 @@ def reshape_paired_batch(data, target):
     return data, target, num_pos
 
 
-def train_step(model, data, target, num_pos, neg_ratio, optimizer):
+def train_step(model, data, target, num_pos, optimizer, negative_weight=1.0, loss_details=None):
     model.train()
-    available_neg = data.size(0) - num_pos
-    num_neg = available_neg
-    if neg_ratio is not None:
-        num_neg = min(available_neg, max(1, int(num_pos * neg_ratio)))
-        data = torch.cat((data[:num_pos], data[num_pos:num_pos + num_neg]))
-        target = torch.cat((target[:num_pos], target[num_pos:num_pos + num_neg]))
+    num_neg = data.size(0) - num_pos
     logits = model(data)
-    loss = soft_cross_entropy_loss(logits, target)
+    loss = weighted_window_loss(logits, target, num_pos, soft_cross_entropy_loss,
+                                negative_weight, loss_details)
     sample_acc, pos_acc, neg_acc = detection_accuracies(
         logits.detach(), target, num_pos, num_neg
     )
@@ -264,41 +260,13 @@ def valid_step(model, data, target, num_pos):
 
 
 def validate_full(model, valid_loader, device, positive_only):
-    loss_sum = 0.0
-    sample_sum = 0.0
-    pos_sum = 0.0
-    neg_sum = 0.0
-    total_samples = 0
-    total_pos = 0
-    total_neg = 0
-    for data, target in valid_loader:
+    def evaluate(data, target, kind):
         data = data.to(device, non_blocking=True).float()
         target = target.to(device, non_blocking=True).float()
-        if positive_only:
-            num_pos = data.size(0)
-        else:
-            data, target, num_pos = reshape_paired_batch(data, target)
-        num_neg = data.size(0) - num_pos
-        sample_acc, pos_acc, neg_acc, loss = valid_step(
-            model, data, target, num_pos
-        )
-        batch_samples = data.size(0)
-        total_samples += batch_samples
-        total_pos += num_pos
-        total_neg += num_neg
-        loss_sum += loss * batch_samples
-        sample_sum += sample_acc * batch_samples
-        pos_sum += pos_acc * num_pos
-        if num_neg:
-            neg_sum += neg_acc * num_neg
-    if total_samples == 0:
-        raise ValueError('validation set is empty')
-    return (
-        sample_sum / total_samples,
-        pos_sum / total_pos,
-        None if total_neg == 0 else neg_sum / total_neg,
-        loss_sum / total_samples,
-    )
+        num_pos = len(data) if kind == 'positive' else 0
+        diagnostic, pos, neg, loss = valid_step(model, data, target, num_pos)
+        return diagnostic, pos if kind == 'positive' else neg, loss
+    return validate_classes(valid_loader, evaluate)
 
 
 if __name__ == '__main__':
@@ -314,7 +282,6 @@ if __name__ == '__main__':
     )
     parser.add_argument('--zarr_path', type=str, required=True)
     parser.add_argument('--ckpt_dir', type=str, required=True)
-    parser.add_argument('--positive_only', action='store_true')
     args = parser.parse_args()
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu_idx)

@@ -149,6 +149,8 @@ class RUN_Picker(object):
           amp_data = np.array([tr.data[0:amp_win_npts] for tr in st])
           s_amp = self.get_s_amp(amp_data)
           if rm_glitch and self.remove_glitch(stream, tp, ts): continue
+        if any(tr.stats.get('gain_missing', False) for tr in stream):
+          s_amp = float('nan')
         output = dict(consensus)
         output.update(
             net_sta=net_sta,
