@@ -44,22 +44,22 @@ PICKERS_LOCAL = {
     "SAR": {
         "config": Path("config_sar_%s.py" % CASE_CODE),
         "gpu_idx": 0,
-        "ckpt": Path("input/SoCal_ckpt/sar_best.ckpt"),
+        "ckpt": AI_PAL_ROOT / "Pre-trained_models/SoCal_2020-2025_ckpt/realtime_sar_best.ckpt",
     },
     "FT": {
         "config": Path("config_ft_%s.py" % CASE_CODE),
         "gpu_idx": 1,
-        "ckpt": Path("input/SoCal_ckpt/ft_best.ckpt"),
+        "ckpt": AI_PAL_ROOT / "Pre-trained_models/SoCal_2020-2025_ckpt/ft_best.ckpt",
     },
     "PHN": {
         "config": Path("config_phn_%s.py" % CASE_CODE),
         "gpu_idx": 2,
-        "ckpt": Path("input/SoCal_ckpt/phn_best.ckpt"),
+        "ckpt": AI_PAL_ROOT / "Pre-trained_models/SoCal_2020-2025_ckpt/phn_best.ckpt",
     },
     "RUN": {
         "config": Path("config_run_%s.py" % CASE_CODE),
         "gpu_idx": 3,
-        "ckpt": Path("input/SoCal_ckpt/run_best.ckpt"),
+        "ckpt": AI_PAL_ROOT / "Pre-trained_models/SoCal_2020-2025_ckpt/run_best.ckpt",
     },
 }
 
@@ -68,22 +68,22 @@ PICKERS_GLOBAL = {
     "SAR_CEED": {
         "config": Path("config_sar_global_ceed.py"),
         "gpu_idx": -1,
-        "ckpt": Path("input/CEED_ckpt/ceed_sar_best.ckpt"),
+        "ckpt": AI_PAL_ROOT / "Pre-trained_models/CEED/CEED_ckpt/ceed_sar_best.ckpt",
     },
     "FT_CEED": {
         "config": Path("config_ft_global_ceed.py"),
         "gpu_idx": -1,
-        "ckpt": Path("input/CEED_ckpt/ceed_ft_best.ckpt"),
+        "ckpt": AI_PAL_ROOT / "Pre-trained_models/CEED/CEED_ckpt/ceed_ft_best.ckpt",
     },
     "PHN_CEED": {
         "config": Path("config_phn_global_ceed.py"),
         "gpu_idx": -1,
-        "ckpt": Path("input/CEED_ckpt/ceed_phn_best.ckpt"),
+        "ckpt": AI_PAL_ROOT / "Pre-trained_models/CEED/CEED_ckpt/ceed_phn_best.ckpt",
     },
     "RUN_CEED": {
         "config": Path("config_run_global_ceed.py"),
         "gpu_idx": -1,
-        "ckpt": Path("input/CEED_ckpt/ceed_run_best.ckpt"),
+        "ckpt": AI_PAL_ROOT / "Pre-trained_models/CEED/CEED_ckpt/ceed_run_best.ckpt",
     },
 }
 

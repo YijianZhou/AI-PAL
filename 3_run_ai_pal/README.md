@@ -1,5 +1,107 @@
 # Run AI-PAL
 
+## Second-class duplicate suppression
+
+Final AI-PAL output uses an additional ranked P-to-S overlap graph after ordinary
+duplicate merging. It applies to local, AWS and realtime AI-PAL outputs, not the
+realtime reference catalogs. Settings in `config_ai_pal_*`:
+
+```python
+self.enable_overlap_duplicate_removal = True
+self.overlap_duplicate_origin_time_tol_sec = 10.0
+self.overlap_duplicate_pick_fraction = 0.5
+self.overlap_duplicate_event_fraction = 0.5
+```
+
+The inclusive OT threshold (gap <= tolerance) creates transitive candidate components; it is separate from
+ordinary `merge_origin_time_tol_sec`. Events are ranked by distinct NET.STA count,
+then larger magnitude, then earlier OT. Missing magnitude (-1) ranks last on a
+station-count tie. Every event is compared with all lower-ranked events, including
+when that parent has itself been rejected. A linked child is discarded, not merged.
+
+For each parent, only stations within its associated-station epicentral-distance
+range qualify. Use its observed P/S pairs when available (any individual interval,
+not their combined span), otherwise predict P/S using vp, vs and hypocentral
+distance. A child row fails when overlap is greater than or equal to the configured
+fraction of its own S-minus-P duration. Reject the child when its failed-row
+fraction is greater than or equal to the event threshold. All child rows remain in
+the denominator, including stations outside the distance range or missing geometry.
+Ranking counts unique stations; the rejection fraction counts station P/S rows.
+
+Surviving event data are unchanged. Alongside the internal final merge log,
+`*.overlap_duplicates.csv` records every parent-child link, coordinates, magnitudes,
+failed/total row counts and failed row/station identifiers. Merge summaries include
+`num_overlap_duplicate_events_removed` for all candidates examined before interval
+trimming. Published intervals are not retroactively rewritten; use offline overwrite
+or a separate realtime output directory to regenerate historical products. Only
+events available to the existing publication window can participate in the graph.
+
+
+Native SAR/FT/PHN/RUN glitch rejection runs immediately after sliding-window
+pick clustering, before picker ensembling or initial association, for local,
+AWS and realtime workflows (controlled by `rm_glitch`). Realtime may defer
+amplitude measurement, but never glitch rejection. PHN-SB reference picks
+do not receive PAL glitch rejection, for either PAL or GaMMA association.
+Post-association initial measurement refreshes amplitudes and magnitude only;
+it no longer removes picks/events. Monitoring omits initial-QC rejection bars.
+Previously generated pick/phase files must be regenerated to apply this order.
+
+Realtime monitoring has a separate internal-event panel: initial seeds (after
+subnet merge), raw reassociation candidates, Local+Global and
+quality-0 QC rejections, candidates surviving both checks, events after
+same-segment deduplication/OT filtering, and published outputs. These are
+different stages, not additive categories. For older timing files lacking QC
+counters, the post-QC survivor count is omitted rather than inferred as zero.
+Associated-pair counts and repicking-pair QC share one panel; continuous
+generated picks remain separate.
+
+Associated-pair totals for AI-PAL and reference branches have black outlines.
+They count unique pairs in the finalized segment (after deduplication and OT
+filtering), not only newly published reporting intervals. Blue Local+Global,
+Local-only and Global-only associated counts partition that same AI-PAL
+population; gray repicked counts are after glitch QC but before reassociation
+and may repeat a physical pick across seed-event jobs. The earlier group
+counters were after reassociation/event QC but before deduplication; old timing
+files explicitly label them post-QC (pre-dedup.) and cannot reconstruct the new
+raw/final breakdown. An unknown-group count is shown if provenance is absent.
+
+Magnitude QC is shared by local, AWS and realtime PAL association/reassociation,
+including realtime reference branches that use PAL magnitude calculation.
+`mag_min_stations = 3` requires three distinct NET.STA estimates from finite,
+positive calibrated amplitudes; `mag_max_std = 1.0` limits their population std.
+Spread is evaluated without outlier clipping and passing estimates are combined
+by median. Failure writes event magnitude `-1`, retaining the event and picks.
+Missing-gain amplitudes remain `nan` and do not contribute. Other negative
+magnitudes remain valid; exactly -1 is ambiguous with the requested sentinel.
+Repick completion checks include these settings. Reprocess historical outputs
+explicitly to apply the new checks.
+
+Final-event QC is shared by local, AWS and realtime post-processing:
+`final_event_min_both_group_picks = 2` requires at least two retained station
+P/S pairs detected by both Local and Global pickers. Set it to `0` to disable,
+or a larger integer to require more agreeing pairs. The check runs after PAL
+reassociation and before phase/catalog/QC output and waveform publication.
+Separate Local-only and Global-only pairs do not satisfy it, and quality 0
+alone does not imply cross-group agreement. Other accepted picks remain in a
+passing event. Initial detections, standalone PAL and realtime reference-only
+catalogs are unchanged. A single-group run must disable this requirement.
+
+`final_event_min_quality0_picks = 2` additionally requires two retained station
+P/S pairs with quality code 0. Both event requirements must pass; an agreeing
+quality-0 pair counts toward both thresholds. Quality 0 from strong single-group
+support also counts toward this second threshold, but not the agreement threshold.
+Set either threshold to `0` to disable only that requirement. Pick quality-code
+assignment itself is unchanged. `num_events_quality0_qc_rejected` counts additional
+rejections among events that passed the Local+Global check, so the two rejection
+counts do not overlap. Both thresholds are included in completion-record checks.
+
+Rejection counts are recorded as `num_events_both_group_qc_rejected` in repick
+status/day summaries. Completion records include the threshold and the updated
+repicker version, preventing stale repick results from being silently reused.
+Deploy the full updated source package (including `PAL_src/event_quality.py`).
+Existing published catalogs are not retroactively rewritten; rerun the relevant
+post-processing to apply this QC to historical output.
+
 Global picker configs default to `trig_thres = 0.6` for SAR/FT and `0.3` for
 PHN/RUN; Local thresholds remain unchanged. The SoCal AWS configs use FT width 256 / four heads / five layers
 and RUN one-block stages, matching the current source architectures. Supply
@@ -45,6 +147,20 @@ continuous models; repicking loads its own models in stage 3. Realtime adds pers
 origin-time ownership, monitoring, and optional independent reference branches.
 
 ## Local Workflow
+
+Final event repicking uses `repick_timing_preference = "Global"` by default.
+Set it to `"Local"` in the shared config to prefer Local when both groups
+agree. P/S times, probabilities, and their standard deviations come from the
+preferred group's existing consensus. Support and provenance still include
+both groups; agreement thresholds and membership are unchanged. Single-group
+supplements use the available group. This setting applies to local, AWS, and
+realtime event repicking, not continuous ensemble picking (which uses medians
+across voting models). Global is a configurable preference, not an assumption
+that every Global training dataset is more accurate.
+
+Changing this setting does not invalidate existing outputs automatically.
+Recompute postprocessing with overwrite enabled or use a fresh output run;
+for realtime, use a fresh output root to avoid mixing timing conventions.
 
 Run these scripts in order, waiting for each stage to finish:
 
@@ -133,11 +249,12 @@ likewise invalidates its prior selection signature. Use a new output directory
 when you want to retain old results for comparison.
 
 Both groups use explicit `ckpt` file paths, never directory/latest selection.
-Copy each model's `best.ckpt` (minimum full-validation loss) and matching config
-into the inference project's `input` folder before running. For local Local
-models, the defaults are `input/<case>_ckpt/sar_best.ckpt`,
-`ft_best.ckpt`, `phn_best.ckpt`, and `run_best.ckpt`; set the Global paths
-in `PICKERS_GLOBAL` likewise. A missing file is an error, not a fallback.
+Packaged examples use checkpoints under `AI_PAL_ROOT/Pre-trained_models`:
+Local models from `SoCal_2020-2025_ckpt`, Global models from
+`CEED/CEED_ckpt`. Realtime retains its distinct SAR checkpoint as
+`SoCal_2020-2025_ckpt/realtime_sar_best.ckpt`. No checkpoint copies are needed
+in example input folders. Custom deployments can still set explicit paths
+to locally trained checkpoints with matching configs. A missing file is an error.
 AWS uses the explicit mounted path `checkpoints/<MODEL>/best.ckpt`;
 its S3 checkpoint inputs must contain that exact file. Use
 `gpu_idx = -1` to run a model on CPU; nonnegative values select that CUDA

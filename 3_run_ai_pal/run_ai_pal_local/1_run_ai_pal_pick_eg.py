@@ -17,14 +17,14 @@ PREPROCESSING_WORKERS = 4  # Existing station I/O/preprocessing concurrency per 
 OVERWRITE_PICKS = False  # False resumes complete days and reruns incomplete days.
 # Config paths are derived from CASE_CODE; picker selection is in config.
 CONFIG_AI_PAL = Path("config_ai_pal_%s.py" % CASE_CODE)
-CKPT_ROOT = Path("input/%s_ckpt" % CASE_CODE)
+CKPT_ROOT = AI_PAL_ROOT / "Pre-trained_models" / "SoCal_2020-2025_ckpt"
 PICK_ROOT = Path("output/%s" % CASE_CODE)
 ENSEMBLE_PICK_DIR = PICK_ROOT / "1.2_picks_AI-PAL-ENSEMBLE"
 
 # ============================================================================
 # USER SETTINGS: AVAILABLE PICKERS, CHECKPOINTS, AND DEVICES
 # Select Local and CEED Global models in config_ai_pal_<case>.py.
-# Copy best training checkpoints into input; specify exact files below.
+# Packaged checkpoints live under AI_PAL_ROOT / "Pre-trained_models".
 # Set gpu_idx=-1 to run a picker on CPU.
 # ============================================================================
 PICKERS_LOCAL = {
@@ -54,22 +54,22 @@ PICKERS_GLOBAL = {
     "SAR_CEED": {
         "config": Path("config_sar_global_ceed.py"),
         "gpu_idx": 0,
-        "ckpt": Path("input/CEED_ckpt/ceed_sar_best.ckpt"),
+        "ckpt": AI_PAL_ROOT / "Pre-trained_models/CEED/CEED_ckpt/ceed_sar_best.ckpt",
     },
     "FT_CEED": {
         "config": Path("config_ft_global_ceed.py"),
         "gpu_idx": 0,
-        "ckpt": Path("input/CEED_ckpt/ceed_ft_best.ckpt"),
+        "ckpt": AI_PAL_ROOT / "Pre-trained_models/CEED/CEED_ckpt/ceed_ft_best.ckpt",
     },
     "PHN_CEED": {
         "config": Path("config_phn_global_ceed.py"),
         "gpu_idx": 0,
-        "ckpt": Path("input/CEED_ckpt/ceed_phn_best.ckpt"),
+        "ckpt": AI_PAL_ROOT / "Pre-trained_models/CEED/CEED_ckpt/ceed_phn_best.ckpt",
     },
     "RUN_CEED": {
         "config": Path("config_run_global_ceed.py"),
         "gpu_idx": 0,
-        "ckpt": Path("input/CEED_ckpt/ceed_run_best.ckpt"),
+        "ckpt": AI_PAL_ROOT / "Pre-trained_models/CEED/CEED_ckpt/ceed_run_best.ckpt",
     },
 }
 

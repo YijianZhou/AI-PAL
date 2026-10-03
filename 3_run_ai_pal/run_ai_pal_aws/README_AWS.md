@@ -29,12 +29,15 @@ retain origin, P, and S timing for the cross-correlation relocation workflow.
 
 The launcher reads Local checkpoints from
 `sagemaker/ai-pal/training/<TRAINING_RUN>/03_checkpoints/<MODEL>/`. Positive-only
-CEED checkpoints and station files are staged from `input/`. Waveforms are read
+CEED checkpoints are staged from `AI_PAL_ROOT/Pre-trained_models/CEED/CEED_ckpt`;
+station files are staged from `input/`. Waveforms are read
 directly from `s3://scedc-pds/continuous_waveforms/` with the channel epochs and
 gains in the full PAL station file.
 
 The CEED inputs are `ceed_sar_best.ckpt`, `ceed_ft_best.ckpt`,
-`ceed_phn_best.ckpt`, and `ceed_run_best.ckpt` in `input/CEED_ckpt/`.
+`ceed_phn_best.ckpt`, and `ceed_run_best.ckpt` in that central CEED folder.
+Temporary container bundles retain `workflow/input/CEED_ckpt/`; these are
+job artifacts, not additional maintained package copies.
 These use the same positive-picker model configs as realtime: SAR hidden size
 128, FT width 256 with four heads and five layers, and RUN one block per stage.
 Event postprocessing use these explicit checkpoint files.
@@ -66,5 +69,5 @@ the directory names inside each case output are consistent.
 Continuous picking defaults to local SAR/PHN plus mixed-trained CEED SAR/PHN.
 Set `picker_group_min_picker_support` (default `[0, 0, 1]`) to the minimum
 Local, Global, and total votes for their combined ensemble; all must pass.
-Pick-only jobs also require the CEED configs/checkpoints in `input/CEED_ckpt`.
+Pick-only jobs also require the CEED configs and centrally stored checkpoints.
 Replace historical positive-only checkpoints with the newly mixed-trained CEED models.

@@ -47,6 +47,8 @@ class Config(object):
     self.vs = 3.5
     self.association_buffer_sec = 20.0
     self.association_interval_sec = 3600.0
+    self.mag_min_stations = 3  # Distinct stations with finite, positive calibrated amplitudes.
+    self.mag_max_std = 1.0  # Station-magnitude population std; failures output -1.
     self.subnet_assoc_params = {
         "default": {
             "min_sta": 4,
@@ -76,6 +78,7 @@ class Config(object):
     # 4. Post-processing: event repicking and PAL reassociation
     self.enable_post_process = True
     self.repicker_local_group = ["SAR", "FT", "PHN", "RUN"]
+    self.repick_timing_preference = "Global"  # "Local" or "Global"; final repick timing/statistics.
     self.repicker_global_group = ["SAR_CEED", "FT_CEED", "PHN_CEED", "RUN_CEED"]
     self.repick_phase_buffer_sec = 2.0
     self.repick_num_repeat = 20
@@ -84,6 +87,15 @@ class Config(object):
     self.repick_min_window_vote_ratio = 0.2
     self.repick_group_min_picker_support = 2
 
+    # Second-class final duplicate suppression (ranked P-to-S overlap DAG).
+    self.enable_overlap_duplicate_removal = True
+    self.overlap_duplicate_origin_time_tol_sec = 10.0  # Transitive OT links: gap <= tolerance.
+    self.overlap_duplicate_pick_fraction = 0.5  # Overlap / child P-S >= threshold.
+    self.overlap_duplicate_event_fraction = 0.5  # Failed / all child rows >= threshold.
+
+    # Final event QC after reassociation; counts retained station P/S pairs.
+    self.final_event_min_both_group_picks = 2  # Local+Global pairs per event; 0 disables.
+    self.final_event_min_quality0_picks = 2  # Quality-0 pairs per event; 0 disables.
     # Final pick quality (0 best, 3 fallback); does not reject picks.
     self.pick_quality_both_groups_code = 0  # Local and Global agree.
     self.pick_quality_strong_vote_ratio = 0.5  # Greater than or equal to this ratio.

@@ -102,7 +102,7 @@ def submit_stage(
                     model.lower()))
         if include_positive_models:
             required.extend(
-                workflow_dir / "input" / "CEED_ckpt" / name
+                ai_pal_root / "Pre-trained_models" / "CEED" / "CEED_ckpt" / name
                 for name in GLOBAL_CHECKPOINTS
             )
     for path in required:
@@ -167,7 +167,7 @@ def submit_stage(
                 ceed_stage.mkdir()
                 for name in GLOBAL_CHECKPOINTS:
                     shutil.copy2(
-                        workflow_dir / "input" / "CEED_ckpt" / name,
+                        ai_pal_root / "Pre-trained_models" / "CEED" / "CEED_ckpt" / name,
                         ceed_stage / name,
                     )
         upload_tree(s3, stage, bucket, stage_prefix)
