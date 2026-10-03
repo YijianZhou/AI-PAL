@@ -23,6 +23,25 @@ Local NPY indexes default to /data/bigdata/eg_train-samples_npy and the integrat
 Zarr to /data/bigdata/eg_train-samples.zarr. Training outputs go to output/eg_ckpt.
 See [the training overview](../README.md) for annual archive options.
 
+### Resuming Sample Cutting
+
+Rerun the same cutting launcher without deleting the NPY output folder. Both
+cutters keep `.cut_resume` station-date completion records and validate shard
+headers/sizes before skipping waveform reads. Interrupted or damaged station-date
+outputs are regenerated; train/validation indexes are rebuilt from retained and
+new shards. Unindexed leftover shards are ignored. Empty results are checkpointed.
+The saved random seed preserves split assignments and per-item sampling when
+worker counts change. Inputs, config sources, waveform root and shard size are
+checked; changed inputs/settings require a new output root. Keep waveform contents
+unchanged when resuming (the waveform tree is not hashed). Run only one cutting
+launcher against an output root at a time.
+
+Older completed stages can be adopted if their finished progress record and all
+indexed shards validate. Since old outputs have no input fingerprint, this assumes
+the same inputs/config as that original run and prints a warning. Older partial
+stages without checkpoints are regenerated once. Copy `PAL_src/cut_resume.py`
+along with the updated picker preprocessing scripts when updating the source.
+
 ## Global Pickers
 
 Normally combine your trained Local models with the supplied Global CEED
