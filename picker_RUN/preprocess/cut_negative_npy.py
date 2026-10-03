@@ -17,6 +17,7 @@ _PICKER_DIR = Path(__file__).resolve().parents[1]
 if str(_PICKER_DIR) not in sys.path:
     sys.path.insert(0, str(_PICKER_DIR))
 import config
+from cut_resume import prepare_resume, ResumableCut
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -135,11 +136,11 @@ class Negative(Dataset):
         is_tp = np.asarray([
             phase_is_available(value) and start_time < value < end_time
             for value in picks['tp']
-        ])
+        ], dtype=bool)
         is_ts = np.asarray([
             phase_is_available(value) and start_time < value < end_time
             for value in picks['ts']
-        ])
+        ], dtype=bool)
         if np.any(is_tp | is_ts):
             continue
         st = cut_event_window(day_stream, start_time, end_time)
@@ -170,6 +171,9 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers', type=int)
     parser.add_argument('--shard_size', type=int, default=1024)
     args = parser.parse_args()
+    resume_seed = prepare_resume(args, cfg, 'negative')
+    if resume_seed is None:
+        sys.exit(0)
     event_list, num_pos = read_fpha(args.fpha)
     positive_multiplier = expected_positive_multiplier()
     negative_target_count = int(round(num_pos * positive_multiplier))
@@ -213,6 +217,7 @@ if __name__ == '__main__':
     generated_samples = 0
     train_rows, valid_rows = [], []
     dataset = Negative(pick_num_items, pick_dict, cut_neg_ratio, args.data_dir, args.out_root, args.shard_size)
+    dataset = ResumableCut(dataset, 'negative', resume_seed)
     write_cut_progress(
         args.out_root, 'negative', 0, len(dataset), 0,
         planned_attempts, 0,

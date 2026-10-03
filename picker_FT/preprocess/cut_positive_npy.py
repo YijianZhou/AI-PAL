@@ -17,6 +17,7 @@ _PICKER_DIR = Path(__file__).resolve().parents[1]
 if str(_PICKER_DIR) not in sys.path:
     sys.path.insert(0, str(_PICKER_DIR))
 import config
+from cut_resume import prepare_resume, ResumableCut
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -203,10 +204,14 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers', type=int)
     parser.add_argument('--shard_size', type=int, default=1024)
     args = parser.parse_args()
+    resume_seed = prepare_resume(args, cfg, 'positive')
+    if resume_seed is None:
+        sys.exit(0)
     event_list, _ = read_fpha(args.fpha, include_pick_metadata=True)
     sta_date_items = list(get_sta_date(event_list).items())
     train_rows, valid_rows = [], []
     dataset = Positive(sta_date_items, args.data_dir, args.out_root, args.shard_size)
+    dataset = ResumableCut(dataset, 'positive', resume_seed)
     planned_by_item = [
         sum(pick_num_aug if samp_class == 'train' else 1
             for samp_class, _, _, _, pick_num_aug in samples)

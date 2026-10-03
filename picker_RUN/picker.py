@@ -132,9 +132,9 @@ class RUN_Picker(object):
     print('  {} accepted clusters (minimum {} windows)'.format(
         len(picks_raw), picker_min_cluster_size
     ))
-    # 3.2 waveform QC is deferred when association follows in memory.
+    # Reject glitches before association; only amplitude measurement may wait.
     print('  {}'.format(
-        'defer waveform QC until association'
+        'glitch removal; defer amplitude measurement'
         if defer_waveform_qc else 'get s_amp & glitch removal'
     ))
     picks = []
@@ -143,12 +143,12 @@ class RUN_Picker(object):
         if pick_start_time is not None and tp < UTCDateTime(pick_start_time): continue
         if pick_end_time is not None and tp >= UTCDateTime(pick_end_time): continue
         p_prob, s_prob = consensus['p_prob'], consensus['s_prob']
+        if rm_glitch and self.remove_glitch(stream, tp, ts): continue
         s_amp = -1.0
         if not defer_waveform_qc:
           st = stream.slice(tp-amp_win[0], ts+amp_win[1]).copy()
           amp_data = np.array([tr.data[0:amp_win_npts] for tr in st])
           s_amp = self.get_s_amp(amp_data)
-          if rm_glitch and self.remove_glitch(stream, tp, ts): continue
         if any(tr.stats.get('gain_missing', False) for tr in stream):
           s_amp = float('nan')
         output = dict(consensus)
