@@ -16,6 +16,9 @@ from association_runner import (
     processing_day_bounds, _combine_files,
 )
 from event_repicker import EVENT_REPICK_VERSION, EventRepicker
+from event_quality import minimum_both_group_picks
+from event_quality import minimum_quality0_picks
+from magnitude_qc import magnitude_parameters
 from phase_merge import group_events, is_event_header, read_phase_file
 from picker_stream import RetainedStationWaveform, configure_torch_backends
 from data_pipeline import preprocess_picker_stream
@@ -323,16 +326,26 @@ def run_offline_event_postprocessing(
                 ),
             )
             completed_version = None
+            completed_mag_params = None
+            completed_qc_minimum = None
+            completed_quality0_minimum = None
             if status_path.exists():
                 try:
-                    completed_version = json.loads(
+                    completed_status = json.loads(
                         status_path.read_text(encoding="utf-8")
-                    ).get("repick_version")
+                    )
+                    completed_version = completed_status.get("repick_version")
+                    completed_mag_params = completed_status.get("magnitude_qc")
+                    completed_qc_minimum = completed_status.get("final_event_min_both_group_picks")
+                    completed_quality0_minimum = completed_status.get("final_event_min_quality0_picks")
                 except (OSError, ValueError, TypeError):
                     completed_version = None
             if (
                 not overwrite and daily_phase.exists()
                 and completed_version == EVENT_REPICK_VERSION
+                and completed_mag_params == magnitude_parameters(cfg)
+                and completed_qc_minimum == minimum_both_group_picks(cfg)
+                and completed_quality0_minimum == minimum_quality0_picks(cfg)
             ):
                 num_done_events += len(initial_events)
                 if num_done_events >= next_progress_event:
@@ -350,6 +363,11 @@ def run_offline_event_postprocessing(
             day_summary = {
                 "date": current_date.isoformat(),
                 "repick_version": EVENT_REPICK_VERSION,
+                "magnitude_qc": magnitude_parameters(cfg),
+                "final_event_min_both_group_picks": minimum_both_group_picks(cfg),
+                "num_events_both_group_qc_rejected": 0,
+                "final_event_min_quality0_picks": minimum_quality0_picks(cfg),
+                "num_events_quality0_qc_rejected": 0,
                 "num_initial_events": len(initial_events),
                 "num_station_event_attempts": 0,
                 "num_repicker_phase_pairs_generated": 0,
@@ -392,6 +410,8 @@ def run_offline_event_postprocessing(
                             "num_repicker_phase_pairs_generated",
                             "num_events_reassociated",
                             "num_events_reassociation_rejected",
+                            "num_events_both_group_qc_rejected",
+                            "num_events_quality0_qc_rejected",
                             "num_phase_pairs_both_groups",
                             "num_phase_pairs_local_only",
                             "num_phase_pairs_global_only",
@@ -433,6 +453,7 @@ def run_offline_event_postprocessing(
                     daily_root / "catalog_{}.dat".format(current_date.isoformat()),
                     groups_path,
                     cfg,
+                    apply_overlap_duplicates=True,
                 )
                 final_events = read_phase_file(daily_phase)
                 day_summary["post_reassociation_merge"] = merge_summary

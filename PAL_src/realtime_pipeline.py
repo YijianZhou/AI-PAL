@@ -30,6 +30,7 @@ from phase_merge import (
     _cluster_station_picks, event_both_group_pick_ratio,
     select_preferred_provenance_picks, write_phase_file,
     station_identity, merged_station_selector, merged_picker_support,
+    median_magnitude,
 )
 from picker_stream import PreparedPickerStream
 import runtime_console
@@ -81,7 +82,8 @@ def _matching_mapping_value(mapping, station):
     return None
 
 
-def _initial_event_magnitude(event, station_dict):
+def _initial_event_magnitude(event, station_dict, cfg=None):
+    from magnitude_qc import magnitude_parameters, station_magnitude_summary
     magnitudes = []
     for pick in event["picks"]:
         geometry = _matching_mapping_value(station_dict, pick["sta"])
@@ -100,21 +102,20 @@ def _initial_event_magnitude(event, station_dict):
         )
         if np.isfinite(distance) and distance > 0:
             magnitudes.append(
-                np.log10(amplitude * 1e6) + np.log10(distance) + 1.0
+                (pick['sta'], np.log10(amplitude * 1e6) + np.log10(distance) + 1.0)
             )
-    if len(magnitudes) >= 3:
-        values = np.asarray(magnitudes, dtype=float)
-        values = np.delete(values, np.argmax(abs(values - np.median(values))))
-        magnitudes = values.tolist()
-    event["mag"] = (
-        round(float(np.median(magnitudes)), 2) if magnitudes else float("nan")
-    )
+    event.update(station_magnitude_summary(magnitudes, **magnitude_parameters(cfg)))
 
 
 def qc_initial_phase_file(
     phase_path, retained_waveforms, station_dict, cfg, cache=None, min_sta=None,
 ):
-    """Measure associated picks only, reject glitches, and refresh magnitude."""
+    """Refresh amplitudes/magnitudes without changing associated event membership.
+
+    Native picks are glitch-filtered before association. Reference picks must
+    not receive PAL glitch filtering. The legacy QC name/zero counters remain
+    for compatibility with existing callers and timing files.
+    """
     events = read_phase_file(phase_path)
     cache = {} if cache is None else cache
     by_station = {}
@@ -139,12 +140,7 @@ def qc_initial_phase_file(
                     if stream is None:
                         result = (False, -1.0)
                     else:
-                        glitch = bool(getattr(cfg, "rm_glitch", True)) and (
-                            is_glitch(
-                                stream, UTCDateTime(pick["p"]),
-                                UTCDateTime(pick["s"]), cfg,
-                            )
-                        )
+                        glitch = False
                         amplitude = (
                             -1.0 if glitch else displacement_amplitude(
                                 stream,
@@ -163,18 +159,11 @@ def qc_initial_phase_file(
             if holder is not None and hasattr(holder, "unload"):
                 holder.unload()
 
-    params = dict(getattr(cfg, "subnet_assoc_params", {}).get("default", {}))
-    params.update(getattr(cfg, "subnet_assoc_params", {}).get("full", {}))
-    min_sta = int(params.get("min_sta", 4) if min_sta is None else min_sta)
     accepted = []
     for event in events:
-        event["picks"] = [
-            pick for pick in event["picks"]
-            if not pick.pop("_initial_glitch", False)
-        ]
-        if len({_station_base(pick["sta"]) for pick in event["picks"]}) < min_sta:
-            continue
-        _initial_event_magnitude(event, station_dict)
+        for pick in event['picks']:
+            pick.pop('_initial_glitch', None)
+        _initial_event_magnitude(event, station_dict, cfg)
         accepted.append(event)
     write_phase_file(
         phase_path, accepted,
@@ -815,6 +804,8 @@ def apply_gain_and_units(stream, sta_key, sta_info):
         gains = [float(item) for item in gain]
 
     for ii, tr in enumerate(stream):
+        if gains[ii] == 1.0:
+            tr.stats.gain_missing = True
         if gains[ii] == 0:
             raise ValueError("zero gain for {} component {}".format(sta_key, ii))
         tr.data = tr.data.astype(np.float32, copy=False) / gains[ii]
@@ -1194,11 +1185,16 @@ def _record_event_repick_timing(timing, branch_key, summary, elapsed_sec):
             "num_picks_reassociation_rejected"
         ),
         "num_event_repick_reassociated": "num_events_reassociated",
+        "num_event_repick_both_group_qc_rejected": "num_events_both_group_qc_rejected",
+        "num_event_repick_quality0_qc_rejected": "num_events_quality0_qc_rejected",
         "num_event_repick_reassociation_rejected": (
             "num_events_reassociation_rejected"
         ),
         "num_event_repick_late_s_skipped": "num_late_s_events_skipped",
         "num_event_repick_pairs_both_groups": "num_phase_pairs_both_groups",
+        "num_event_repick_raw_pairs_both_groups": "num_raw_pairs_both_groups",
+        "num_event_repick_raw_pairs_local_only": "num_raw_pairs_local_only",
+        "num_event_repick_raw_pairs_global_only": "num_raw_pairs_global_only",
         "num_event_repick_pairs_local_only": "num_phase_pairs_local_only",
         "num_event_repick_pairs_global_only": "num_phase_pairs_global_only",
         "num_event_repick_windows": "num_repick_windows",
@@ -1383,7 +1379,7 @@ def process_segment(
             initial_qc["num_rejected_events"]
         )
         print(
-            "{} initial waveform QC: {} -> {} events | {} glitch picks "
+            "{} initial amplitude measurement: {} -> {} events | {} picks "
             "rejected".format(
                 branch_name,
                 initial_qc["num_input_events"],
@@ -1512,6 +1508,8 @@ def process_segment(
         # update_final_merged_outputs rewrites the internal phase file after
         # same-segment deduplication and corrected-origin filtering.
         merged_events = read_phase_file(merged_phase_path)
+        if branch_name == PREFERRED_ENSEMBLE_BRANCH:
+            timing.update(final_associated_group_counts(merged_events))
         timing["merged_events_{}".format(branch_key)] = len(merged_events)
         num_associated_picks = len({
             (pick["sta"], pick["p"], pick["s"])
@@ -1527,6 +1525,10 @@ def process_segment(
         timing["time_segment_merge_{}_sec".format(branch_key)] = final_sec
         timing["time_segment_merge_sec"] += final_sec
         timing["num_final_intervals_written"] += len(final_results)
+        timing["num_overlap_duplicate_events_removed_{}".format(branch_key)] = sum(
+            int(result.get("num_overlap_duplicate_events_removed", 0))
+            for result in final_results
+        )
         reported_final_events = sum(
             int(result.get("num_merged_events", 0))
             for result in final_results
@@ -1684,6 +1686,21 @@ def is_event_header(codes):
     except ValueError:
         return False
     return True
+
+
+def final_associated_group_counts(events):
+    """Partition the same unique pair population used for associated totals."""
+    from phase_merge import resolve_pick_provenance
+    pairs = {}
+    for event in events:
+        for pick in event['picks']:
+            key = (pick['sta'], pick['p'], pick['s'])
+            pairs.setdefault(key, []).append(pick.get('pick_provenance', 'initial'))
+    counts = {group: 0 for group in ('both_groups', 'local_only', 'global_only', 'unknown')}
+    for values in pairs.values():
+        group = resolve_pick_provenance(values)
+        counts[group if group in counts else 'unknown'] += 1
+    return {'num_final_assoc_pairs_' + group: value for group, value in counts.items()}
 
 
 def read_phase_file(fpha):
@@ -1967,7 +1984,7 @@ def merge_group(group, phase_pick_time_tol_sec=1.0, cfg=None):
         "lat": median([event["lat"] for event in events]),
         "lon": median([event["lon"] for event in events]),
         "depth": median([event["depth"] for event in events]),
-        "mag": median_valid([event["mag"] for event in events], default=float("nan")),
+        "mag": median_magnitude([event["mag"] for event in events]),
         "picks": [],
         "num_events": len(events),
         "sources": sorted({event["source"] for event in events}),
@@ -2047,7 +2064,8 @@ def merge_phase_files(fpha_list, fpha_out, fmerge_log, origin_time_tol_sec=2.5,
                       event_time_end=None, exclude_phase_files=None,
                       min_shared_phase_stations=0,
                       phase_pick_time_tol_sec=1.0,
-                      min_both_group_ratio=None, cfg=None):
+                      min_both_group_ratio=None, cfg=None,
+                      apply_overlap_duplicates=False):
     events = []
     file_event_counts = {}
     for fpha in sorted(fpha_list):
@@ -2088,6 +2106,15 @@ def merge_phase_files(fpha_list, fpha_out, fmerge_log, origin_time_tol_sec=2.5,
     merged_events = []
     for group in groups:
         merged = merge_group(group, phase_pick_time_tol_sec, cfg)
+        merged_events.append(merged)
+    num_overlap_removed = 0
+    if apply_overlap_duplicates:
+        from overlap_duplicates import filter_final_events
+        diagnostic_path = str(fmerge_log).removesuffix('.tmp') + '.overlap_duplicates.csv'
+        merged_events, num_overlap_removed = filter_final_events(
+            merged_events, cfg, diagnostic_path)
+    interval_events = []
+    for merged in merged_events:
         # Assign a duplicate group to exactly one disjoint final interval by
         # its canonical merged origin. Using "any member in interval" can put
         # a boundary-straddling group in two final files and previously led to
@@ -2099,7 +2126,8 @@ def merge_phase_files(fpha_list, fpha_out, fmerge_log, origin_time_tol_sec=2.5,
             continue
         if event_time_end is not None and merged["time"] >= event_time_end:
             continue
-        merged_events.append(merged)
+        interval_events.append(merged)
+    merged_events = interval_events
     merged_events = sorted(merged_events, key=lambda item: item["time"])
     num_interval_events_before_both_group_qc = len(merged_events)
     num_both_group_ratio_rejected = 0
@@ -2170,9 +2198,10 @@ def merge_phase_files(fpha_list, fpha_out, fmerge_log, origin_time_tol_sec=2.5,
         "num_input_events_in_final_interval": num_input_events_in_interval,
         "num_merged_events": len(merged_events),
         "num_events_both_group_ratio_rejected": num_both_group_ratio_rejected,
+        "num_overlap_duplicate_events_removed": num_overlap_removed,
         "num_duplicate_events_removed": num_input_events - num_grouped_events,
         "num_events_outside_final_interval": (
-            num_grouped_events - num_interval_events_before_both_group_qc
+            num_grouped_events - num_overlap_removed - num_interval_events_before_both_group_qc
         ),
         "num_multi_input_event_groups": num_multi_event_groups,
         "max_input_events_per_group": max_input_events_per_group,
@@ -2203,6 +2232,8 @@ def merge_phase_files(fpha_list, fpha_out, fmerge_log, origin_time_tol_sec=2.5,
                     )
                 )
     print("merged events: {}".format(summary["num_merged_events"]))
+    if apply_overlap_duplicates:
+        print("second-class overlap duplicates removed: {}".format(num_overlap_removed))
     if min_both_group_ratio is not None:
         print(
             "events rejected below both-repicker-group ratio {:.3f}: {}".format(
@@ -2875,13 +2906,15 @@ def _corrected_origin_bounds(record, cfg):
 
 
 def _merge_corrected_interval(source_paths, phase_path, merge_log_path,
-                              interval_start, interval_end, cfg):
+                              interval_start, interval_end, cfg,
+                              apply_overlap_duplicates=False):
     phase_tmp = phase_path + ".tmp"
     merge_log_tmp = merge_log_path + ".tmp"
     summary = merge_phase_files(
         source_paths,
         phase_tmp,
         merge_log_tmp,
+        apply_overlap_duplicates=apply_overlap_duplicates,
         origin_time_tol_sec=cfg.merge_origin_time_tol_sec,
         epicenter_tol_km=cfg.merge_epicenter_tol_km,
         depth_tol_km=cfg.merge_depth_tol_km,
@@ -2957,6 +2990,7 @@ def _publish_corrected_tail(record, report_start, report_end, cfg):
     summary = _merge_corrected_interval(
         [record["phase_path"]], phase_path, merge_log_path,
         report_start, report_end, cfg,
+        apply_overlap_duplicates=True,
     )
     export_phase_qc(phase_path)
     if write_catalog:

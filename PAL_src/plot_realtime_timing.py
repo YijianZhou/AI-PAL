@@ -91,7 +91,7 @@ def subnet_label(value):
 
 
 def is_published_label(label):
-    return label.endswith((" published events", " waveform PNGs"))
+    return label.endswith((" published events", " waveform PNGs", " associated P/S pairs"))
 
 
 def short_tick_label(label):
@@ -299,17 +299,20 @@ def associated_phase_count_values(record):
         for key in sorted(record) if key.startswith("num_associated_picks_")
     ]
     items += [
-        ("Local + Global pairs", "num_event_repick_pairs_both_groups"),
-        ("Local-only pairs", "num_event_repick_pairs_local_only"),
-        ("Global-only pairs", "num_event_repick_pairs_global_only"),
         ("Generated repicker pairs", "num_event_repicker_pairs_generated"),
-        (
-            "Glitch-rejected repicker pairs",
-            "num_event_repicker_pairs_glitch_rejected",
-        ),
         ("Pairs rejected by reassociation",
          "num_event_repick_picks_reassoc_rejected"),
     ]
+    for label, group in (("Local + Global", "both_groups"),
+                         ("Local-only", "local_only"), ("Global-only", "global_only")):
+        final_key = 'num_final_assoc_pairs_' + group
+        if final_key in record:
+            items.append((label + ' assoc. pairs', final_key))
+        elif 'num_event_repick_pairs_' + group in record:
+            items.append((label + ' post-QC (pre-dedup.)', 'num_event_repick_pairs_' + group))
+        items.append((label + ' repicked pairs', 'num_event_repick_raw_pairs_' + group))
+    if get_float(record, 'num_final_assoc_pairs_unknown'):
+        items.append(('Unknown group assoc. pairs', 'num_final_assoc_pairs_unknown'))
     return (
         [label for label, key in items if key in record],
         [get_float(record, key) for label, key in items if key in record],
@@ -338,26 +341,37 @@ def event_count_values(record):
         for key in sorted(record)
         if key.startswith("event_waveform_final_plots_")
     ]
-    items += [
-        (
-            clean_label(key[len("initial_events_qc_rejected_"):])
-            + " initial events rejected by waveform QC",
-            key,
-        )
-        for key in sorted(record)
-        if key.startswith("initial_events_qc_rejected_")
-    ]
-    items += [
-        ("Repick intervals", "num_event_repick_intervals"),
-        ("Late-S events skipped", "num_event_repick_late_s_skipped"),
-        ("Events reassociated", "num_event_repick_reassociated"),
-        ("Events rejected by reassociation",
-         "num_event_repick_reassociation_rejected"),
-    ]
     return (
         [label for label, key in items if key in record],
         [get_float(record, key) for label, key in items if key in record],
     )
+
+
+def internal_event_count_values(record):
+    """Stage counts, not additive bins; absent historical QC is unknown."""
+    items = [
+        ("Initial seeds (subnet-merged)", "initial_events_AI_PAL"),
+        ("Seeds without reassoc.", "num_event_repick_reassociation_rejected"),
+        ("Raw reassoc. candidates", "num_event_repick_reassociated"),
+        ("Local+Global QC rej.", "num_event_repick_both_group_qc_rejected"),
+        ("Quality-0 QC rej.", "num_event_repick_quality0_qc_rejected"),
+    ]
+    labels = [label for label, key in items if record.get(key) not in (None, "")]
+    values = [get_float(record, key) for _, key in items if record.get(key) not in (None, "")]
+    qc_keys = ("num_event_repick_reassociated",
+               "num_event_repick_both_group_qc_rejected",
+               "num_event_repick_quality0_qc_rejected")
+    if all(record.get(key) not in (None, "") for key in qc_keys):
+        labels.append("After event QC")
+        values.append(get_float(record, qc_keys[0]) - sum(get_float(record, key) for key in qc_keys[1:]))
+    for label, key in (
+        ("After dedup. + OT filter", "merged_events_AI_PAL"),
+        ("AI-PAL published events", "final_events_AI_PAL"),
+    ):
+        if record.get(key) not in (None, ""):
+            labels.append(label)
+            values.append(get_float(record, key))
+    return labels, values
 
 
 def waveform_plot_qc_values(record):
@@ -405,7 +419,7 @@ def plot_timing(timing_csv, output_png):
         ("Picker ensemble", "picker_ensemble_sec"),
         ("Association (all workflows)", "assoc_wall_sec"),
         ("Subnet event merge", "merge_sec"),
-        ("Initial amp + glitch QC", "initial_waveform_qc_sec"),
+        ("Initial amplitude measurement", "initial_waveform_qc_sec"),
         ("Segment merge + OT filter", "time_segment_merge_sec"),
         ("Event repicking", "event_repick_sec"),
     ]
@@ -436,7 +450,9 @@ def plot_timing(timing_csv, output_png):
         return [
             "#29966F" if "GaMMA" in label else
             "#DE8F32" if any(label.startswith(clean_label(key)) for key in reference_pickers) else
-            "#888888" if label in ("Station preprocessing", "Pick-file writing") else
+            "#888888" if label in ("Station preprocessing", "Pick-file writing", "Generated repicker pairs",
+                                   "Glitch-rejected repicker pairs", "Pairs rejected by reassociation")
+            or label.endswith(' repicked pairs') else
             "#2878B5"
             for label in labels
         ]
@@ -446,7 +462,7 @@ def plot_timing(timing_csv, output_png):
     assoc = combined(association_timings)
     merging = combined(merge_timings)
     for key in sorted(record):
-        for prefix, suffix in (("initial_waveform_qc_", " waveform QC"),
+        for prefix, suffix in (("initial_waveform_qc_", " amplitude measurement"),
                                ("event_waveform_plot_", " plots")):
             if key.startswith(prefix) and key.endswith("_sec") and key != prefix + "sec":
                 merging[0].extend(branch_labels([clean_label(key[len(prefix):-4]) + suffix]))
@@ -458,7 +474,9 @@ def plot_timing(timing_csv, output_png):
     picks = pick_count_values(pick_record)
     associated_record = {key: value for key, value in record.items()
                          if key.startswith("num_associated_picks_")
-                         or key.startswith("num_event_repick_pairs_")}
+                         or key.startswith("num_event_repick_pairs_")
+                         or key.startswith("num_final_assoc_pairs_")
+                         or key.startswith("num_event_repick_raw_pairs_")}
     associated = associated_phase_count_values(associated_record)
     associated = (branch_labels(associated[0]), associated[1])
     pair_qc = associated_phase_count_values({
@@ -468,6 +486,8 @@ def plot_timing(timing_csv, output_png):
                    "num_event_repick_picks_reassoc_rejected")
     })
     events = combined(event_count_values)
+    internal_events = internal_event_count_values(record)
+    associated = (associated[0] + pair_qc[0], associated[1] + pair_qc[1])
     ratio_labels, ratio_values = association_ratio_values(record)
     qc_labels, qc_counts = qc_values(record)
     waveform_qc_labels, waveform_qc_counts = waveform_plot_qc_values(record)
@@ -478,9 +498,9 @@ def plot_timing(timing_csv, output_png):
         Patch(color="#2878B5", label="Preferred AI-PAL"),
         Patch(color="#DE8F32", label="Reference picker / PAL"),
         Patch(color="#29966F", label="Reference GaMMA"),
-        Patch(color="#888888", label="Shared preprocessing"),
+        Patch(color="#888888", label="Shared preprocessing / repick QC"),
         Patch(facecolor="white", edgecolor="k", linewidth=1.3,
-              label="Published outputs"),
+              label="Published events / assoc. totals"),
     ], loc="upper center", bbox_to_anchor=(0.5, 0.973), ncol=5, frameon=False,
        fontsize=LABEL_FONTSIZE)
     panels = (
@@ -495,8 +515,8 @@ def plot_timing(timing_csv, output_png):
          ) else "Waveform QC + plotting", "Time (s)", False),
         (axes[1, 2], picks, "Generated pick counts", "Station P/S pairs", True),
         (axes[2, 0], events, "Event counts", "Events / outputs", True),
-        (axes[2, 1], associated, "Associated pick counts", "Station P/S pairs", True),
-        (axes[2, 2], pair_qc, "Repicking pair QC", "Station P/S pairs", True),
+        (axes[2, 1], internal_events, "AI-PAL internal event counts", "Events / candidates (stage counts)", True),
+        (axes[2, 2], associated, "Associated picks + repicking QC", "Station P/S pairs", True),
     )
     for axis, (labels, values), title, xlabel, counts in panels:
         palette = colors(labels)

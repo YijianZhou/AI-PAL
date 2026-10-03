@@ -387,6 +387,8 @@ def apply_overrides(cfg, args):
         )
         final_cfg.write_catalog_outputs = False
         final_cfg.result_name = result_name
+        if result_name != 'AI-PAL':
+            final_cfg.enable_overlap_duplicate_removal = False
         pick_dir = (
             cfg.picker_output_dirs[members[0]]
             if len(members) == 1
@@ -425,6 +427,9 @@ def subnet_name_from_path(path):
 
 
 def get_assoc_param(cfg, subnet_name, param):
+    if param in ('mag_min_stations', 'mag_max_std'):
+        from magnitude_qc import magnitude_parameters
+        return magnitude_parameters(cfg)[param]
     configured = getattr(cfg, "subnet_assoc_params", {})
     params = dict(configured.get("default", {}))
     params.update(configured.get(subnet_name, {}))
@@ -459,6 +464,7 @@ class ParallelSubnetAssociators(object):
                     "xy_margin", "xy_grid", "z_grids", "min_sta",
                     "ot_dev", "max_res", "max_drop", "vp",
                     "lat_range", "lon_range",
+                    "mag_min_stations", "mag_max_std",
                 )
             })
         self.executor = ThreadPoolExecutor(
@@ -585,6 +591,8 @@ if __name__ == "__main__":
     ))
 
     pick_sta_dict = rtp.get_realtime_sta_dict(cfg.full_sta_file)
+    for branch in cfg.result_branches.values():
+        branch['final_cfg']._overlap_duplicate_stations = pick_sta_dict
     print("loaded {} station selectors for picking from full station file".format(
         len(pick_sta_dict)
     ))

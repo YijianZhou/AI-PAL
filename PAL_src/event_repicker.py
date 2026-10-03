@@ -36,6 +36,9 @@ from pick_ensemble import (
 )
 from waveform_qc import displacement_amplitude, is_glitch
 from station_inventory import waveform_station_selector
+from event_quality import filter_final_events, minimum_both_group_picks
+from event_quality import filter_quality0_events, minimum_quality0_picks
+from magnitude_qc import magnitude_parameters
 
 
 REPICKER_REGISTRY = {
@@ -45,7 +48,7 @@ REPICKER_REGISTRY = {
     "RUN": ("picker_RUN", "RUNWindowPicker"),
 }
 
-EVENT_REPICK_VERSION = "repick_pair_window_votes_v20"
+EVENT_REPICK_VERSION = "repick_group_count_stages_v25"
 EVENT_WAVEFORM_PRE_ORIGIN_SEC = 5.0
 EVENT_WAVEFORM_POST_S_SEC = 10.0
 EVENT_WAVEFORM_PLOT_DPI = 200
@@ -156,8 +159,8 @@ def _safe_event_code(origin_time):
     return UTCDateTime(origin_time).strftime("%Y%m%dT%H%M%S.%fZ")
 
 
-class PositivePickerAdapter(object):
-    """Adapt one benchmark positive picker to a filtered ObsPy stream."""
+class RepickerAdapter(object):
+    """Adapt one Local or Global model to shared random-window repicking."""
 
     def __init__(self, name, module, picker, cfg):
         self.name = name
@@ -326,7 +329,7 @@ class PositivePickerAdapter(object):
 
 
 class EventRepicker(object):
-    """Repick events with pos+neg and positive-only model ensembles."""
+    """Repick events with Local and Global model ensembles."""
 
     def __init__(
         self, ai_pal_root, cfg, repicker_local_specs, station_file,
@@ -337,6 +340,9 @@ class EventRepicker(object):
         if str(self.ai_pal_root) not in sys.path:
             sys.path.insert(0, str(self.ai_pal_root))
         self.cfg = cfg
+        self._timing_preference()  # Workflow-level validation before loading models.
+        minimum_both_group_picks(cfg)  # Validate before loading models or waveforms.
+        minimum_quality0_picks(cfg)
         self.repicker_specs = {
             "Local": dict(repicker_local_specs or {}),
             "Global": dict(repicker_global_specs or {}),
@@ -361,6 +367,7 @@ class EventRepicker(object):
             else cfg.get_sta_dict(str(self.station_file))
         )
         self.reassociation_params = self._resolve_reassociation_params()
+        cfg._overlap_duplicate_stations = self.stations
         self.reassociator = associator_pal.PS_Pair_Assoc(
             self.stations, **self.reassociation_params
         )
@@ -411,6 +418,7 @@ class EventRepicker(object):
         if not stations:
             raise ValueError("event repicker station geometry is empty")
         self.stations = stations
+        self.cfg._overlap_duplicate_stations = stations
         self.reassociator = associator_pal.PS_Pair_Assoc(
             self.stations, **self.reassociation_params
         )
@@ -430,6 +438,7 @@ class EventRepicker(object):
             "max_res", "max_drop", "min_sta", "lat_range", "lon_range",
         }
         params = {key: value for key, value in params.items() if key in supported}
+        params.update(magnitude_parameters(self.cfg))
         print(
             "post-repick full-network PAL reassociation: min_sta={}".format(
                 params["min_sta"]
@@ -525,7 +534,7 @@ class EventRepicker(object):
                     self.cfg.repick_batch_size, self.cfg.repick_random_seed,
                     _minimum_window_votes(self.cfg),
                 )
-                adapter = PositivePickerAdapter(
+                adapter = RepickerAdapter(
                     name, module, picker, module.cfg,
                 )
                 loaded[key] = adapter
@@ -574,7 +583,7 @@ class EventRepicker(object):
         )
 
     def bind_continuous_pickers(self, pickers):
-        """Reuse loaded pos+neg models selected for continuous inference."""
+        """Reuse loaded models selected for continuous inference."""
         if self.pickers is not None:
             raise RuntimeError("continuous models must be bound before loading")
         if any(name in pickers for name in ("Local", "Global")):
@@ -588,7 +597,7 @@ class EventRepicker(object):
             ).update(pickers)
 
     def load_pickers(self):
-        """Load positive models before a large segment waveform is resident."""
+        """Load repicker models before a large segment waveform is resident."""
         self._load_pickers()
 
     def close(self):
@@ -633,6 +642,10 @@ class EventRepicker(object):
             return {
                 "enabled": True,
                 "num_events": 0,
+                "final_event_min_both_group_picks": minimum_both_group_picks(self.cfg),
+                "num_events_both_group_qc_rejected": 0,
+                "final_event_min_quality0_picks": minimum_quality0_picks(self.cfg),
+                "num_events_quality0_qc_rejected": 0,
                 "num_station_event_attempts": 0,
                 "num_repicker_phase_pairs_generated": 0,
                 "num_picks_reassociation_rejected": 0,
@@ -762,6 +775,12 @@ class EventRepicker(object):
                 event["picks"].extend(results)
             result_merge_sec += time.perf_counter() - merge_started
 
+        raw_provenance_counts = {key: 0 for key in ('both_groups', 'local_only', 'global_only')}
+        for event in events:
+            for pick in event['picks']:
+                provenance = resolve_pick_provenance([pick.get('pick_provenance', 'initial')])
+                if provenance in raw_provenance_counts:
+                    raw_provenance_counts[provenance] += 1
         reassociation_started = time.perf_counter()
         waveform_qc_measurement_sec = 0.0
         reassociated_events = []
@@ -790,7 +809,10 @@ class EventRepicker(object):
             reassociated_events.extend(reassociated)
             num_events_reassociated += len(reassociated)
 
-        events = reassociated_events
+        events, num_events_both_group_qc_rejected = filter_final_events(
+            reassociated_events, self.cfg
+        )
+        events, num_events_quality0_qc_rejected = filter_quality0_events(events, self.cfg)
         reassociation_sec = max(
             0.0,
             time.perf_counter() - reassociation_started
@@ -830,6 +852,10 @@ class EventRepicker(object):
         summary = {
             "enabled": True,
             "num_events": len(events),
+            "final_event_min_both_group_picks": minimum_both_group_picks(self.cfg),
+            "num_events_both_group_qc_rejected": num_events_both_group_qc_rejected,
+            "final_event_min_quality0_picks": minimum_quality0_picks(self.cfg),
+            "num_events_quality0_qc_rejected": num_events_quality0_qc_rejected,
             "num_station_event_attempts": num_attempts,
             "num_repicker_phase_pairs_generated": num_generated,
             "num_repicker_phase_pairs_glitch_rejected": num_glitch_rejected,
@@ -841,6 +867,9 @@ class EventRepicker(object):
                 num_events_reassociation_rejected
             ),
             "num_phase_pairs_both_groups": provenance_counts["both_groups"],
+            "num_raw_pairs_both_groups": raw_provenance_counts["both_groups"],
+            "num_raw_pairs_local_only": raw_provenance_counts["local_only"],
+            "num_raw_pairs_global_only": raw_provenance_counts["global_only"],
             "num_phase_pairs_local_only": provenance_counts["local_only"],
             "num_phase_pairs_global_only": provenance_counts["global_only"],
             "num_late_s_events_skipped": num_late_s_events,
@@ -939,16 +968,9 @@ class EventRepicker(object):
     def qc_initial_events(
         self, phase_path, waveform_context, catalog_path=None,
     ):
-        """Measure and glitch-check only picks used by initial detections."""
+        """Refresh initial amplitudes; glitch rejection belongs before association."""
         events = read_phase_file(phase_path)
         rejected_picks = 0
-        params = dict(getattr(
-            self.cfg, "subnet_assoc_params", {}
-        ).get("default", {}))
-        params.update(getattr(
-            self.cfg, "subnet_assoc_params", {}
-        ).get("full", {}))
-        min_sta = int(params.get("min_sta", 4))
         accepted = []
         for event in events:
             picks = []
@@ -962,14 +984,6 @@ class EventRepicker(object):
                     start_time=UTCDateTime(pick["p"]) - float(self.cfg.amp_win[0]),
                     end_time=UTCDateTime(pick["s"]) + float(self.cfg.amp_win[1]),
                 )
-                if stream is not None and bool(getattr(
-                    self.cfg, "rm_glitch", True
-                )) and is_glitch(
-                    stream, UTCDateTime(pick["p"]),
-                    UTCDateTime(pick["s"]), self.cfg,
-                ):
-                    rejected_picks += 1
-                    continue
                 pick["score"] = (
                     self._displacement_amplitude(
                         stream, UTCDateTime(pick["p"]), UTCDateTime(pick["s"])
@@ -977,8 +991,6 @@ class EventRepicker(object):
                 )
                 picks.append(pick)
             event["picks"] = picks
-            if len({_station_base(pick["sta"]) for pick in picks}) < min_sta:
-                continue
             amplitude_rows = np.asarray([
                 (self._station_geometry_key(pick["sta"]), pick["score"])
                 for pick in picks
@@ -1622,9 +1634,15 @@ class EventRepicker(object):
             for group_name in ("Local", "Global")
         }
 
+    def _timing_preference(self):
+        preference = getattr(self.cfg, "repick_timing_preference", "Global")
+        if preference not in ("Local", "Global"):
+            raise ValueError("repick_timing_preference must be 'Local' or 'Global'")
+        return preference
+
     def _output_repicker_pick(self, job, selected, provenance, groups):
-        # Positive-only models are the timing authority when both groups agree.
-        timing = selected["Global"] if "Global" in selected else next(
+        preference = self._timing_preference()
+        timing = selected[preference] if preference in selected else next(
             iter(selected.values())
         )
         tp, ts = timing["tp"], timing["ts"]
@@ -1664,38 +1682,38 @@ class EventRepicker(object):
         return output
 
     def _combine_repicker_groups(self, job, group_results):
-        pos_neg = list(group_results["Local"])
-        pos = list(group_results["Global"])
+        local_picks = list(group_results["Local"])
+        global_picks = list(group_results["Global"])
         outputs = []
-        used_pos = set()
-        for pos_neg_pick in pos_neg:
+        used_global = set()
+        for local_pick in local_picks:
             matches = [
-                (index, pos_pick)
-                for index, pos_pick in enumerate(pos)
-                if index not in used_pos
-                and abs(pos_pick["tp"] - pos_neg_pick["tp"])
+                (index, global_pick)
+                for index, global_pick in enumerate(global_picks)
+                if index not in used_global
+                and abs(global_pick["tp"] - local_pick["tp"])
                 <= float(self.cfg.tp_dev)
-                and abs(pos_pick["ts"] - pos_neg_pick["ts"])
+                and abs(global_pick["ts"] - local_pick["ts"])
                 <= float(self.cfg.ts_dev)
             ]
             if matches:
-                index, pos_pick = min(matches, key=lambda value: (
-                    abs(value[1]["tp"] - pos_neg_pick["tp"])
-                    + abs(value[1]["ts"] - pos_neg_pick["ts"])
+                index, global_pick = min(matches, key=lambda value: (
+                    abs(value[1]["tp"] - local_pick["tp"])
+                    + abs(value[1]["ts"] - local_pick["ts"])
                 ))
-                used_pos.add(index)
+                used_global.add(index)
                 outputs.append(self._output_repicker_pick(
-                    job, {"Local": pos_neg_pick, "Global": pos_pick},
+                    job, {"Local": local_pick, "Global": global_pick},
                     "both_groups", ["Local", "Global"],
                 ))
             else:
                 outputs.append(self._output_repicker_pick(
-                    job, {"Local": pos_neg_pick}, "local_only", ["Local"]
+                    job, {"Local": local_pick}, "local_only", ["Local"]
                 ))
-        for index, pos_pick in enumerate(pos):
-            if index not in used_pos:
+        for index, global_pick in enumerate(global_picks):
+            if index not in used_global:
                 outputs.append(self._output_repicker_pick(
-                    job, {"Global": pos_pick}, "global_only", ["Global"]
+                    job, {"Global": global_pick}, "global_only", ["Global"]
                 ))
         return outputs
 
@@ -1989,7 +2007,7 @@ class EventRepicker(object):
             "evt_lat": float(event["lat"]),
             "evt_lon": float(event["lon"]),
             "evt_dep": float(event["depth"]),
-            "mag": float("nan"),
+            "mag": -1.0,
         }
         if amplitude_rows:
             event_location = self.reassociator.calc_mag(
@@ -2155,6 +2173,10 @@ class RealtimeEventRepickCoordinator(object):
         "num_repicker_phase_pairs_generated",
         "num_picks_reassociation_rejected",
         "num_events_reassociated", "num_events_reassociation_rejected",
+        "num_raw_pairs_both_groups", "num_raw_pairs_local_only", "num_raw_pairs_global_only",
+        "final_event_min_both_group_picks", "num_events_both_group_qc_rejected",
+        "final_event_min_quality0_picks", "num_events_quality0_qc_rejected",
+        "mag_min_stations", "mag_max_std",
         "num_late_s_events_skipped", "num_repick_windows",
         "job_build_sec", "window_prepare_sec", "device_inference_wall_sec",
         "device_transfer_sec", "result_merge_sec", "reassociation_sec",
@@ -2242,6 +2264,14 @@ class RealtimeEventRepickCoordinator(object):
                 if (
                     not row.get("phase_path")
                     or row.get("repick_version") != EVENT_REPICK_VERSION
+                    or any(row.get(key) != str(value) for key, value in
+                           magnitude_parameters(self.repicker.cfg).items())
+                    or row.get("final_event_min_both_group_picks") != str(
+                        minimum_both_group_picks(self.repicker.cfg)
+                    )
+                    or row.get("final_event_min_quality0_picks") != str(
+                        minimum_quality0_picks(self.repicker.cfg)
+                    )
                 ):
                     continue
                 phase_path = os.path.abspath(row["phase_path"])
@@ -2516,6 +2546,9 @@ class RealtimeEventRepickCoordinator(object):
             row = {name: summary.get(name, "") for name in self.STATUS_FIELDS}
             row["time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             row["repick_version"] = EVENT_REPICK_VERSION
+            row.update(magnitude_parameters(self.repicker.cfg))
+            row["final_event_min_both_group_picks"] = minimum_both_group_picks(self.repicker.cfg)
+            row["final_event_min_quality0_picks"] = minimum_quality0_picks(self.repicker.cfg)
             row["picker_group"] = self.picker_group
             writer.writerow(row)
             fp.flush()

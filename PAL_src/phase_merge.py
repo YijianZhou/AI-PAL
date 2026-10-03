@@ -105,9 +105,9 @@ def median_valid(values, default=-1.0):
 
 
 def median_magnitude(values):
-    """Magnitudes may be negative; only nonfinite values are unavailable."""
-    valid = [float(value) for value in values if isfinite(float(value))]
-    return median(valid) if valid else float("nan")
+    """Preserve negative magnitudes except the reserved missing sentinel -1."""
+    from magnitude_qc import median_event_magnitude
+    return median_event_magnitude(values)
 
 
 def horizontal_distance_km(left, right):
@@ -462,6 +462,7 @@ def merge_phase_files(
     phase_files, output_phase, output_catalog, output_groups, cfg,
     event_time_start=None, event_time_end=None,
     min_both_group_ratio=None,
+    apply_overlap_duplicates=False,
 ):
     events = []
     input_counts = {}
@@ -481,11 +482,20 @@ def merge_phase_files(
     merged = []
     for group in groups:
         event = merge_group(group, cfg.merge_phase_pick_time_tol_sec, cfg)
+        merged.append(event)
+    num_overlap_removed = 0
+    if apply_overlap_duplicates:
+        from overlap_duplicates import filter_final_events
+        merged, num_overlap_removed = filter_final_events(
+            merged, cfg, str(output_groups) + '.overlap_duplicates.csv')
+    interval_events = []
+    for event in merged:
         if event_time_start is not None and event["time"] < event_time_start:
             continue
         if event_time_end is not None and event["time"] >= event_time_end:
             continue
-        merged.append(event)
+        interval_events.append(event)
+    merged = interval_events
     merged.sort(key=lambda event: event["time"])
     merged_before_both_group_qc = list(merged)
     num_both_group_ratio_rejected = 0
@@ -564,6 +574,7 @@ def merge_phase_files(
         "num_candidate_input_events": len(events),
         "num_input_events": contributing_events,
         "num_merged_events": len(merged),
+        "num_overlap_duplicate_events_removed": num_overlap_removed,
         "num_events_both_group_ratio_rejected": num_both_group_ratio_rejected,
         "num_duplicate_events_removed": (
             contributing_before_both_group_qc

@@ -15,6 +15,7 @@ class NativePickerAdapter(object):
         self.device = picker.device
 
     def pick(self, stream, prepared=None):
+        # Native pickers always reject glitches; defer only amplitude work.
         return self.picker.pick(
             stream, prepared=prepared, defer_waveform_qc=True
         )
