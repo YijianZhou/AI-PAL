@@ -5,6 +5,64 @@ procedure are in [CHANGELOG_INTERNAL.md](CHANGELOG_INTERNAL.md).
 
 ## Unreleased
 
+- Require at least two Local+Global station P/S pairs per final AI-PAL event by default.
+
+- Make second-class duplicate thresholds inclusive: OT gap <= tolerance,
+  pick overlap >= threshold, and failed-pick fraction >= threshold.
+
+- Training NPY cutting now resumes completed station-dates, regenerates incomplete
+  shards, and preserves randomized splits across restarts.
+
+- Fix negative training-sample cutting for station-days with no catalog picks.
+
+- 2026-10-01: PAL range exports include one integrated association-rate CSV
+  beside phase/catalog outputs, ready for training sample preparation.
+
+- Add configurable second-class duplicate suppression for final AI-PAL events:
+  ranked P-to-S overlap links, including descendants of discarded events, with
+  per-link diagnostic CSVs. Available in local, AWS, and realtime workflows.
+
+- Native realtime pickers now reject waveform glitches before initial
+  association, consistent with local/AWS picking. Reference PHN-SB catalogs
+  no longer receive PAL post-association glitch filtering. Initial-QC rejection
+  bars are removed from monitoring; amplitude/magnitude measurement remains.
+
+- 2026-09-30: Final event repicking can prefer Global (default) or Local
+  timing using `repick_timing_preference` in the shared configuration.
+
+### 2026-09-30: Unit-Gain Placeholder
+
+- Treat gain 1.0 as missing calibration in local/AWS PAL and AI-PAL realtime
+  processing, including legacy gain layouts. Retain waveform picking but output
+  NaN station amplitude and exclude it from magnitude calculation if a selected
+  component is uncalibrated. Existing amplitudes require reprocessing.
+- AI-PAL repick version is advanced to invalidate previous repick completion
+  records. Regression tests cover unit gain on all or one component and both
+  AI-PAL/PALM calibration implementations.
+
+### 2026-09-30: PAL Magnitude QC
+
+- Require three distinct valid station magnitude estimates and population std
+  <= 1.0, configurable with `mag_min_stations` and `mag_max_std`.
+- Replace unconditional worst-station removal with a spread check followed by
+  the median. Failed magnitude is -1 without discarding arrival picks or events;
+  missing-gain amplitudes remain NaN. Magnitude merging excludes the -1 sentinel
+  and retains other negative values. This supersedes the earlier NaN event-mag
+  convention for PAL; MFT magnitude estimation is unchanged.
+- Shared helper and parameter propagation cover local/AWS PAL and AI-PAL
+  realtime/reassociation. Repick completion checks include magnitude thresholds.
+  Tests cover the reported M6.56 case, missing amplitudes, distinct stations,
+  negative magnitudes, threshold boundaries and AI-PAL/PALM source parity.
+
+- Final AI-PAL events additionally require two quality-0 station P/S pairs by
+  default (`final_event_min_quality0_picks`); zero disables this requirement.
+
+- Final AI-PAL events now require at least one Local+Global station P/S pair
+  by default across local, AWS and realtime; the minimum is configurable.
+
+- 2026-09-29: Centralized packaged inference checkpoints in
+  `Pre-trained_models`; removed verified duplicate input copies.
+
 - CEED phase extraction now supports per-HDF5 multiprocessing and resumable
   completed-file outputs in both the packaged and SoCal workflows.
 
