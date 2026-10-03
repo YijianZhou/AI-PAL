@@ -624,14 +624,14 @@ def plot_features(hist, args):
     ax[0].hist(mag, bins=mag_edges, density=True, color="0.75", edgecolor="0.3", label="hist")
     ax[0].plot(centers, mag_pdf, "r-", lw=1.8, label="PDF")
     ax[0].set(xlabel="Magnitude", ylabel="PDF", title="Magnitude/FMD PDF")
-    ax[0].legend()
+    ax[0].legend(loc="upper right")
 
     hypo, hypo_edges, hypo_pdf, _ = hist["hypo_dist"]
     centers = 0.5 * (hypo_edges[:-1] + hypo_edges[1:])
     ax[1].hist(hypo, bins=hypo_edges, density=True, color="0.75", edgecolor="0.3", label="hist")
     ax[1].plot(centers, hypo_pdf, "r-", lw=1.8, label="PDF")
     ax[1].set(xlabel="Hypocentral distance (km)", ylabel="PDF", title="Hypocentral Distance PDF")
-    ax[1].legend()
+    ax[1].legend(loc="upper right")
 
     st_counts, st_edges, st_pdf, _ = hist["st_count"]
     centers = 0.5 * (st_edges[:-1] + st_edges[1:])
@@ -642,7 +642,7 @@ def plot_features(hist, args):
         f"{args.spatial_bin_km:g} km x {args.spatiotemporal_time_bin_days:g} day bin"
     )
     ax[2].set(xlabel=st_xlabel, ylabel="PDF", title="Spatiotemporal Count Distribution")
-    ax[2].legend()
+    ax[2].legend(loc="upper right")
 
     rate_x = np.asarray(st_counts, dtype=float)
     rate_y = np.asarray(hist["st_density"], dtype=float)
@@ -662,7 +662,7 @@ def plot_features(hist, args):
     )
     if np.any(valid_rate):
         ax[3].set_yscale("log")
-    ax[3].legend()
+    ax[3].legend(loc="upper right")
 
     for axis in ax:
         axis.grid(True, alpha=0.3)

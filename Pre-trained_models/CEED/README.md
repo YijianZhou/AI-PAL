@@ -1,5 +1,14 @@
 # CEED Global Pickers
 
+Step `train_picker/2.2_copy_neg_zarr_ceed.py` defaults to `NUM_WORKERS = 4`
+for parallel annual negative copying; set 1 for serial execution. Workers own
+disjoint full storage chunks/shards and only the parent updates checkpoints.
+Existing interrupted transfers resume with either worker count. `BATCH_ROWS`
+is aligned to storage chunk size; memory scales with worker count. More workers
+are not necessarily faster when disk bandwidth is saturated. Do not train or
+modify the stores during transfer. Use screen/tmux for long remote runs and
+ensure old workers have stopped before restarting after a forced parent kill.
+
 Setting a zero negative training batch does not disable negative validation.
 The mixed Zarr must still contain a nonempty negative validation set; all four
 trainers evaluate both classes and report negative accuracy at every validation.

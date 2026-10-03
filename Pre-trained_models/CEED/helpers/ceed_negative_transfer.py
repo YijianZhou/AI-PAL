@@ -3,8 +3,47 @@ import json
 from pathlib import Path
 import shutil
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 import os
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
+
+
+def _open_copy_worker(stores, relative, staged):
+    import zarr
+    global _worker_arrays, _worker_output
+    _worker_arrays = []
+    offset = 0
+    for store in stores:
+        array = zarr.open(str(Path(store) / relative), mode='r')
+        _worker_arrays.append((offset, offset + array.shape[0], array))
+        offset += array.shape[0]
+    _worker_output = zarr.open(str(staged), mode='r+')
+
+
+def _copy_chunk_range(bounds):
+    import numpy as np
+    start, end = bounds
+    parts = [array[max(start, lo) - lo:min(end, hi) - lo]
+             for lo, hi, array in _worker_arrays if lo < end and hi > start]
+    _worker_output[start:end] = parts[0] if len(parts) == 1 else np.concatenate(parts)
+    return start, end
+
+
+def _parallel_ranges(stores, relative, staged, cursor, total, step, workers):
+    # Ordered acknowledgments preserve a contiguous resume watermark. Bound
+    # in-flight tasks; workers never share a destination storage chunk/shard.
+    with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context('spawn'),
+                             initializer=_open_copy_worker,
+                             initargs=(stores, relative, staged)) as pool:
+        pending = deque()
+        for start in range(cursor, total, step):
+            pending.append(pool.submit(_copy_chunk_range, (start, min(start + step, total))))
+            if len(pending) >= 2 * workers:
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
 
 
 @contextmanager
@@ -47,7 +86,7 @@ def _save_transfer_json(path, value):
 
 
 def copy_annual_negatives(source, destination, years, models, batch_rows=128,
-                          restart_legacy=False):
+                          restart_legacy=False, num_workers=1):
     """Resume a staged annual transfer; never alter CEED positive arrays.
 
     restart_legacy is an explicit assertion that the old, non-locking copier
@@ -56,11 +95,11 @@ def copy_annual_negatives(source, destination, years, models, batch_rows=128,
     destination = Path(destination).resolve()
     with _transfer_guard(destination):
         return _copy_annual_negatives(source, destination, years, models,
-                                      batch_rows, restart_legacy)
+                                      batch_rows, restart_legacy, num_workers)
 
 
 def _copy_annual_negatives(source, destination, years, models, batch_rows,
-                           restart_legacy):
+                           restart_legacy, num_workers=1):
     """Concatenate annual negatives into an existing positive-only CEED store.
 
     Run with no concurrent readers/writers. Zarr chunks are decoded in bounded
@@ -76,6 +115,8 @@ def _copy_annual_negatives(source, destination, years, models, batch_rows,
         raise ValueError('years must be nonempty, unique, and chronological')
     if not isinstance(batch_rows, int) or batch_rows <= 0:
         raise ValueError('batch_rows must be a positive integer')
+    if isinstance(num_workers, bool) or not isinstance(num_workers, int) or num_workers < 1:
+        raise ValueError('num_workers must be a positive integer')
     if source == destination or source in destination.parents or destination in source.parents:
         raise ValueError('Source and destination must be distinct, non-nested stores')
     stores = [source / ('{}.zarr'.format(year)) for year in years]
@@ -177,15 +218,25 @@ def _copy_annual_negatives(source, destination, years, models, batch_rows,
             # Write whole storage chunks (shards for sharded Zarr). This avoids
             # decoding an incomplete chunk left by a terminated write.
             step = max(chunk_rows, batch_rows // chunk_rows * chunk_rows)
-            for start in range(cursor, totals[split], step):
-                end = min(start + step, totals[split])
-                parts = [array[max(start, lo) - lo:min(end, hi) - lo]
-                         for lo, hi, array in arrays if lo < end and hi > start]
-                output[start:end] = parts[0] if len(parts) == 1 else np.concatenate(parts)
-                state['rows'][key] = end
-                _save_transfer_json(state_path, state)
-                if start == cursor or end == totals[split] or (start // step) % 100 == 0:
-                    print('[copy] {} rows={}/{}'.format(key, end, totals[split]), flush=True)
+            print('[copy] {} workers={} rows/task={}'.format(key, num_workers, step), flush=True)
+            if num_workers > 1:
+                completed_ranges = _parallel_ranges(stores, relative, staged, cursor,
+                                                    totals[split], step, num_workers)
+            else:
+                completed_ranges = ((start, min(start + step, totals[split]))
+                                    for start in range(cursor, totals[split], step))
+            # Join workers before releasing the transfer lock, even if saving
+            # a checkpoint fails or the user interrupts the parent process.
+            with closing(completed_ranges):
+                for start, end in completed_ranges:
+                    if num_workers == 1:
+                        parts = [array[max(start, lo) - lo:min(end, hi) - lo]
+                                 for lo, hi, array in arrays if lo < end and hi > start]
+                        output[start:end] = parts[0] if len(parts) == 1 else np.concatenate(parts)
+                    state['rows'][key] = end
+                    _save_transfer_json(state_path, state)
+                    if start == cursor or end == totals[split] or (start // step) % 100 == 0:
+                        print('[copy] {} rows={}/{}'.format(key, end, totals[split]), flush=True)
             del output
         state['phase'] = 'publishing'
         _save_transfer_json(state_path, state)

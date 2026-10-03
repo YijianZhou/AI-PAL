@@ -47,6 +47,8 @@ class Config(object):
     self.vs = 3.5
     self.association_buffer_sec = 20.0
     self.association_interval_sec = 3600.0
+    self.mag_min_stations = 3  # Distinct stations with finite, positive calibrated amplitudes.
+    self.mag_max_std = 1.0  # Station-magnitude population std; failures output -1.
     self.subnet_assoc_params = {
         "default": {
             "min_sta": 4,
@@ -84,6 +86,9 @@ class Config(object):
     self.repick_min_window_vote_ratio = 0.2
     self.repick_group_min_picker_support = 2
 
+    # Final event QC after reassociation; counts retained station P/S pairs.
+    self.final_event_min_both_group_picks = 2  # Local+Global pairs per event; 0 disables.
+    self.final_event_min_quality0_picks = 2  # Quality-0 pairs per event; 0 disables.
     # Final pick quality (0 best, 3 fallback); does not reject picks.
     self.pick_quality_both_groups_code = 0  # Local and Global agree.
     self.pick_quality_strong_vote_ratio = 0.5  # Greater than or equal to this ratio.
