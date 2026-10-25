@@ -32,5 +32,6 @@ class SAR(nn.Module):
 
   def forward(self, x):
     x, _ = self.gru_layer(x)
-    if self.attention: x, _ = self.attention(query=x, key=x, value=x)  # self attention
+    if self.attention:
+        x, _ = self.attention(query=x, key=x, value=x, need_weights=False)
     return self.fc_layer(x)
