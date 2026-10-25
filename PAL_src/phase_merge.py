@@ -221,7 +221,7 @@ def write_phase_file(path, events, time_format_digits=6, catalog_path=None):
         )
         try:
             for event in sorted(events, key=lambda item: item["time"]):
-                header = "{},{:.5f},{:.5f},{:.1f},{:.2f}\n".format(
+                header = "{},{:.4f},{:.4f},{:.1f},{:.2f}\n".format(
                     format_time(event["time"], time_format_digits),
                     event["lat"], event["lon"], event["depth"], event["mag"],
                 )
@@ -488,6 +488,9 @@ def merge_phase_files(
         from overlap_duplicates import filter_final_events
         merged, num_overlap_removed = filter_final_events(
             merged, cfg, str(output_groups) + '.overlap_duplicates.csv')
+        from station_participation_qc import filter_events as participation_qc
+        merged = participation_qc(
+            merged, cfg, str(output_groups) + '.station_participation.csv')
     interval_events = []
     for event in merged:
         if event_time_start is not None and event["time"] < event_time_start:
@@ -519,7 +522,7 @@ def merge_phase_files(
     with phase_partial.open("w", encoding="utf-8") as phase_fp, \
             catalog_partial.open("w", encoding="utf-8") as catalog_fp:
         for event in merged:
-            header = "{},{:.5f},{:.5f},{:.1f},{:.2f}\n".format(
+            header = "{},{:.4f},{:.4f},{:.1f},{:.2f}\n".format(
                 format_time(event["time"], cfg.merge_time_format_digits),
                 event["lat"], event["lon"], event["depth"], event["mag"],
             )

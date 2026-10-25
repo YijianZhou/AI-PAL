@@ -804,8 +804,9 @@ def apply_gain_and_units(stream, sta_key, sta_info):
         gains = [float(item) for item in gain]
 
     for ii, tr in enumerate(stream):
-        if gains[ii] == 1.0:
+        if np.isnan(gains[ii]):
             tr.stats.gain_missing = True
+            gains[ii] = 1.0  # Keep finite waveform samples for picking only.
         if gains[ii] == 0:
             raise ValueError("zero gain for {} component {}".format(sta_key, ii))
         tr.data = tr.data.astype(np.float32, copy=False) / gains[ii]
@@ -2113,6 +2114,10 @@ def merge_phase_files(fpha_list, fpha_out, fmerge_log, origin_time_tol_sec=2.5,
         diagnostic_path = str(fmerge_log).removesuffix('.tmp') + '.overlap_duplicates.csv'
         merged_events, num_overlap_removed = filter_final_events(
             merged_events, cfg, diagnostic_path)
+        from station_participation_qc import filter_events as participation_qc
+        merged_events = participation_qc(
+            merged_events, cfg,
+            str(fmerge_log).removesuffix('.tmp') + '.station_participation.csv')
     interval_events = []
     for merged in merged_events:
         # Assign a duplicate group to exactly one disjoint final interval by
@@ -2142,7 +2147,7 @@ def merge_phase_files(fpha_list, fpha_out, fmerge_log, origin_time_tol_sec=2.5,
     with open(fpha_out, "w") as fp:
         for event in merged_events:
             fp.write(
-                "{},{:.5f},{:.5f},{:.1f},{:.2f}\n".format(
+                "{},{:.4f},{:.4f},{:.1f},{:.2f}\n".format(
                     format_time(event["time"], time_format_digits),
                     event["lat"],
                     event["lon"],
@@ -2176,7 +2181,7 @@ def merge_phase_files(fpha_list, fpha_out, fmerge_log, origin_time_tol_sec=2.5,
         fp.write("merged_event_id,num_input_events,num_sources,num_picks,time,lat,lon,depth,mag,sources\n")
         for event_id, event in enumerate(merged_events):
             fp.write(
-                "{},{},{},{},{},{:.5f},{:.5f},{:.1f},{:.2f},{}\n".format(
+                "{},{},{},{},{},{:.4f},{:.4f},{:.1f},{:.2f},{}\n".format(
                     event_id,
                     event["num_events"],
                     len(event["sources"]),

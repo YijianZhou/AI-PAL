@@ -184,16 +184,19 @@ def _load_pickers(ai_pal_root, picker_specs):
 
 
 def _group_by_device(pickers):
+    """One queue per CPU model; one shared queue per accelerator device."""
     groups = {}
     for name, picker in pickers.items():
-        groups.setdefault(str(picker.device), []).append((name, picker))
-    print("picker device groups: {}".format({
+        device = str(picker.device)
+        queue_key = "cpu:" + name if device.split(":")[0] == "cpu" else device
+        groups.setdefault(queue_key, []).append((name, picker))
+    print("picker inference queues: {}".format({
         device: [name for name, _ in members]
         for device, members in groups.items()
     }), flush=True)
     runtime_console.log(
         "startup",
-        "picker devices={}".format({
+        "picker inference queues={}".format({
             device: [name for name, _ in members]
             for device, members in groups.items()
         }),
@@ -207,17 +210,28 @@ def _run_device_group(
 ):
     results = {}
     with device_lock:
-        for name, picker in members:
-            print("picking {} with {}".format(prepared.net_sta, name))
-            with torch.inference_mode():
-                picks = picker.pick(
-                    prepared.stream,
-                    pick_start_time=start_time,
-                    pick_end_time=end_time,
-                    prepared=prepared,
-                    defer_waveform_qc=defer_waveform_qc,
-                )
-            results[name] = picks if picks else []
+        try:
+            for name, picker in members:
+                print("picking {} with {}".format(prepared.net_sta, name))
+                with torch.inference_mode():
+                    picks = picker.pick(
+                        prepared.stream,
+                        pick_start_time=start_time,
+                        pick_end_time=end_time,
+                        prepared=prepared,
+                        defer_waveform_qc=defer_waveform_qc,
+                    )
+                results[name] = picks if picks else []
+        finally:
+            # Release before the next station acquires this device's lock.
+            if members:
+                prepared.release_device(members[0][1].device)
+        # Reclaim idle cache once per successful station, not per model/batch.
+        # Keep the device lock held through completion and cache release.
+        if members and str(members[0][1].device).startswith('cuda'):
+            with torch.cuda.device(members[0][1].device):
+                torch.cuda.synchronize(members[0][1].device)
+                torch.cuda.empty_cache()
     return results
 
 
@@ -579,7 +593,7 @@ def run_offline_picker_ensemble(
     num_workers = max(1, int(num_workers))
     device_locks = {device: Lock() for device in device_groups}
     print(
-        "offline station-date workers: {} | one inference queue per device".format(
+        "offline station-date workers: {} | one inference queue per CPU model / GPU device".format(
             num_workers
         ),
         flush=True,
@@ -596,12 +610,8 @@ def run_offline_picker_ensemble(
         raise ValueError(
             "data_buffer_sec must be at least taper_max_length_sec"
         )
-    if dates and buffer_sec:
-        previous_raw_tails = _load_raw_tail_cache(
-            dates[0] - 86400, cfg, data_dir, stations, num_workers
-        )
-    else:
-        previous_raw_tails = {}
+    # None means context has not been loaded; {} is a valid empty tail cache.
+    previous_raw_tails = None
 
     if cfg.save_individual_picker_outputs:
         context = nullcontext(Path(individual_pick_root))
@@ -654,8 +664,19 @@ def run_offline_picker_ensemble(
                 not cfg.save_individual_picker_outputs
                 or individual_complete
             ) and _has_current_ownership(ensemble_path, buffer_sec, selection_signature)
+            rebuild = (
+                not complete and not overwrite and individual_complete
+                and _has_current_ownership(ensemble_path, buffer_sec, selection_signature)
+            )
+            needs_waveforms = need_retained_waveforms or not (complete or rebuild)
+            if needs_waveforms and previous_raw_tails is None:
+                previous_raw_tails = (
+                    _load_raw_tail_cache(
+                        date - 86400, cfg, data_dir, stations, num_workers
+                    ) if buffer_sec else {}
+                )
             retained_waveforms = {}
-            next_raw_tails = {}
+            next_raw_tails = None
             if complete:
                 day_summaries = [
                     _existing_pick_summary(ensemble_path)
@@ -672,19 +693,11 @@ def run_offline_picker_ensemble(
                         date, cfg, data_dir, stations, num_workers,
                         previous_raw_tails,
                     )
-                else:
-                    next_raw_tails = _load_raw_tail_cache(
-                        date, cfg, data_dir, stations, num_workers
-                    )
                 print(
                     "skip completed daily picking: {}".format(ensemble_path),
                     flush=True,
                 )
-            elif (
-                not overwrite
-                and individual_complete
-                and _has_current_ownership(ensemble_path, buffer_sec, selection_signature)
-            ):
+            elif rebuild:
                 day_summaries = [merge_picker_pick_files(
                     {name: path / filename for name, path in pick_dirs.items()},
                     ensemble_path, cfg.tp_dev, cfg.ts_dev, min_support=required,
@@ -694,10 +707,6 @@ def run_offline_picker_ensemble(
                     retained_waveforms, next_raw_tails = _prepare_day_waveforms(
                         date, cfg, data_dir, stations, num_workers,
                         previous_raw_tails,
-                    )
-                else:
-                    next_raw_tails = _load_raw_tail_cache(
-                        date, cfg, data_dir, stations, num_workers
                     )
                 print(
                     "rebuilt missing ensemble from completed picker files: {}"
@@ -748,7 +757,8 @@ def run_offline_picker_ensemble(
                     retained_waveforms,
                 )
             previous_raw_tails = next_raw_tails
-            _trim_cpu_allocator()
+            if needs_waveforms:
+                _trim_cpu_allocator()
     num_input = sum(sum(item["input_counts"].values()) for item in summaries)
     num_output = sum(item["num_merged_picks"] for item in summaries)
     print("picker ensemble: {} input picks -> {} consensus picks in {} files".format(

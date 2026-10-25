@@ -4,6 +4,7 @@ import gc
 import json
 import tempfile
 import time
+from numbers import Integral
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
@@ -220,15 +221,31 @@ def run_offline_event_postprocessing(
     data_dir, station_file,
     initial_phase_dir, final_root, time_range, num_workers=1,
     overwrite=False, day_complete_callback=None,
+    num_processes=None, _publish_outputs=True,
+    _event_cache=None, _repicker=None, _day_key=None, _resume_identity=None,
 ):
     """Repick/reassociate initial detections one event at a time."""
+    if isinstance(num_workers, bool) or not isinstance(num_workers, Integral) or num_workers < 1:
+        raise ValueError("PREPROCESSING_WORKERS (num_workers) must be a positive integer")
     runtime_console.configure(cfg)
     if not bool(getattr(cfg, "enable_post_process", False)):
-        raise ValueError(
-            "2.3 postprocessing requires enable_post_process=True"
-        )
+        raise ValueError("postprocessing requires enable_post_process=True")
     if not repicker_local_specs or not repicker_global_specs:
         raise ValueError("both event repicker groups must be selected")
+    from offline_repick_blocks import run_repick_blocks, validate_process_count
+    process_count = validate_process_count(
+        getattr(cfg, 'repick_num_processes', 4) if num_processes is None else num_processes)
+    if _event_cache is None:
+        paths = run_repick_blocks(cfg, dict(
+            ai_pal_root=ai_pal_root, repicker_local_specs=repicker_local_specs,
+            repicker_global_specs=repicker_global_specs, data_dir=data_dir,
+            station_file=station_file, initial_phase_dir=initial_phase_dir,
+            final_root=final_root, time_range=time_range, num_workers=num_workers,
+            overwrite=overwrite), process_count, day_complete_callback)
+        if _publish_outputs:
+            phase, catalog = _publish_range_outputs(paths, Path(final_root), time_range)
+            runtime_console.log('output', 'final phase | {} | catalog | {}'.format(phase, catalog))
+        return paths
     cfg.repick_num_workers = max(1, int(num_workers))
     configure_torch_backends(cfg)
 
@@ -253,12 +270,11 @@ def run_offline_event_postprocessing(
         start_date + timedelta(days=index)
         for index in range((end_date - start_date).days)
     ]
-    repicker = EventRepicker(
+    repicker = _repicker or EventRepicker(
         ai_pal_root, cfg, repicker_local_specs, station_file,
         station_dict=load_station_geometry(cfg, station_file, start_date),
         repicker_global_specs=repicker_global_specs,
     )
-    repicker.load_pickers()
     initial_phase_paths = {
         date: initial_phase_dir / "phase_{}.dat".format(date.isoformat())
         for date in target_dates
@@ -356,6 +372,9 @@ def run_offline_event_postprocessing(
                         num_done_events // PROGRESS_EVERY_EVENTS + 1
                     ) * PROGRESS_EVERY_EVENTS
                 print("skip completed postprocess day: {}".format(daily_phase))
+                if day_complete_callback is not None:
+                    day_complete_callback(current_date, daily_phase, status_path,
+                                          dict(completed_status, skipped_existing=True))
                 continue
 
             reassociated_events = []
@@ -376,59 +395,33 @@ def run_offline_event_postprocessing(
                 "num_phase_pairs_both_groups": 0,
                 "num_phase_pairs_local_only": 0,
                 "num_phase_pairs_global_only": 0,
+                "event_checkpoint_key": _day_key,
+                "resume_identity": _resume_identity,
             }
             with tempfile.TemporaryDirectory(
                 prefix="{}_".format(current_date.isoformat()),
                 dir=internal_root,
             ) as temp_dir:
                 temp_dir = Path(temp_dir)
-                work_phase = temp_dir / "event_phase.dat"
-                work_catalog = temp_dir / "event_catalog.dat"
-                for event in initial_events:
-                    repicker.write_events([event], work_phase, work_catalog)
-                    context = []
-                    try:
-                        context, _ = _load_waveform_context(
-                            repicker,
-                            [event],
-                            cfg,
-                            data_dir,
-                            stations,
-                            max(1, int(num_workers)),
-                        )
-                        summary = repicker.process_event(
-                            event["time"],
-                            work_phase,
-                            work_catalog,
-                            context,
-                            {},
-                        )
-                        event_outputs = read_phase_file(work_phase)
-                        reassociated_events.extend(event_outputs)
-                        for key in (
-                            "num_station_event_attempts",
-                            "num_repicker_phase_pairs_generated",
-                            "num_events_reassociated",
-                            "num_events_reassociation_rejected",
-                            "num_events_both_group_qc_rejected",
-                            "num_events_quality0_qc_rejected",
-                            "num_phase_pairs_both_groups",
-                            "num_phase_pairs_local_only",
-                            "num_phase_pairs_global_only",
-                        ):
-                            day_summary[key] += int(summary.get(key, 0))
-                        if bool(getattr(
-                            cfg, "enable_event_waveform_plot", False
-                        )) or bool(getattr(
-                            cfg, "save_filtered_event_waveform", getattr(cfg, "save_filtered_event_waveforms", False)
-                        )):
-                            new_snapshots = repicker.capture_event_waveforms(
-                                event_outputs, context
-                            )
-                            waveform_snapshots.extend(new_snapshots)
-                            unreleased_snapshots.extend(new_snapshots)
-                    finally:
-                        _release_context(context)
+                for event_index, event in enumerate(initial_events):
+                    from repick_checkpoints import load_checkpoint
+                    cache_path, cache_key = _event_cache[event_index]
+                    event_outputs, summary, new_snapshots = load_checkpoint(cache_path, cache_key)
+                    reassociated_events.extend(event_outputs)
+                    for key in (
+                        "num_station_event_attempts",
+                        "num_repicker_phase_pairs_generated",
+                        "num_events_reassociated",
+                        "num_events_reassociation_rejected",
+                        "num_events_both_group_qc_rejected",
+                        "num_events_quality0_qc_rejected",
+                        "num_phase_pairs_both_groups",
+                        "num_phase_pairs_local_only",
+                        "num_phase_pairs_global_only",
+                    ):
+                        day_summary[key] += int(summary.get(key, 0))
+                    waveform_snapshots.extend(new_snapshots)
+                    unreleased_snapshots.extend(new_snapshots)
 
                     num_done_events += 1
                     if num_done_events >= next_progress_event:
@@ -484,6 +477,10 @@ def run_offline_event_postprocessing(
                             waveform_summary[key] = (
                                 waveform_summary.get(key, 0) + value
                             )
+                    # Keep cached samples disk-backed even on very dense days.
+                    for snapshot in matched:
+                        for holder in snapshot['waveforms'].values():
+                            holder.release()
                 day_summary["num_event_plots"] = num_plots
                 day_summary.update(waveform_summary)
                 _release_snapshots(waveform_snapshots)
@@ -523,14 +520,16 @@ def run_offline_event_postprocessing(
             )
     finally:
         _release_snapshots(unreleased_snapshots)
-        repicker.close()
+        if _repicker is None:
+            repicker.close()
 
     _print_progress(
         num_done_events, num_all_events, progress_started, final=True
     )
 
-    output_phase, output_catalog = _publish_range_outputs(daily_phase_paths, final_root, time_range)
-    runtime_console.log("output", "final phase | {} | catalog | {}".format(output_phase, output_catalog))
+    if _publish_outputs:
+        output_phase, output_catalog = _publish_range_outputs(daily_phase_paths, final_root, time_range)
+        runtime_console.log("output", "final phase | {} | catalog | {}".format(output_phase, output_catalog))
     print(
         "daily postprocessed phase files: {}".format(len(daily_phase_paths)),
         flush=True,

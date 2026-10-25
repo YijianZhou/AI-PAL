@@ -437,7 +437,10 @@ def get_assoc_param(cfg, subnet_name, param):
     if suffix != subnet_name:
         params.update(configured.get(suffix, {}))
     if param not in params:
-        if param in ("lat_range", "lon_range"):
+        temporal_defaults = {"unique_stations": True, "ot_grid_step_sec": 0.1, "ot_grid_max_width_sec": 1.0, "ot_grid_max_points": 10}
+        if param in temporal_defaults:
+            return temporal_defaults[param]
+        if param in ("lat_range", "lon_range", "travel_time_table"):
             return None
         raise KeyError("Missing {} association parameter for {}".format(
             param, subnet_name
@@ -462,8 +465,9 @@ class ParallelSubnetAssociators(object):
                 param: get_assoc_param(cfg, subnet_name, param)
                 for param in (
                     "xy_margin", "xy_grid", "z_grids", "min_sta",
-                    "ot_dev", "max_res", "max_drop", "vp",
-                    "lat_range", "lon_range",
+                    "ot_dev", "max_res", "max_drop", "velo_mod",
+                    "lat_range", "lon_range", "unique_stations", "travel_time_table",
+                    "ot_grid_step_sec", "ot_grid_max_width_sec", "ot_grid_max_points",
                     "mag_min_stations", "mag_max_std",
                 )
             })

@@ -25,7 +25,7 @@ def _is_warning(line):
         "warning:", "error:", "[warn]", "[error]", "bad ", "false ",
         "pipeline error ", "skip repick waveform ",
         "input data too short", "filter type not supported",
-        "no event waveform files ", "stale repick status ignored ",
+        "stale repick status ignored ",
     ))
 
 

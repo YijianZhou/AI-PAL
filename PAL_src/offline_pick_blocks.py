@@ -3,6 +3,8 @@ import contextlib
 from datetime import datetime
 import importlib.util
 import multiprocessing as mp
+import os
+import math
 from pathlib import Path
 import queue
 import sys
@@ -25,8 +27,21 @@ def _worker(index, kwargs, config_path, log_path, messages):
     with open(log_path, "w", encoding="utf-8", buffering=1) as log:
         with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
             try:
+                cpu_threads = os.environ.get('AI_PAL_CPU_THREADS')
+                if cpu_threads is not None:
+                    cpu_threads = int(cpu_threads)
+                    if cpu_threads < 1:
+                        raise ValueError('AI_PAL_CPU_THREADS must be positive')
+                    import torch
+                    torch.set_num_threads(cpu_threads)
+                    torch.set_num_interop_threads(1)
+                    print('[startup] CPU intra-op threads={} | inter-op threads=1'.format(
+                        cpu_threads), file=log, flush=True)
                 cfg = load_workflow_config(config_path)
                 from offline_picker_runner import run_offline_picker_ensemble
+                import offline_picker_runner
+                from pick_diagnostics import install
+                install(offline_picker_runner)
                 def complete(day, path, summary):
                     import torch
                     memory = {}
@@ -37,7 +52,8 @@ def _worker(index, kwargs, config_path, log_path, messages):
                             "peak_reserved_MiB": round(torch.cuda.max_memory_reserved(device) / 2**20),
                         }
                     skipped = bool(summary.get("skipped_existing", False))
-                    print("GPU memory peaks (PyTorch only): {}".format(memory), flush=True)
+                    print("[memory] GPU memory peaks (PyTorch only, process lifetime) "
+                          "day={}: {}".format(day.date, memory), file=log, flush=True)
                     messages.put(("day", index, (str(day.date), skipped, memory)))
                 run_offline_picker_ensemble(cfg=cfg, day_complete_callback=complete, **kwargs)
                 messages.put(("done", index, None))
@@ -52,7 +68,10 @@ def run_offline_pick_blocks(*, ai_pal_root, config_path, picker_specs, data_dir,
                             station_file, time_range, individual_pick_root,
                             ensemble_pick_dir, log_dir, num_workers=2,
                             preprocessing_workers=4,
-                            overwrite=False):
+                            overwrite=False, progress_interval_sec=60):
+    progress_interval_sec = float(progress_interval_sec)
+    if not math.isfinite(progress_interval_sec) or progress_interval_sec <= 0:
+        raise ValueError("progress_interval_sec must be finite and positive")
     if int(num_workers) < 1 or int(preprocessing_workers) < 1:
         raise ValueError("worker counts must be positive")
     start, end = [datetime.strptime(value, "%Y%m%d").date()
@@ -110,13 +129,14 @@ def run_offline_pick_blocks(*, ai_pal_root, config_path, picker_specs, data_dir,
                     day, was_skipped, memory = payload
                     skipped += was_skipped
                     completed += not was_skipped
-                    report("worker{}:{} | GPU peaks {}".format(index, day, memory))
-                    last_report = time.monotonic()
+                    if time.monotonic() - last_report >= progress_interval_sec:
+                        report("worker{}:{} | GPU peaks {}".format(index, day, memory))
+                        last_report = time.monotonic()
                 elif kind == "done":
                     done.add(index)
                 else:
                     raise RuntimeError("AI worker {} failed: {}; see {}".format(index, payload, logs[index]))
-            if time.monotonic() - last_report >= 30:
+            if time.monotonic() - last_report >= progress_interval_sec:
                 report("active blocks={}".format(len(processes)-len(done)))
                 last_report = time.monotonic()
         for process in processes:

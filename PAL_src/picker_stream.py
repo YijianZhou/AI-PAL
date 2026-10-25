@@ -266,6 +266,14 @@ class PreparedPickerStream(object):
                 self._device_tensors[key] = tensor
         return tensor
 
+    def release_device(self, device):
+        """Drop one finished accelerator copy, preserving CPU data for peers."""
+        device = torch.device(device)
+        if device.type == "cpu":
+            return
+        with self._device_lock:
+            self._device_tensors.pop(str(device), None)
+
     def retained_waveform(self):
         """Drop device tensors and transfer stream ownership to postprocessing."""
         retained = RetainedStationWaveform.from_prepared(self)

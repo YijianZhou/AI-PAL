@@ -434,8 +434,9 @@ class EventRepicker(object):
         if params["min_sta"] <= 0:
             raise ValueError("full-network min_sta must be positive")
         supported = {
-            "xy_margin", "xy_grid", "z_grids", "vp", "ot_dev",
-            "max_res", "max_drop", "min_sta", "lat_range", "lon_range",
+            "xy_margin", "xy_grid", "z_grids", "velo_mod", "ot_dev",
+            "max_res", "max_drop", "min_sta", "lat_range", "lon_range", "unique_stations", "travel_time_table",
+            "ot_grid_step_sec", "ot_grid_max_width_sec", "ot_grid_max_points",
         }
         params = {key: value for key, value in params.items() if key in supported}
         params.update(magnitude_parameters(self.cfg))
@@ -1261,7 +1262,7 @@ class EventRepicker(object):
             ax.set_xlabel("Time relative to origin (s)")
             ax.set_ylabel("Stations ordered by epicentral distance")
             ax.set_title(
-                "{} | M {:.2f} | {:.5f}, {:.5f} | depth {:.1f} km".format(
+                "{} | M {:.2f} | {:.4f}, {:.4f} | depth {:.1f} km".format(
                     str(origin), event["mag"], event["lat"], event["lon"],
                     event["depth"],
                 )
@@ -1941,7 +1942,7 @@ class EventRepicker(object):
 
         associated = self.reassociator.associate(
             np.asarray(rows, dtype=dtype), verbose=False,
-            unique_stations=True,
+            unique_stations=self.reassociation_params.get("unique_stations", True),
         )
         if not associated:
             return []
@@ -2114,7 +2115,7 @@ class EventRepicker(object):
         )
         try:
             for event in sorted(events, key=lambda item: item["time"]):
-                header = "{},{:.5f},{:.5f},{:.1f},{:.2f}\n".format(
+                header = "{},{:.4f},{:.4f},{:.1f},{:.2f}\n".format(
                     format_time(event["time"], self.cfg.merge_time_format_digits),
                     event["lat"],
                     event["lon"],
