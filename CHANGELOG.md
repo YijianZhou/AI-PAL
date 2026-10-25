@@ -5,273 +5,153 @@ procedure are in [CHANGELOG_INTERNAL.md](CHANGELOG_INTERNAL.md).
 
 ## Unreleased
 
-- Require at least two Local+Global station P/S pairs per final AI-PAL event by default.
+- Default offline event waveform plots to off; retain explicit opt-in and
+  existing realtime defaults.
 
-- Make second-class duplicate thresholds inclusive: OT gap <= tolerance,
-  pick overlap >= threshold, and failed-pick fraction >= threshold.
+- Fix event-repick resume fingerprints changing between Python processes and
+  avoid parsing input phase files for unchanged completed days.
 
-- Training NPY cutting now resumes completed station-dates, regenerates incomplete
-  shards, and preserves randomized splits across restarts.
+- Run offline repicking with four persistent event workers by default, dynamic
+  load balancing and atomic event-level resume; retain daily merging/products
+  and station preprocessing concurrency.
 
-- Fix negative training-sample cutting for station-days with no catalog picks.
+- Default routine picking and association console progress to 60 seconds,
+  including rapid date-completion updates; preserve immediate failure reports.
 
-- 2026-10-01: PAL range exports include one integrated association-rate CSV
-  beside phase/catalog outputs, ready for training sample preparation.
+- Balance offline association dynamically across pending dates, retain worker
+  caches, report active dates, and fail promptly on unexpected worker exits.
 
-- Add configurable second-class duplicate suppression for final AI-PAL events:
-  ranked P-to-S overlap links, including descendants of discarded events, with
-  per-link diagnostic CSVs. Available in local, AWS, and realtime workflows.
+- Avoid repeating failed association searches after unrelated events are found,
+  without restricting the spatial search or changing association thresholds.
 
-- Native realtime pickers now reject waveform glitches before initial
-  association, consistent with local/AWS picking. Reference PHN-SB catalogs
-  no longer receive PAL post-association glitch filtering. Initial-QC rejection
-  bars are removed from monitoring; amplitude/magnitude measurement remains.
+- Reuse decoded station travel-time tables during association instead of
+  repeatedly loading them; add flushed search diagnostics to daily logs.
 
-- 2026-09-30: Final event repicking can prefer Global (default) or Local
-  timing using `repick_timing_preference` in the shared configuration.
+- Added optional local `0_build_travel_time_table_eg.py` preparation with
+  editable settings at the top and a shared `PAL_src` helper; no separate
+  builder configuration file is needed.
 
-### 2026-09-30: Unit-Gain Placeholder
+- Use `nan` for unavailable station gains; gain `1` now correctly permits
+  already-calibrated data to contribute to magnitude. Missing-gain stations
+  remain usable for picking. Migrate older gain-1 placeholders before rerunning.
 
-- Treat gain 1.0 as missing calibration in local/AWS PAL and AI-PAL realtime
-  processing, including legacy gain layouts. Retain waveform picking but output
-  NaN station amplitude and exclude it from magnitude calculation if a selected
-  component is uncalibrated. Existing amplitudes require reprocessing.
-- AI-PAL repick version is advanced to invalidate previous repick completion
-  records. Regression tests cover unit gain on all or one component and both
-  AI-PAL/PALM calibration implementations.
+- Association now accepts only homogeneous `velo_mod=[Vp, Vs]` or a saved
+  `travel_time_table` (.paltt). Build layered-model tables separately; runtime
+  model-file inputs and `layered_model_options` have been removed from active
+  workflows. Existing saved tables and homogeneous settings remain compatible.
 
-### 2026-09-30: PAL Magnitude QC
+- Load precomputed P/S times from one `.paltt` file using optional
+  `travel_time_table`; skip unavailable station/cell pairs safely.
 
-- Require three distinct valid station magnitude estimates and population std
-  <= 1.0, configurable with `mag_min_stations` and `mag_max_std`.
-- Replace unconditional worst-station removal with a spread check followed by
-  the median. Failed magnitude is -1 without discarding arrival picks or events;
-  missing-gain amplitudes remain NaN. Magnitude merging excludes the -1 sentinel
-  and retains other negative values. This supersedes the earlier NaN event-mag
-  convention for PAL; MFT magnitude estimation is unchanged.
-- Shared helper and parameter propagation cover local/AWS PAL and AI-PAL
-  realtime/reassociation. Repick completion checks include magnitude thresholds.
-  Tests cover the reported M6.56 case, missing amplitudes, distinct stations,
-  negative magnitudes, threshold boundaries and AI-PAL/PALM source parity.
+- Accept scalar `max_res=r` as shorthand for equal P/S residual limits `[r, r]`.
 
-- Final AI-PAL events additionally require two quality-0 station P/S pairs by
-  default (`final_event_min_quality0_picks`); zero disables this requirement.
+- PAL spatial association now checks both P and S arrivals. Configure homogeneous
+  `velo_mod=[5.9, 3.5]` (km/s) and `max_res=[res_p, res_s]` (seconds);
+  active workflow configs are migrated, retaining regional tolerances.
 
-- Final AI-PAL events now require at least one Local+Global station P/S pair
-  by default across local, AWS and realtime; the minimum is configurable.
+- Speed up PAL association with sliding-window station counts, local count
+  updates, stable pick indices, and reused per-cluster calculations. Existing
+  association settings and selection rules are preserved.
 
-- 2026-09-29: Centralized packaged inference checkpoints in
-  `Pre-trained_models`; removed verified duplicate input copies.
+- PAL now counts distinct stations by default (`unique_stations=True`) while
+  retaining alternative P-S pairs for spatial selection. Failed neighborhoods
+  yield to alternative centers; retries no longer discard their candidates.
+  Fix adaptive grid coverage and preserve internal location precision. Catalog
+  coordinates use four decimal places for lat/lon and one for depth.
 
-- CEED phase extraction now supports per-HDF5 multiprocessing and resumable
-  completed-file outputs in both the packaged and SoCal workflows.
+- Configurable final AI-PAL station-participation QC flags unusually large
+  magnitudes supported by few stations within the Local+Global pick radius.
+  Default action preserves detections but marks magnitude `nan`; removal and
+  disabled modes are available, with per-event diagnostic CSVs.
 
-- Packaged CEED retraining now matches the workdir's separate positive-Zarr
-  build (2.1) and resumable annual-negative transfer (2.2), using example paths.
-
-- CEED training-shard preparation now adds randomly scaled synthetic Gaussian
-  noise to copies after the first, following Local augmentation semantics.
-  Validation remains unaugmented by noise; existing datasets must be rebuilt.
-
-- Repicking now merges P/S pairs using distinct-window support and the shared
-  multi-picker clustering algorithm, independent of predicted arrival ranking.
-  Random windows retain the full phase buffer. Final duplicate merging matches
-  NET.STA while preserving instrument selectors and recalculating support/quality.
-
-- Added configurable negative-window training loss weighting for all four
-  pickers, with separate group-loss diagnostics and unchanged full validation.
-  Updated CEED retraining and SoCal case batch/weight recipes.
-
-- Final waveform-measured phase and QC rows retain the selected channel band
-  and location (`NET.STA.BAND.LOC`); locator readers accept these identifiers.
-
-- Repick quality 0 now also includes three strong pickers within either Local
-  or Global, configurable through `pick_quality_code0_min_pickers`.
-
-- Event reassociation now uses all QC-accepted Local and Global repicks,
-  including single-group picks. Removed the later residual-matched
-  supplementation pass; existing QC and quality codes remain unchanged.
-
-- All four picker trainers now evaluate the full negative validation set even
-  when the negative training batch is zero, including metrics and balanced
-  validation loss used for best-checkpoint selection.
-
-- Default training batches are now [128, 32] for SAR/FT and [128, 8] for
-  PHN/RUN. The dedicated CEED training recipe retains its smaller 8/4 negative batches.
-
-- Picker architecture is inferred from the name prefix (e.g. SAR_CEED -> SAR).
-  Removed redundant model keys from local/AWS/realtime picker settings.
-
-- Fixed event repicking for dataset-qualified model names such as SAR_CEED
-  and FT_CEED: architecture-specific input framing and inference are now
-  selected using the configured model type, not its display name.
-
-- Missing instrument gains no longer remove arrival-time picks. Same-band
-  location/epoch fallback is allowed; no cross-band gain borrowing. Uncalibrated
-  amplitudes are nan and excluded from event magnitude.
-
-- 2026-09-25: realtime processing skips stations with missing instrument/epoch
-  gains with a warning instead of aborting the whole segment; calibration
-  remains strict and uncalibrated picks are not published.
-
-- 2026-09-25: refreshed bundled SoCal 2020-2025 picker checkpoints and realtime
-  example copies; training batches are [128, 32] for SAR/FT and [128, 16] for PHN/RUN.
-
-- 2026-09-24: PAL amplitude QC no longer crashes on incomplete component
-  windows. Unavailable checks are recorded as `nan` and bypassed; available
-  failing checks still reject picks.
-
-- 2026-09-24: Retired the combined offline AI-PAL launcher. Local and AWS
-  inference now use stages 1 (pick), 2 (associate), and 3 (repick/reassociate).
-  Existing output paths and resume manifests are unchanged; realtime is unchanged.
-
-- AI picking batch size is configured only in the workflow config; the local
-  example defaults to 256 without a pick-only launcher override.
-
-- Local AI pick-only step 2.1 supports spawned date blocks (default 2), retaining
-  per-process preprocessing concurrency (4). All picker device defaults use GPU
-  0, with batch size 256, private configs, per-block logs and GPU peak reporting.
-
-- Move CEED-specific preprocessing/negative-transfer helpers and tests into
-  `Pre-trained_models/CEED`, keeping dataset-specific workflows out of `PAL_src`.
-
-- Clarify window-inference modules as `picker_window.py`; NPY-shard benchmark
-  runners/adapters now live in the SoCal benchmark workdir instead of the
-  source picker folders. Production repicking uses the shared window engines.
+- PAL association now searches up to ten origin times at 0.1-second spacing
+  near the cluster median, bounded by its 5th-95th percentiles. Solutions maximize
+  associated count, then minimize median absolute P residual. Temporal step,
+  maximum span, and point count are configurable per subnet (defaults: 0.1 s,
+  1.0 s, and 10 points).
 
 
-- Refresh bundled CEED inference checkpoints across local, AWS, and realtime
-  workflows. Checkpoints use `ceed_<model>_best.ckpt`; CEED picker configs use
-  `config_<model>_global_ceed.py` consistently, including optional training.
+- Faster offline picking resume: skipped days no longer reload waveform tails;
+  only the context needed by the next unfinished day is loaded.
 
-- Local picking exposes `threads_per_worker` for native numerical libraries,
-  matching the AWS control; example launchers default to 2.
+- Offline GPU picking now releases unused CUDA allocator cache after each
+  successful station/device group. This reduces idle reservation, not the
+  required peak inference memory; CPU picking and checkpoints are unchanged.
 
-- Local PAL picking now uses independent date-block processes instead of
-  station threads. Worker count controls date blocks; daily outputs and resume
-  checks are unchanged, with per-block logs and aggregate console progress.
+- Offline CPU pickers now run concurrently by model within each date-block
+  process, while GPU inference remains serialized per device.
+- Release finished GPU waveform copies without waiting for CPU pickers, and
+  avoid unused SAR attention weights. Existing checkpoints remain compatible.
+- Local AI-PAL pick-only examples now default to four date-block processes;
+  preprocessing concurrency remains four workers per process.
+- Local training defaults now use 64 negative windows for SAR/FT and 16 for
+  PHN/RUN, with negative loss weight 1.0. CEED training uses 16 and 4 respectively,
+  with negative loss weight 0.1 for every model. Positive batch size remains 128.
+  Align these defaults across active workflow, benchmark, and pretrained-model
+  config copies; existing checkpoint weights and inference settings are unchanged.
 
-- Simplified local PAL entry points to `1_run_pal_pick_eg.py` and
-  `2_run_pal_assoc_eg.py`; removed the redundant combined launcher.
+## v7.2 - Release Preparation
 
-- Local picking resumes without reading waveform tails for every skipped day;
-  previous-day context is loaded only when picking actually resumes.
+Changes since v7.1. Prepared 2026-10-03; GitHub publication/tagging is performed separately.
 
-- Fixed daily trigger-count ownership at buffered boundaries: pre-QC candidates
-  now use refined P time like accepted picks, avoiding false count failures.
+### Detection and Quality Control
 
-- Local picking retains waveforms with missing gain locations/epochs, using
-  warned same-band gain fallback or uncalibrated counts as a last resort.
+- Rename picker groups to Local and Global, identify Global models by dataset
+  (for example SAR_CEED), and support both groups in continuous detection.
+  Configure ensemble support independently for each group and for the total.
+- Repick using shared random windows and distinct-window votes, then reassociate
+  all QC-accepted Local/Global picks. Timing preference and pick quality are configurable.
+- Require at least two Local+Global pairs and two quality-0 pairs per final event
+  by default. Add ranked P-to-S overlap duplicate suppression, including linked
+  descendants, with configurable inclusive thresholds and diagnostic outputs.
+- Apply native waveform-glitch rejection before association. Keep realtime
+  reference catalogs separate from AI-PAL-specific filtering.
+- Improve calibration and PAL magnitude QC: retain arrival picks with unavailable
+  gains, exclude uncalibrated amplitudes (marked by nan gains), and
+  require at least three valid station magnitudes with standard deviation <=1.0.
+  Failed event magnitudes use -1; other negative magnitudes remain supported.
 
-- Local PAL picking now prints live day/station progress and a 30-second
-  heartbeat while retaining detailed output in a line-buffered log.
+### Training and Models
 
-- Daily PAL association now shares buffered picks across all subnets inside
-  parallel contiguous date blocks, eliminating per-subnet pick-file rereads.
+- Configure positive/negative batch sizes explicitly and weight negative-window
+  loss independently. Validate full positive and negative sets separately,
+  including negative validation when the negative training batch is zero.
+- Improve integrated/annual Zarr loading with chunk-aligned positive sampling
+  and reusable negative chunks; fix the FT validation-scheduler failure.
+- Support optional CEED retraining with local negatives and synthetic Gaussian
+  noise augmentation. Add resumable/multiprocess preparation and negative transfer,
+  plus resumable local training-sample cutting.
+- Refresh CEED and SoCal checkpoints and centralize packaged models under
+  Pre-trained_models. Keep optional CEED preparation/training with the models;
+  move case-specific benchmarking out of common production source.
 
-- PAL configs explicitly use a 30 s association buffer. Local PAL examples
-  now enable cross-day association and pick halos, with bounded per-worker
-  daily pick caching. Association resumes detect buffer-policy changes.
+### Workflows and Outputs
 
+- Unify band/location selection and epoch-aware NET.STA.BAND.LOC station/gain
+  inventories across local, AWS and realtime workflows; retain simplified inputs.
+- Improve PAL date-block parallelism, buffered association, progress reporting,
+  and resume behavior. Export integrated association rates for training handoff.
+- Simplify offline launchers and visible phase/catalog outputs; keep intermediate
+  status products under _internal.
+- Publish compact final phase rows with instrument selectors, picker vote ratios,
+  combined SNR fields, and separate detailed .picker_qc.csv companions.
+  Event waveform PNG names include origin time and coordinates.
+- Expand realtime monitoring of internal event stages, associated/repicked counts,
+  and rejection diagnostics.
 
-- Align positive training batches to each annual Zarr store's physical chunks
-  for all four pickers, avoiding unnecessary cross-chunk reads.
-- Negative training now reuses decoded Zarr chunks across minibatches, with
-  disjoint worker partitions and traversal continuing across positive epochs.
-  Positive sampling, batch ratios and validation are unchanged.
-- Separated optional CEED preparation/retraining from local picker training;
-  numbered each workflow independently and shared CEED waveform settings across
-  preparation and training. Local users can reuse the supplied Global models.
-- Renamed raw waveform cleaning control to `to_clean`, distinct from filtering;
-  legacy `to_prep` configs and reader keyword arguments remain supported.
-- Final pick quality counts votes at the configured strong-vote threshold
-  inclusively (`>=`); a ratio of exactly 0.5 now qualifies by default.
-- Default picker trigger thresholds to 0.3 across Local/Global models; move
-  final quality settings into post-processing and standardize waveform option
-  names to singular (`save_filtered_event_waveform`).
-- Aligned the SoCal realtime case wrapper with Local/Global continuous picking,
-  dataset-qualified CEED models, and current source configuration/CLI names.
-- Compact final phase rows to 13 columns: picker identities are included in
-  vote ratios, SNR components share one field, and probability spreads move
-  to the QC companion. Shared readers retain legacy-format support.
-- Fixed FT training failing after its first update because the validation
-  scheduler referenced an undefined batch-count variable.
-- Separated CEED preprocessing from case-specific SeisBench benchmark utilities;
-  the CEED fixed-window builder no longer depends on the SeisBench builder.
-- All four trainers validate the entire positive and negative splits separately,
-  select best checkpoints using class-balanced validation loss, report both
-  class losses, and always validate at the final training step.
-- Training mode now follows `batch_size` alone: `[128, 0]` trains and validates
-  using positives only. Removed the separate positive-only CLI switch;
-  converters select source classes with `--sample_types` instead.
-- The historical benchmark `train_pos/3_train_pos_pickers.py` now trains on
-  CEED positives plus imported local negatives, with reduced negative batches.
-- Annual CEED negative transfers now checkpoint and resume interrupted copies;
-  legacy interrupted transfers have an explicit, positive-preserving restart.
-- Continuous picker support now accepts `[min_local, min_global, min_total]`,
-  defaulting to `[0, 0, 1]`; all three minima must pass.
-- Global picker identities now include their training dataset, such as SAR_CEED,
-  independently of the architecture used to load each model.
-- Renamed inference picker groups to Local (formerly POS_NEG) and Global
-  (formerly POS), including config keys, global config filenames, and QC labels.
-  Historical phase/QC and timing labels remain readable; checkpoint files are
-  not renamed.
-- Continuous AI-PAL picking now combines local POS_NEG and mixed-trained CEED
-  POS SAR/PHN models. `picker_group_min_picker_support` defaults to one vote
-  across the combined ensemble; local, AWS, and realtime workflows are aligned.
-- Existing CEED positive Zarr stores can now import negatives from annual local
-  archives without rebuilding positives, using the special-purpose
-  `benchmark_picker/train_pos/2.3_copy_negatives_ceed.py` launcher.
-- Added separate local and CEED training stages; CEED training now mixes CEED positives with local negatives using explicit per-model batches. The positive-only benchmark remains unchanged.
+### Upgrade Notes
 
-- Training batches now specify `[positive, negative]` counts directly:
-  SAR/FT `[128, 32]`, PHN/RUN `[128, 16]`. Removed ratio-based negative
-  reduction; only requested negative windows are loaded. POS-only training
-  uses the first count; validation sampling remains unchanged.
-
-- Added standalone `polarity_RUN`: a residual U-Net for 2.5-second vertical
-  waveforms with [Noise, Up, Down] soft labels and strict probability > 0.5
-  decoding. Source layout follows phase RUN; training-data construction and
-  executable workflows are deferred.
-
-- POS picker trigger thresholds now default to 0.6 for SAR/FT and 0.3 for
-  PHN/RUN. SoCal AWS FT/RUN configs
-  use the current compact architectures; matching checkpoints are required.
-
-- Unified configurable band/location selection (band first by default) and
-  fullfed-derived, time-dependent `NET.STA.BAND.LOC` gain inventories across
-  local and AWS PAL, AI-PAL realtime, and PALM MFT. Simplified files remain
-  supported; routine post-merge station-file reconciliation is unnecessary.
-
-- Documented station-file formats and workflow restrictions; corrected AWS
-  inference examples to use SCEDC epoch metadata and matching example dates.
-
-- Added per-picker P/S probability histogram inspection from final QC tables,
-  with POS/POS_NEG selection, time filtering and downloadable bin counts.
-
-- Offline final-event PNGs now use `event_waveform_plot/`, distinct from
-  filtered waveform data in `event_waveforms/`; existing folders are retained.
-
-- Published AI-PAL final phases now separate detailed per-picker QC into
-  matching `.picker_qc.csv` files, including median P/S probabilities across
-  random-window votes. The phase row drops the packed picker-uncertainty field;
-  built-in readers support both old and new formats.
-
-- Unified offline initial/final range phase and catalog outputs across local
-  and AWS combined/split workflows. Offline initial results use
-  `2.1_phase_init_AI-PAL`; new intermediate files live under `_internal`.
-  Legacy resume paths remain supported; realtime numbering is unchanged.
-
-- Fixed PAL event merging that discarded valid negative magnitudes. Missing
-  magnitudes now use `nan`, not the physically valid value -1. Existing
-  affected catalogs require magnitude recalculation; they are not auto-repaired.
-
-- Added realtime preferred/reference catalog inspection: FMD, side-by-side
-  event maps, matched phase-count plots, residual-ranked one-to-one event
-  matching, and waveform copies for detections without eligible counterparts.
-  Competing assignments are reported separately rather than labeled as misses.
-  Event waveform filenames now include OT, latitude, and longitude to avoid
-  overwriting distinct co-OT detections; QC also supports legacy filenames.
+- Update workflow configs with the source; use Local/Global names and matching
+  checkpoint/config pairs. Review explicit training batches and negative-loss weights.
+- Use to_clean for raw-waveform cleaning (legacy to_prep remains supported).
+  Review custom readers for compact phase rows and separate QC companions.
+- Existing products are not repaired automatically. Reprocess affected data for
+  calibration/magnitude, event QC, or duplicate-removal changes; do not combine
+  older and newer processing policies in a comparison without a time cutoff.
+- Negative magnitude -1 is reserved for failed PAL estimates. This PAL magnitude
+  policy does not change MFT magnitude estimation.
+- Future changes are recorded above under Unreleased, relative to v7.2. The
+  source/config/documentation fingerprint is in RELEASE_BASELINE.json.
 
 ## v7.1 - Release Preparation
 
