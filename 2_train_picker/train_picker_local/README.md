@@ -13,7 +13,7 @@ The eg case is a template: replace paths and case-specific settings with your
 real data. Shared waveform/scientific controls live in config_ai_pal_eg.py;
 model architecture and training controls live in config_<model>_eg.py.
 
-SAR/FT use [128, 32] positive/negative samples per training batch; PHN/RUN use
+SAR/FT use [128, 64] positive/negative samples per training batch; PHN/RUN use
 [128, 16]. Epoch length follows positives. Validation traverses the full positive
 and negative splits independently every valid_step updates and at the final
 update; class-balanced validation loss selects best.ckpt. [128, 0] explicitly
@@ -55,3 +55,7 @@ That branch can copy negatives from a compatible integrated local Zarr.
 It has its own numbered sequence and a single shared CEED waveform config.
 Do not run launchers concurrently against one source installation: they stage
 configuration files in the shared picker source directories.
+
+PAL association accepts homogeneous `velo_mod=[Vp, Vs]` in km/s or a
+precomputed `travel_time_table` (.paltt). Build layered-model travel times
+separately; model-file paths and runtime solver options are no longer accepted.

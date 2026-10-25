@@ -68,12 +68,14 @@ PICKERS_GLOBAL = {
 
 # ============================================================================
 # USER SETTINGS: EXECUTION
-# Events are processed sequentially so all repicker models load only once.
+# NUM_WORKERS controls persistent event-queue processes (not date blocks).
+# Each process loads its models once and processes its events sequentially.
 # Workers concurrently read, merge, gain-correct, and filter station spans for
-# the current event. OVERWRITE=False resumes completed daily phase files.
+# the current event. OVERWRITE=False resumes completed events and daily files.
 # Set it True after changing repick settings or enabling a new output product.
 # ============================================================================
-NUM_WORKERS = 4
+NUM_WORKERS = 4  # Independent event processes; positive integer; each loads its own models.
+PREPROCESSING_WORKERS = 4  # Station/window preparation threads per process; positive integer.
 OVERWRITE = False
 
 
@@ -99,7 +101,8 @@ def migrate_legacy_directory(legacy, current):
         ))
 
 
-shutil.copyfile(case_path(CONFIG_AI_PAL), PAL_SRC / "config_ai_pal.py")
+if __name__ == "__main__":
+    shutil.copyfile(case_path(CONFIG_AI_PAL), PAL_SRC / "config_ai_pal.py")
 for source_path in (AI_PAL_ROOT, PAL_SRC):
     if str(source_path) not in sys.path:
         sys.path.insert(0, str(source_path))
@@ -155,7 +158,8 @@ def main():
                            else case_path(INITIAL_PHASE_DIR)),
         final_root=case_path(FINAL_ROOT),
         time_range=TIME_RANGE,
-        num_workers=NUM_WORKERS,
+        num_processes=NUM_WORKERS,
+        num_workers=PREPROCESSING_WORKERS,
         overwrite=OVERWRITE,
     )
 

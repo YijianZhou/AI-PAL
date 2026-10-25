@@ -23,7 +23,8 @@ class Config(AIPALConfig):
 
     # Training.
     self.num_epochs = 20
-    self.batch_size = [128, 32]  # [positive, negative]; positive-only mode ignores negative.
+    self.batch_size = [128, 16]  # [positive, negative] windows/batch; 0 negatives disables negative training.
+    self.negative_loss_weight = 0.1  # Nonnegative, finite multiplier; positive data points keep weight 1.
     self.learning_rate = 1e-4
     self.min_learning_rate = 1e-6
     self.warmup_steps = 10000
