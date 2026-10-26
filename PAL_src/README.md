@@ -1,5 +1,11 @@
 # PAL Source
 
+Console detail is controlled by the existing `console_verbosity` setting:
+`default` retains workflow progress and warnings but hides detailed `[assoc]`
+attempt/cache/per-call completion diagnostics; `debug` displays them; `quiet`
+retains warnings and final output/completion messages. Association results are
+unchanged. No additional logging parameter is required.
+
 Rule-based PAL picker, association, phase merging, and reusable orchestration modules.
 Executable examples live in `../1_run_pal/`. AI picker source folders are siblings
 named `picker_*`; combined AI picking and PAL association workflows live in
