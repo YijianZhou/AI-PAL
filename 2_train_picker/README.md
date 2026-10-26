@@ -1,5 +1,20 @@
 # Train Pickers
 
+Current training defaults (also aligned in active inference, benchmark, and
+pretrained-model config copies):
+
+| Training group | Models | `batch_size` | `negative_loss_weight` |
+| --- | --- | --- | --- |
+| Local | SAR, FT | `[128, 64]` | `1.0` |
+| Local | PHN, RUN | `[128, 16]` | `1.0` |
+| Global CEED | SAR, FT | `[128, 16]` | `0.1` |
+| Global CEED | PHN, RUN | `[128, 4]` | `0.1` |
+
+Batch sizes count positive/negative windows, respectively, and must be integers
+with positive > 0 and negative >= 0. The loss multiplier is dimensionless.
+These are defaults for future training, not historical checkpoint metadata;
+changing them does not retrain existing checkpoints or alter inference batching.
+
 `negative_loss_weight` (default `1.0`) scales negative-only training windows.
 Positive windows retain equal data-point weighting, including their background
 samples; Noise/P/S class weights are unchanged. For actual batch counts Bp/Bn
@@ -161,8 +176,8 @@ detection accuracy, and `<model>_training_diagnostics.png` for loss plus frame
 accuracy (SAR/FT) or sample accuracy (PHN/RUN). Both figures show full-range and
 5th-95th percentile zoom panels.
 
-Training uses `batch_size = [bs_pos, bs_neg]`: SAR/FT default to `[128, 32]`
-(160 windows per full batch), PHN/RUN to `[128, 16]` (144). The former
+Training uses `batch_size = [bs_pos, bs_neg]`: SAR/FT default to `[128, 64]`
+(192 windows per full batch), PHN/RUN to `[128, 16]` (144). The former
 `neg_reduction_ratio` setting is removed; archive class proportions do not
 determine the training mix. Update older scalar batch-size configs to a pair.
 Positive-only training uses the first entry and never reads negative samples.
@@ -422,3 +437,13 @@ canonical daily PAL outputs. The association-rate CSV contains one header and
 one row per station-date record. Waveforms are streamed directly from the SCEDC
 public S3 continuous-waveform archive by the Processing Job and are not copied
 here.
+
+PAL association (including post-repick reassociation) uses `velo_mod=[Vp, Vs]`
+(km/s) and separate `max_res=[res_p, res_s]` limits (seconds) in the subnet
+config. Both phase limits must pass for the same pair. See the
+[PAL configuration and migration guide](../PAL_src/README.md#ps-spatial-configuration).
+
+For precomputed P/S times, set the subnet association `travel_time_table`
+parameter to a single `.paltt` file available on each worker. Its saved grid
+replaces homogeneous spatial settings; the same option applies to reassociation.
+Default `None` retains the homogeneous backend.
