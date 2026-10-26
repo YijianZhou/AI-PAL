@@ -416,17 +416,8 @@ written to `output/<CASE_CODE>/1.2_picks_AI-PAL-ENSEMBLE/`. Set
 retain only the ensemble; `True` preserves indexed individual branches such as
 `1.1.1_picks_local_SAR/` and `1.1.2_picks_local_PHN/` as well.
 
-Offline local step 3 defines `NUM_WORKERS = 4` persistent event processes and
-`PREPROCESSING_WORKERS = 4` preparation threads per process in the executable.
-Both are positive integers; 1 process is serial. Events from a dense day can run
-concurrently; these are not date blocks. AWS retains its config/environment
-controls. Atomic per-event checkpoints under
-`_internal/postprocess_AI-PAL/events/` retain filtered windows until daily
-merge/plots/SAC finish, enabling resume within unfinished days. Keep these
-trusted local caches for resume. Completed legacy daily products remain reusable;
-new event/day keys also validate settings and input identities. Use overwrite
-after modifying waveform archives in place. Parent progress reports event counts
-every `progress_interval_sec` (default 60 s); range publication remains parent-only.
+Offline execution, worker settings, checkpoint safety, and resume behavior are
+documented under [Offline Runtime and Resume](#offline-runtime-and-resume).
 
 Local output uses the preferred-branch subset of the realtime numbering:
 
@@ -710,6 +701,71 @@ the cross-correlation relocation preprocessors in `4_location/2_hypodd`.
 Fixed positive-event and negative-event launchers are maintained in
 `../benchmark_picker/` because they are evaluation workflows rather than
 continuous-data processing.
+## Offline Runtime and Resume
+
+### Waveform plots and diagnostics
+
+Offline/AWS event waveform PNG plots default to `enable_event_waveform_plot = False`
+to limit disk usage. Enable the boolean explicitly when needed; AWS launchers
+use `ENABLE_EVENT_WAVEFORM_PLOT`. Realtime defaults and filtered SAC export
+settings are unchanged. Existing PNGs are not deleted. Changing the plot flag
+can invalidate previous event-repick resume signatures.
+
+Missing event waveform files are expected for inactive stations and are shown
+only with the existing `console_verbosity = "debug"` setting. Default and quiet
+console modes suppress these messages; gain fallback, malformed-channel and
+other warnings remain visible.
+
+### Event workers and checkpoints
+
+The local step-3 launcher defines `NUM_WORKERS = 4` event processes and
+`PREPROCESSING_WORKERS = 4` preparation threads per process. Both must be
+positive integers; one event worker runs serially. Regional launchers may override these values.
+Other callers, including AWS, retain `Config.repick_num_processes = 4` as
+the fallback when no explicit process count is passed. Unfinished events are dynamically
+queued, including concurrent events from the same day. Each spawned
+process loads its own selected models once and retains existing station-level
+preprocessing concurrency (`PREPROCESSING_WORKERS` in local launchers). Budget GPU/RAM
+per process; this does not distribute models across devices automatically.
+Atomic per-event checkpoints under `_internal/postprocess_AI-PAL/events/`
+preserve results and filtered windows until the daily merge/plots/SAC finish.
+Resume skips completed matching events; partial events rerun. Checkpoints are
+local trusted pickle caches: do not import them from untrusted sources.
+Keys include event contents, configuration, station/model/table file identities
+(path, size, mtime) and the repicker version. Modified waveform archives are
+not scanned: use `OVERWRITE=True` after changing waveform data in place.
+Existing completed days retain their previous version/QC resume checks; new
+daily markers also validate the full event/config key. Large cached windows
+are removed after successful daily finalization. Keep the internal folder for
+resume; final phase/catalog filenames and daily merging are unchanged.
+New daily markers also record initial phase/QC-sidecar file identities, allowing
+metadata-only skip checks. Startup reports reusable events/days and pending
+events before inference. Older partial-function fingerprints included Python
+memory addresses; their opaque mismatched keys cannot be automatically trusted.
+Invalidated daily markers are archived as `*.previous.<timestamp>.json`.
+Workers write separate logs under
+`output/<case>/_internal/postprocess_AI-PAL/logs/repick_<range>_worker<N>.log`.
+Progress reports event counts every `progress_interval_sec` (default 60 seconds).
+Only the parent publishes the complete requested range after all workers succeed.
+AWS waveform/day callbacks run in the parent; realtime repicking is unchanged.
+
+### Association scheduling
+
+Buffered offline association queues pending dates chronologically, one date per
+task, rather than assigning fixed date blocks. The existing worker setting is
+an upper limit: effective workers = min(requested workers, pending dates).
+Fully completed dates are preflight-skipped using the existing policy and
+output checks; partially completed dates recheck each subnet in the worker.
+All subnets share a date's buffered picks. Persistent processes retain their
+table and bounded pick caches, although neighboring workers may read overlapping
+pick files. No pending dates means no raw-association pool; merge/finalization
+still proceed. Progress includes active PID/date pairs and unexpected worker
+exits raise an error. Resume with unchanged settings and overwrite disabled.
+
+See [PAL runtime reporting](../1_run_pal/README.md#runtime-reporting)
+and [association performance](../PAL_src/README.md#association-performance)
+for progress controls and per-worker cache costs.
+
 ## AWS Workflow
 
 The AWS launchers submit separate picking, association, and event

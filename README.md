@@ -1,93 +1,5 @@
 # AI-PAL
 
-Offline/AWS event waveform PNG plots default to `enable_event_waveform_plot = False`
-to limit disk usage. Enable the boolean explicitly when needed; AWS launchers
-use `ENABLE_EVENT_WAVEFORM_PLOT`. Realtime defaults and filtered SAC export
-settings are unchanged. Existing PNGs are not deleted. Changing the plot flag
-can invalidate previous event-repick resume signatures.
-
-The local step-3 launcher defines `NUM_WORKERS = 4` event processes and
-`PREPROCESSING_WORKERS = 4` preparation threads per process. Both must be
-positive integers; one event worker runs serially. Cent-Cal uses 12 and 3.
-Other callers, including AWS, retain `Config.repick_num_processes = 4` as
-the fallback when no explicit process count is passed. Unfinished events are dynamically
-queued, including concurrent events from the same day. Each spawned
-process loads its own selected models once and retains existing station-level
-preprocessing concurrency (`PREPROCESSING_WORKERS` in local launchers). Budget GPU/RAM
-per process; this does not distribute models across devices automatically.
-Atomic per-event checkpoints under `_internal/postprocess_AI-PAL/events/`
-preserve results and filtered windows until the daily merge/plots/SAC finish.
-Resume skips completed matching events; partial events rerun. Checkpoints are
-local trusted pickle caches: do not import them from untrusted sources.
-Keys include event contents, configuration, station/model/table file identities
-(path, size, mtime) and the repicker version. Modified waveform archives are
-not scanned: use `OVERWRITE=True` after changing waveform data in place.
-Existing completed days retain their previous version/QC resume checks; new
-daily markers also validate the full event/config key. Large cached windows
-are removed after successful daily finalization. Keep the internal folder for
-resume; final phase/catalog filenames and daily merging are unchanged.
-New daily markers also record initial phase/QC-sidecar file identities, allowing
-metadata-only skip checks. Startup reports reusable events/days and pending
-events before inference. Older partial-function fingerprints included Python
-memory addresses; their opaque mismatched keys cannot be automatically trusted.
-Invalidated daily markers are archived as `*.previous.<timestamp>.json`.
-Workers write separate logs under
-`output/<case>/_internal/postprocess_AI-PAL/logs/repick_<range>_worker<N>.log`.
-Progress reports event counts every `progress_interval_sec` (default 60 seconds).
-Only the parent publishes the complete requested range after all workers succeed.
-AWS waveform/day callbacks run in the parent; realtime repicking is unchanged.
-
-Missing event waveform files are expected for inactive stations and are shown
-only with the existing `console_verbosity = "debug"` setting. Default and quiet
-console modes suppress these messages; gain fallback, malformed-channel and
-other warnings remain visible.
-
-Routine PAL picking and buffered association/merge/finalization reports default
-to 60 seconds, configured by `Config.progress_interval_sec` (finite positive
-seconds). Startup, failures and final summaries remain immediate. Completed
-dates no longer bypass the interval. AI offline picking retains its existing
-`progress_interval_sec` runner argument (default 60 seconds) and also throttles
-day-completion reports. Detailed per-event diagnostic files are unchanged.
-
-Buffered offline association queues pending dates chronologically, one date per
-task, rather than assigning fixed date blocks. The existing worker setting is
-an upper limit: effective workers = min(requested workers, pending dates).
-Fully completed dates are preflight-skipped using the existing policy and
-output checks; partially completed dates recheck each subnet in the worker.
-All subnets share a date's buffered picks. Persistent processes retain their
-table and bounded pick caches, although neighboring workers may read overlapping
-pick files. No pending dates means no raw-association pool; merge/finalization
-still proceed. Progress includes active PID/date pairs and unexpected worker
-exits raise an error. Resume with unchanged settings and overwrite disabled.
-
-Association also remembers failed location searches by exact ordered pick
-membership for the duration of each association call. Removing picks invalidates
-only failures containing those picks; unchanged failures are reused. Spatial
-search bounds and scientific settings are unchanged. The diagnostic
-`failure_cache_hits` counts candidate neighborhoods skipped using this cache
-(including duplicate centers), not distinct cached clusters.
-
-Saved-table association retains decoded P/S arrays on first station use and
-reuses them across searches and dates with unchanged station geometry. Each
-worker has its own cache; budget about 625 MiB for 182 stations on a 225,216-cell
-float64 P/S grid, in addition to other worker memory. The buffered runner retires
-old geometry caches per subnet. No association thresholds or config defaults
-change. Flushed daily logs include input counts, exponentially spaced attempt
-diagnostics, and a completion summary. Table-load time is cumulative for the
-current cache; location-search time includes table loading.
-
-For a new case, keep the PAL detection and local-picker training workflow.
-Global CEED retraining is optional: normally reuse the supplied
-`Pre-trained_models/CEED/CEED_ckpt` checkpoints with their matching configs.
-Optional rebuilding starts in [CEED preparation](Pre-trained_models/CEED/README.md)
-and continues in [CEED training](Pre-trained_models/CEED/README.md).
-
-See [Station File Formats](STATION_FORMATS.md) for supported schemas,
-workflow-specific restrictions, and the station filenames used by launchers.
-
-Current release preparation: **v7.2**. See the [changelog](CHANGELOG.md)
-for major changes since v7.1. Future changes are tracked against this baseline.
-
 AI-PAL is a self-supervised earthquake detection framework built around one
 central idea: use the rule-based Phase picking, Association, and Location (PAL)
 algorithm to generate locally adapted phase labels and training samples from
@@ -101,6 +13,9 @@ new postprocessing stage. The established initial detection sequence of AI
 phase picking followed by PAL association is retained. The reorganized package
 supports local workstation, AWS, and persistent realtime workflows for model
 training and continuous-data processing, followed by final event location.
+
+Current release preparation: **v7.2**. See the [changelog](CHANGELOG.md)
+for major changes since v7.1. Future changes are tracked against this baseline.
 
 ## 1. Overview
 
@@ -255,6 +170,12 @@ normalization, waveform boundaries, and execution instructions.
 
 ### 4.2 Train AI Pickers
 
+For a new case, keep the PAL detection and local-picker training workflow.
+Global CEED retraining is optional: normally reuse the supplied
+`Pre-trained_models/CEED/CEED_ckpt` checkpoints with their matching configs.
+See [CEED preparation and training](Pre-trained_models/CEED/README.md)
+for optional rebuilding instructions.
+
 Use `2_train_picker/` to:
 
 1. Analyze phase rarity and assign positive-sample augmentation.
@@ -312,6 +233,9 @@ to seed more MFT templates. See the PALM `2_run_mft/` template-source setting.
 ## 5. Core Data Contracts
 
 ### 5.1 Waveforms And Stations
+
+See [Station File Formats](STATION_FORMATS.md) for supported schemas,
+workflow-specific restrictions, and the station filenames used by launchers.
 
 Station selectors use:
 
