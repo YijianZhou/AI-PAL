@@ -5,6 +5,9 @@ procedure are in [CHANGELOG_INTERNAL.md](CHANGELOG_INTERNAL.md).
 
 ## Unreleased
 
+- Hide detailed PAL association attempt/cache counters at normal console
+  verbosity; retain them with console_verbosity="debug".
+
 - Default offline event waveform plots to off; retain explicit opt-in and
   existing realtime defaults.
 
