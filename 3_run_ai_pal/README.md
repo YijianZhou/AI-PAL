@@ -2,7 +2,21 @@
 
 ## Optional travel-time preparation
 
+To derive a model from UCVM, follow the [regional 1D model guide](../preprocess/build_1d_velo_mod/README.md).
+Provide its **step-2 output `output/eg/velocity_model_1d.json`** as
+`MODEL_FILE` in `0_build_travel_time_table_eg.py`. Copy it to the launcher's
+`input/velocity_model_1d.json` to retain the default path, or set its absolute
+path. Alternatively, use combined depth/Vp/Vs CSV or paired P/S CRE files;
+see [format settings](../PAL_src/VELOCITY_MODEL_FORMATS.md) for the required
+model-zero elevation and bottom policy. Datum reports are not model inputs.
+Step 3 (CRE export) is optional and is not required for PAL. Review the JSON's
+local-surface elevation datum before building. Runtime association consumes the
+resulting `.paltt` via `travel_time_table`, not the model JSON directly.
+
 `run_ai_pal_local/0_build_travel_time_table_eg.py` builds a layered-model
+P/S table using the bundled `input/velocity_model_1d.json` example by default.
+Replace that JSON with a suitable regional model for real processing; see the
+input-folder README for provenance. The builder prepares the
 P/S table before association. All inputs, grid/datum/solver options and execution
 flags are at the top of the script; the helper is `PAL_src/travel_time_table.py`.
 Supply the model JSON at MODEL_FILE and set the output table path in the

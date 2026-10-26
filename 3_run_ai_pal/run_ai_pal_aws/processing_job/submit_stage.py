@@ -15,6 +15,7 @@ from sagemaker.core.processing import ScriptProcessor
 from sagemaker.core.shapes import ProcessingInput, ProcessingS3Input
 
 from processing_job.job_common import prefix_has_objects, upload_tree
+from processing_job.table_staging import stage_table_config
 
 
 MODEL_NAMES = ("SAR", "FT", "PHN", "RUN")
@@ -141,7 +142,7 @@ def submit_stage(
         pal_stage.mkdir(parents=True)
         input_stage.mkdir(parents=True)
         shutil.copy2(requirements, stage / "requirements.txt")
-        shutil.copy2(shared_config, pal_stage / "config_ai_pal.py")
+        stage_table_config(shared_config, pal_stage / "config_ai_pal.py", input_stage / "travel_time_tables", "/opt/ml/processing/source/workflow/input/travel_time_tables")
         for name in PAL_SOURCE_NAMES:
             shutil.copy2(ai_pal_root / "PAL_src" / name, pal_stage / name)
         for path in station_paths:
