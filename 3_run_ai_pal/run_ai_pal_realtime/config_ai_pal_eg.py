@@ -50,27 +50,37 @@ class Config(object):
     self.vp = 5.9
     self.vs = 3.5
     self.association_buffer_sec = 20.0
+    self.progress_interval_sec = 60.0  # PAL pick/association console reports; finite positive seconds.
     self.association_interval_sec = 3600.0
     self.mag_min_stations = 3  # Distinct stations with finite, positive calibrated amplitudes.
     self.mag_max_std = 1.0  # Station-magnitude population std; failures output -1.
+    # Spatial association: velo_mod=[Vp, Vs] km/s, finite Vp > Vs > 0 (default [5.9, 3.5]).
+    # max_res=[P, S] seconds (or scalar for both): positive finite limits, both must pass strictly.
+    # Existing regional tolerances are preserved for P and initially also used for S.
     self.subnet_assoc_params = {
         "default": {
+            "travel_time_table": None,  # .paltt path takes precedence; None/numeric NaN builds from velo_mod.
+            # velo_mod: homogeneous [Vp, Vs] km/s; build layered-model tables separately.
+            "unique_stations": True,  # Count stations; retain alternative pairs for spatial search.
+            "ot_grid_step_sec": 0.1,
+            "ot_grid_max_width_sec": 1.0,  # Maximum first-to-last candidate span.
+            "ot_grid_max_points": 10,
             "min_sta": 4,
             "ot_dev": 1.2,
-            "max_res": 1.0,
+            "max_res": [1.0, 1.0],
             "max_drop": 1,
             "xy_margin": 0.1,
             "xy_grid": 0.02,
             "z_grids": np.arange(2, 25, 3),
-            "vp": 5.9,
+            "velo_mod": [5.9, 3.5],
         },
-        "full": {"min_sta": 4, "ot_dev": 1.2, "max_res": 1.0},
-        "r1": {"min_sta": 4, "ot_dev": 1.2, "max_res": 1.0},
-        "r2": {"min_sta": 4, "ot_dev": 1.2, "max_res": 1.0},
-        "r3": {"min_sta": 4, "ot_dev": 1.0, "max_res": 0.8},
-        "r4": {"min_sta": 4, "ot_dev": 1.2, "max_res": 1.0},
-        "r5": {"min_sta": 4, "ot_dev": 1.0, "max_res": 0.8},
-        "r6": {"min_sta": 4, "ot_dev": 1.5, "max_res": 1.2},
+        "full": {"min_sta": 4, "ot_dev": 1.2, "max_res": [1.0, 1.0]},
+        "r1": {"min_sta": 4, "ot_dev": 1.2, "max_res": [1.0, 1.0]},
+        "r2": {"min_sta": 4, "ot_dev": 1.2, "max_res": [1.0, 1.0]},
+        "r3": {"min_sta": 4, "ot_dev": 1.0, "max_res": [0.8, 0.8]},
+        "r4": {"min_sta": 4, "ot_dev": 1.2, "max_res": [1.0, 1.0]},
+        "r5": {"min_sta": 4, "ot_dev": 1.0, "max_res": [0.8, 0.8]},
+        "r6": {"min_sta": 4, "ot_dev": 1.5, "max_res": [1.2, 1.2]},
     }
     self.merge_origin_time_tol_sec = 2.5
     self.merge_epicenter_tol_km = 5.0
@@ -100,6 +110,9 @@ class Config(object):
     # Final event QC after reassociation; counts retained station P/S pairs.
     self.final_event_min_both_group_picks = 2  # Local+Global pairs per event; 0 disables.
     self.final_event_min_quality0_picks = 2  # Quality-0 pairs per event; 0 disables.
+    self.station_participation_qc_action = 'mark_nan'  # 'off', 'mark_nan', or 'remove'.
+    self.station_participation_qc_magnitudes = [2.0, 2.5]
+    self.station_participation_qc_ratios = [0.05, 0.10]  # Local+Global radius; linear M boundary.
     # Final pick quality (0 best, 3 fallback); does not reject picks.
     self.pick_quality_both_groups_code = 0  # Local and Global agree.
     self.pick_quality_strong_vote_ratio = 0.5  # Greater than or equal to this ratio.

@@ -1,5 +1,46 @@
 # Run AI-PAL
 
+## Optional travel-time preparation
+
+`run_ai_pal_local/0_build_travel_time_table_eg.py` builds a layered-model
+P/S table before association. All inputs, grid/datum/solver options and execution
+flags are at the top of the script; the helper is `PAL_src/travel_time_table.py`.
+Supply the model JSON at MODEL_FILE and set the output table path in the
+association config. See [PAL preparation settings](../1_run_pal/README.md#optional-layered-model-travel-time-preparation)
+for defaults, model schema and overwrite behavior. No separate builder config
+is required, and existing tables do not need rebuilding for this code change.
+
+## Station Participation Magnitude QC
+
+Final Local/Global AI-PAL publication (local, AWS, and realtime) applies
+`station_participation_qc_action = 'mark_nan'` after duplicate suppression.
+Use `'remove'` to discard flagged detections, or `'off'` to disable this QC.
+Defaults are `station_participation_qc_magnitudes = [2.0, 2.5]` and
+`station_participation_qc_ratios = [0.05, 0.10]`.
+
+The radius is the farthest associated Local+Global (`both_groups`) station.
+Within that inclusive epicentral radius, count unique associated NET.STA from
+all groups divided by unique inventory NET.STA. Stations outside the radius
+do not contribute to either count. The supplied final-stage station geometry
+defines inventory coverage, not verified live waveform availability.
+
+Flag M > 2 below 5%; from 5% to less than 10%, flag magnitudes above the linear
+boundary from (5%, M2) to (10%, M2.5). Equality to the magnitude boundary passes;
+ratios >= 10% pass. Missing magnitude, missing associated-station geometry, or
+no Local+Global picks do not trigger cleaning. Reference catalogs are unchanged.
+Default cleaning writes literal `nan` in the magnitude field of final phase
+and catalog headers, retaining picks and the event. Existing magnitude-QC
+failures still use `-1`; readers must handle both missing-value conventions.
+The merge-log companion `*.station_participation.csv` records original magnitude,
+radius, numerator/denominator, ratio, boundary, status, and action. Existing
+published files are not retroactively rewritten.
+
+Offline pick-only resume validates existing outputs without reading skipped
+days' waveforms. Previous-day raw tails are loaded lazily before the first day
+requiring waveform work (including after a skipped gap), then reused across
+consecutive processed days. Existing pick files are still counted for summaries.
+Callbacks requesting retained waveforms continue to rebuild those waveforms.
+
 ## Second-class duplicate suppression
 
 Final AI-PAL output uses an additional ranked P-to-S overlap graph after ordinary
@@ -258,9 +299,12 @@ to locally trained checkpoints with matching configs. A missing file is an error
 AWS uses the explicit mounted path `checkpoints/<MODEL>/best.ckpt`;
 its S3 checkpoint inputs must contain that exact file. Use
 `gpu_idx = -1` to run a model on CPU; nonnegative values select that CUDA
-device. In the local pick-only `1_run_ai_pal_pick_eg.py`, `NUM_WORKERS = 2`
+device. In the local pick-only `1_run_ai_pal_pick_eg.py`, `NUM_WORKERS = 4`
 controls independent spawned date-block processes; `PREPROCESSING_WORKERS = 4`
 retains concurrent station-date reading/preprocessing inside each process.
+The Central California run measured about 2228 MiB per process (about 8.7 GiB
+for four). Allow GPU memory headroom and reduce `NUM_WORKERS` when using more
+models, larger batches, or a GPU shared with other jobs.
 `picker_batch_size = 256` is defined in `config_ai_pal_eg.py` and inherited
 by the model-specific configs; the launcher does not override it. All Local and Global device defaults
 in this launcher are GPU 0; disabled picker choices are not loaded.
@@ -270,13 +314,60 @@ logic to `PAL_src/offline_picker_runner.py`.
 The local ensemble runner reads, merges, gain-corrects, and preprocesses each
 station waveform once. A `PreparedPickerStream` then caches one base tensor on
 CPU and lazily transfers exactly one copy to each distinct configured device.
-Every picker model is loaded once. Per-device locks serialize station inference
-on the same GPU while allowing CPU I/O/preprocessing to run ahead; distinct
-devices run concurrently. Models assigned to the same device run sequentially
-and reuse that device's tensor. Because a buffered daily three-channel stream
+Every picker model is loaded once. Each CPU model has its own inference queue,
+so Local and Global CPU pickers can run concurrently on shared prepared data.
+The same model is still serialized across stations. GPU models share one queue
+per device, allowing CPU I/O/preprocessing to run ahead; different queues run
+concurrently. Models assigned to the same GPU run sequentially
+and reuse that device's tensor. Finished accelerator waveform copies are released
+before the device lock is handed to another station, without waiting for CPU
+pickers. CPU data remains available until all groups finish. PyTorch may retain
+the freed memory in its reusable allocator cache; no per-station empty_cache
+call is made. SAR does not request unused attention weights; checkpoint layouts
+are unchanged, although backend floating-point roundoff can differ.
+
+For GPU memory diagnosis, run `PAL_src/tests/profile_sar_cuda_memory.py` in the
+picking environment. Its top-level settings control batch size, retained
+waveforms, and old/new attention behavior. It reports live/reserved/peak memory
+around GRU and attention, and writes a profiler trace. This synthetic two-SAR
+probe uses random weights and production dimensions, not real station data;
+run configurations in separate processes with sufficient free GPU memory.
+
+Because a buffered daily three-channel stream
 can be large, increase preprocessing concurrency with attention to host RAM. Each picker
 keeps standalone preprocessing as its default when called without a prepared
 stream.
+
+CPU model concurrency uses threads inside each date-block process, not extra
+model-loading processes. Native numerical work can overlap, but Python-heavy
+work remains subject to the GIL. Multiple CPU models and their native thread
+pools can oversubscribe the host when many date-block processes run; more
+concurrency is not a guarantee of greater throughput. Concurrent CPU inference
+also increases peak host RAM. Batch size and preprocessing concurrency are
+unchanged. Existing running jobs retain their previous scheduling behavior.
+
+Optional `AI_PAL_CPU_THREADS` sets PyTorch intra-op threads in each spawned
+worker, with inter-op threads set to one, before model execution. Unset keeps
+existing defaults. This is not a total CPU quota: concurrent CPU models can
+each execute native work. For consistent native-library limits also set
+OMP_NUM_THREADS, MKL_NUM_THREADS, and OPENBLAS_NUM_THREADS before launch.
+
+Worker logs include `[memory] GPU memory peaks` after each completed/skipped
+day, independently of console verbosity. These are process-lifetime PyTorch
+allocated/reserved peaks, not per-day peaks or total driver-reported GPU usage.
+
+For opt-in detailed worker traces set `AI_PAL_DIAGNOSTICS_DIR` to a dedicated
+output directory before launch. `AI_PAL_DIAGNOSTICS_SECONDS` defaults to 600
+seconds starting at each worker's first newly picked day, excluding initial
+skips. `AI_PAL_DIAGNOSTICS_SYNC=1` synchronizes CUDA stage boundaries for timing;
+default 0 avoids those barriers, so forward timings then measure host elapsed
+time and can underreport asynchronous GPU execution. Tracing itself adds overhead.
+JSONL files are unique per process/run and bypass console filtering. Timings
+overlap across threads and nested model stages: do not sum them as wall time.
+CUDA peaks remain process-lifetime counters, not individual stage peaks; no
+allocator reset or empty-cache call is added. These diagnostics cannot attach
+retroactively to existing workers. GPU allocations outside PyTorch require
+external process-memory sampling, ideally at comparable timestamps.
 
 The pick-only launcher assigns disjoint whole-day blocks without adding extra
 output days. Each process owns its models, CUDA context, device locks, and
@@ -287,7 +378,9 @@ Legacy directory migration occurs before spawning. AWS retains its existing
 staged execution model.
 
 Block logs are in `output/<case>/pick_logs/pick_<start>-<end>.log`. Parent
-progress reports completed/skipped days plus a 30-second heartbeat. After each
+progress reports completed/skipped days plus a 60-second heartbeat, configurable
+with `PROGRESS_INTERVAL_SEC` in the local launcher. Completion reports remain
+immediate. After each
 day, workers report PyTorch peak allocated/reserved GPU MiB; these exclude
 CUDA context and other non-PyTorch allocations, so also inspect nvidia-smi.
 An error (including CUDA OOM) fails the run and stops other workers. Restart
@@ -322,6 +415,18 @@ written to `output/<CASE_CODE>/1.2_picks_AI-PAL-ENSEMBLE/`. Set
 `save_individual_picker_outputs = False` to use temporary model branches and
 retain only the ensemble; `True` preserves indexed individual branches such as
 `1.1.1_picks_local_SAR/` and `1.1.2_picks_local_PHN/` as well.
+
+Offline local step 3 defines `NUM_WORKERS = 4` persistent event processes and
+`PREPROCESSING_WORKERS = 4` preparation threads per process in the executable.
+Both are positive integers; 1 process is serial. Events from a dense day can run
+concurrently; these are not date blocks. AWS retains its config/environment
+controls. Atomic per-event checkpoints under
+`_internal/postprocess_AI-PAL/events/` retain filtered windows until daily
+merge/plots/SAC finish, enabling resume within unfinished days. Keep these
+trusted local caches for resume. Completed legacy daily products remain reusable;
+new event/day keys also validate settings and input identities. Use overwrite
+after modifying waveform archives in place. Parent progress reports event counts
+every `progress_interval_sec` (default 60 s); range publication remains parent-only.
 
 Local output uses the preferred-branch subset of the realtime numbering:
 
@@ -822,3 +927,32 @@ per station-day. The default complete station format retains all candidate
 `NET.STA.BAND.LOC` epochs, allowing runtime fallback with the correct gains.
 Local launchers use `input/example_pal_format4.sta`; case-specific AWS/realtime
 filenames remain unchanged. See [station formats](../STATION_FORMATS.md).
+# Station-Boundary Memory Diagnostics
+
+Production offline picking now synchronizes and clears unused CUDA allocator
+cache after each successful station/device group, while holding its inference
+lock. Cleanup runs after all models on that device and waveform release, never
+between batches. CPU queues are unaffected. This reduces idle reservation but
+does not cap peak memory or guarantee a particular per-process footprint.
+With this policy, the diagnostic `station_gpu_idle` sample is already after
+production cache cleanup; the optional extra empty-cache probe is redundant.
+
+Opt-in worker traces report effective batch sizes, actual forward-input shapes,
+thread IDs, and `station_gpu_idle` memory readings after waveform release while
+the device inference lock is held. These boundaries synchronize CUDA and sample
+the current PID through nvidia-smi; diagnostic timings are therefore perturbed.
+`AI_PAL_DIAGNOSTICS_EMPTY_CACHE=1` additionally logs
+`station_after_empty_cache` to measure reclaimable cache. This is a diagnostic
+experiment, not a production memory policy. Default is off. External process
+memory minus reserved allocator memory is an approximate non-allocator residual,
+not an identification of individual CUDA libraries. Normal runs are unchanged.
+
+PAL association (including post-repick reassociation) uses `velo_mod=[Vp, Vs]`
+(km/s) and separate `max_res=[res_p, res_s]` limits (seconds) in the subnet
+config. Both phase limits must pass for the same pair. See the
+[PAL configuration and migration guide](../PAL_src/README.md#ps-spatial-configuration).
+
+For precomputed P/S times, set the subnet association `travel_time_table`
+parameter to a single `.paltt` file available on each worker. Its saved grid
+replaces homogeneous spatial settings; the same option applies to reassociation.
+Default `None` retains the homogeneous backend.

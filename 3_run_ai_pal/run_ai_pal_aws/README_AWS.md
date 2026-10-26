@@ -1,5 +1,14 @@
 # AI-PAL AWS inference
 
+Offline postprocessing defaults to four persistent event-queue processes through
+`Config.repick_num_processes` (positive integer; 1 is serial). `NUM_WORKERS`
+continues to control preprocessing threads per process. GPU/RAM requirements
+scale with the process count. Daily and waveform upload callbacks execute in
+the parent; the final requested-range outputs are assembled only after success.
+Atomic event checkpoints under `_internal/postprocess_AI-PAL/events/` support
+resume within unfinished days; keep/sync that folder to resume on a new host.
+Daily merge and final plots/SAC run after all that day's events complete.
+
 Station inputs must use the [SCEDC nine-column schema](../../STATION_FORMATS.md).
 The launchers now reuse the full station file from
 `../../1_run_pal/run_pal_aws/input/station_scedc_aws_selected_20200101_20260701_pal.csv`.
@@ -71,3 +80,7 @@ Set `picker_group_min_picker_support` (default `[0, 0, 1]`) to the minimum
 Local, Global, and total votes for their combined ensemble; all must pass.
 Pick-only jobs also require the CEED configs and centrally stored checkpoints.
 Replace historical positive-only checkpoints with the newly mixed-trained CEED models.
+
+PAL association accepts homogeneous `velo_mod=[Vp, Vs]` in km/s or a
+precomputed `travel_time_table` (.paltt). Build layered-model travel times
+separately; model-file paths and runtime solver options are no longer accepted.

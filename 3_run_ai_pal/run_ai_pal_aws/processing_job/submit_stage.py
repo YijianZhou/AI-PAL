@@ -23,7 +23,7 @@ GLOBAL_CHECKPOINTS = (
     "ceed_phn_best.ckpt", "ceed_run_best.ckpt",
 )
 PAL_SOURCE_NAMES = (
-    "associator_pal.py", "association_runner.py", "aws_inference_job.py",
+    "associator_pal.py", "travel_time_table_io.py", "association_runner.py", "aws_inference_job.py",
     "data_pipeline.py", "station_inventory.py", "data_pipeline_aws.py", "data_pipeline_ai_aws.py",
     "event_repicker.py", "offline_event_postprocessor.py",
     "offline_picker_runner.py",
