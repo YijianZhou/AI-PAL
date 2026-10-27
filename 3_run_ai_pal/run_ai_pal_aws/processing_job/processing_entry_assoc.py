@@ -64,6 +64,7 @@ def main():
                 assoc_root=offline_association_root(case_root),
                 time_range=time_range,
                 num_workers=int(os.environ.get("NUM_WORKERS", "16")),
+                association_table_dir=os.environ.get("ASSOCIATION_TABLE_DIR", "/opt/ml/processing/work/input"),
                 config_factory=config_module.Config,
                 overwrite=os.environ.get("OVERWRITE", "0") == "1",
                 output_catalog=initial_root / "catalog_{}.dat".format(time_range),

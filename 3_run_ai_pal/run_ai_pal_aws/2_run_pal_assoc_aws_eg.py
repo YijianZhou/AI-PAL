@@ -23,6 +23,7 @@ volume_size_gb = 256
 max_runtime_seconds = 432000
 num_workers = 16
 cpu_threads = 1
+ASSOCIATION_TABLE_DIR = "/opt/ml/processing/work/input"  # Nonempty writable container-local shared-table directory.
 overwrite = False
 
 
@@ -41,4 +42,5 @@ if __name__ == "__main__":
         volume_size_gb=volume_size_gb,
         max_runtime_seconds=max_runtime_seconds, num_workers=num_workers,
         model_gpu_map={}, overwrite=overwrite, cpu_threads=cpu_threads,
+        extra_env={"ASSOCIATION_TABLE_DIR": ASSOCIATION_TABLE_DIR},
     )

@@ -1,5 +1,16 @@
 # Run AI-PAL
 
+## Offline Initial Association Table Sharing
+
+Step 2's date workers share read-only float32 P/S arrays through a run-owned
+cache, prepared once per distinct geometry/grid/model. Configure
+ASSOCIATION_TABLE_DIR in the local/AWS association launcher: "./input" locally,
+"/opt/ml/processing/work/input" inside AWS. This must be a nonempty writable
+directory with sufficient disk space; no OS temporary-directory fallback is
+used. Cache cleanup occurs after workers exit. Hard termination may leave
+orphan files; never delete a cache still in use. Existing date scheduling,
+phase output, resume checks and saved .paltt inputs are unchanged.
+
 ## Optional travel-time preparation
 
 To derive a model from UCVM, follow the [regional 1D model guide](../preprocess/build_1d_velo_mod/README.md).
@@ -313,11 +324,11 @@ to locally trained checkpoints with matching configs. A missing file is an error
 AWS uses the explicit mounted path `checkpoints/<MODEL>/best.ckpt`;
 its S3 checkpoint inputs must contain that exact file. Use
 `gpu_idx = -1` to run a model on CPU; nonnegative values select that CUDA
-device. In the local pick-only `1_run_ai_pal_pick_eg.py`, `NUM_WORKERS = 4`
-controls independent spawned date-block processes; `PREPROCESSING_WORKERS = 4`
+device. In the local pick-only `1_run_ai_pal_pick_eg.py`, `PICKING_NUM_WORKERS = 4`
+controls persistent spawned pending-date workers; `PREPROCESSING_NUM_WORKERS = 4`
 retains concurrent station-date reading/preprocessing inside each process.
 The Central California run measured about 2228 MiB per process (about 8.7 GiB
-for four). Allow GPU memory headroom and reduce `NUM_WORKERS` when using more
+for four). Allow GPU memory headroom and reduce `PICKING_NUM_WORKERS` when using more
 models, larger batches, or a GPU shared with other jobs.
 `picker_batch_size = 256` is defined in `config_ai_pal_eg.py` and inherited
 by the model-specific configs; the launcher does not override it. All Local and Global device defaults
@@ -383,18 +394,20 @@ allocator reset or empty-cache call is added. These diagnostics cannot attach
 retroactively to existing workers. GPU allocations outside PyTorch require
 external process-memory sampling, ideally at comparable timestamps.
 
-The pick-only launcher assigns disjoint whole-day blocks without adding extra
-output days. Each process owns its models, CUDA context, device locks, and
+The pick-only launcher checks completion/ownership metadata first, then queues
+sorted unfinished dates dynamically. Workers pull another date when done;
+the process count is capped by pending dates. An all-complete resume starts no
+model workers. Each process owns its models, CUDA context, device locks, and
 waveform cache; same-GPU inference can overlap between processes. Only boundary
 waveform context is duplicated, not daily output files. Configs are loaded
 privately in each process without copying over installed source configs.
 Legacy directory migration occurs before spawning. AWS retains its existing
 staged execution model.
 
-Block logs are in `output/<case>/pick_logs/pick_<start>-<end>.log`. Parent
+Worker logs are in `output/<case>/pick_logs/pick_<range>_worker<N>.log`. Parent
 progress reports completed/skipped days plus a 60-second heartbeat, configurable
-with `PROGRESS_INTERVAL_SEC` in the local launcher. Completion reports remain
-immediate. After each
+with `PROGRESS_INTERVAL_SEC` in the local launcher. Heartbeats show active worker
+dates instead of active blocks; final completion is immediate. After each
 day, workers report PyTorch peak allocated/reserved GPU MiB; these exclude
 CUDA context and other non-PyTorch allocations, so also inspect nvidia-smi.
 An error (including CUDA OOM) fails the run and stops other workers. Restart
@@ -403,12 +416,12 @@ remain subject to the existing resume signature checks. Changing GPU mappings
 changes picker specs and may invalidate older outputs. Use a separate output
 root for performance/memory comparisons.
 
-Within each process, offline dates are processed sequentially. Before the first requested date, the
-runner reads only the preceding day's final `2 * data_buffer_sec` raw tail. For
-each subsequent date it reads that date once, caches its final raw tail, and
-prepends the prior cached tail before preprocessing. Thus every station is
-processed with a 24-hour plus `2 * data_buffer_sec` stream without repeatedly
-opening both adjacent daily files. Here "raw" means merged, gain-corrected
+Each worker processes one date at a time. Before its first date, or after a
+nonconsecutive assignment, it reads the preceding day's final
+`2 * data_buffer_sec` raw tail. For consecutive assignments it reuses its cached
+tail. The current date is read once and prepended with the appropriate tail;
+no tail from another date is reused. Dynamic scheduling therefore adds some
+short neighboring-day reads, not full extra days. Here "raw" means merged, gain-corrected
 waveform data before picker detrending, tapering, and filtering.
 
 The file named for date `D` owns picks in the half-open interval
@@ -692,7 +705,7 @@ needed files from both date folders are read and merged before gain correction
 and shared preprocessing. A `taper_max_length_sec` halo is included on both
 sides of each requested span and removed after filtering.
 Set `enable_post_process = True` before running this dedicated postprocessing
-stage. The outer loop is over all initial events, while `NUM_WORKERS` controls
+stage. The outer loop is over all initial events, while `POSTPROCESS_NUM_WORKERS` controls
 concurrent waveform I/O and preprocessing for stations required by the current
 event. Repicker models are loaded once and reused for the full event
 sequence. With `OVERWRITE = False`, completed daily phase files are resumed;
@@ -732,15 +745,41 @@ other warnings remain visible.
 
 ### Event workers and checkpoints
 
-The local step-3 launcher defines `NUM_WORKERS = 4` event processes and
-`PREPROCESSING_WORKERS = 4` preparation threads per process. Both must be
-positive integers; one event worker runs serially. Regional launchers may override these values.
-Other callers, including AWS, retain `Config.repick_num_processes = 4` as
-the fallback when no explicit process count is passed. Unfinished events are dynamically
-queued, including concurrent events from the same day. Each spawned
+Executable worker controls use stage-specific `XXX_NUM_WORKERS` names when
+there is more than one control. `PREPROCESSING_WORKERS` is now
+`PREPROCESSING_NUM_WORKERS`; the former generic `NUM_WORKERS` is
+`PICKING_NUM_WORKERS` in local pick-only launchers, `POSTPROCESS_NUM_WORKERS`
+in offline postprocessing, and `PREPROCESSING_NUM_WORKERS` in realtime.
+`ASSOCIATION_NUM_WORKERS` is unchanged. Update custom launcher overrides to
+these names; values, internal `num_workers`/`preprocessing_workers` API arguments,
+CLI flags and AWS environment contracts are unchanged. Single-control scripts
+may retain `NUM_WORKERS`; native-library thread limits are separate settings.
+
+The local step-3 launcher defines `POSTPROCESS_NUM_WORKERS = 4` event processes and
+`PREPROCESSING_NUM_WORKERS = 4` preparation threads per process. Both must be
+positive integers; one outer worker retains one model set. Its CPU reassociation
+concurrency is controlled separately. Regional launchers may override these values.
+AWS exposes `POSTPROCESS_NUM_WORKERS = 4`; other API callers retain
+`Config.repick_num_processes = 4` when no explicit process count is passed.
+Pending events are ordered by date in a shared queue; each free worker takes
+the next same-day batch, without fixed event/date ownership.
+Each spawned
 process loads its own selected models once and retains existing station-level
-preprocessing concurrency (`PREPROCESSING_WORKERS` in local launchers). Budget GPU/RAM
+preprocessing concurrency (`PREPROCESSING_NUM_WORKERS` in local launchers). Budget GPU/RAM
 per process; this does not distribute models across devices automatically.
+Each executable also sets `ASSOCIATION_NUM_WORKERS = 4`, a positive integer
+CPU reassociation process count **per model-owning worker**, not a shared total.
+Thus 4 model workers can use 16 CPU reassociation workers. Within each worker,
+repicking is serial (retaining threaded preparation and GPU batching); CPU
+reassociation overlaps subsequent repicking. At most `ASSOCIATION_NUM_WORKERS`
+events are in flight per worker, with batches stopping at day boundaries.
+When the pending queue is short, batches shrink to leave work for idle workers.
+Setting it to 1 disables the inner pool. CPU workers receive pick arrays and
+station geometry, not GPU models or waveform data. Each retains one travel-time
+table. Event timing includes pipeline waiting and must not be summed as wall time.
+The queue contains only pending events on resume; completed per-event checkpoints
+remain reusable when only worker counts or scheduling change. Faster workers
+can take more events instead of waiting for a slower fixed partition.
 Atomic per-event checkpoints under `_internal/postprocess_AI-PAL/events/`
 preserve results and filtered windows until the daily merge/plots/SAC finish.
 Resume skips completed matching events; partial events rerun. Checkpoints are
@@ -810,6 +849,89 @@ target range. The association stage writes daily merged initial phases. The
 postprocessing stage is epoch-aware and can optionally publish filtered SAC
 event waveforms for the cross-correlation relocation workflow.
 ## Realtime Workflow
+
+### Realtime Initial Association CPU Workers
+
+The realtime executable sets `ASSOCIATION_NUM_WORKERS = 4`, a positive integer
+CPU-process budget shared by initial AI-PAL/reference PAL association across
+all subnets and post-repick event reassociation. `1` runs both serially.
+This is separate from `PREPROCESSING_NUM_WORKERS` (station preparation), GPU assignments,
+and reference GaMMA's own `ncpu`. The CLI forwards it as
+`--association_num_workers`; it does not belong in the scientific config.
+
+PAL uses the same `PS_Pair_Assoc` algorithm as offline/AWS workflows. Realtime
+splits sorted station-origin-time picks only at gaps >= `ot_dev`: no strict
+origin neighborhood can cross such a gap. Each connected cluster runs the
+unchanged greedy association, including its pick removal and failure cache.
+Overlapping event candidates are NOT independently parallelized. Output event
+sets/picks are preserved; raw event order across independent clusters can differ.
+One dense connected cluster cannot use multiple processes internally.
+
+A bounded, persistent spawn pool is shared across subnet coordinators. Independent
+clusters from different subnets may run concurrently. Each station/parameter
+configuration's P/S tables are published once as read-only memory-mapped arrays;
+parent engines and workers use the same backing files, not private table copies.
+Switching networks or segments does not rebuild them. Cache identity includes
+station geometry, association parameters, and saved-table file size/mtime.
+Full-network reassociation uses the same store; each offline outer process owns
+its own store shared with its CPU children. Serial mode is unchanged.
+With six subnets and one full network, unchanged configurations need seven table
+sets per realtime run, not seven sets per worker or per segment.
+
+P/S table storage uses float32, halving the uncompressed table payload and dense
+shared-cache size (the measured SoCal configuration: about 20.84 to 10.42 GiB).
+Other process memory is not halved. Restart to generate a new cache; do not remove
+cache files used by a running process. Existing float64 `.paltt` inputs are
+converted when loaded by PAL, not rewritten; newly built archives store float32.
+Grid coordinates and absolute-time precision are unchanged.
+
+Backing files use `ASSOCIATION_TABLE_DIR = "./input"`, exposed near the top of
+realtime/local/AWS postprocessing executables. It must be a nonempty writable
+directory path; relative paths resolve from the launch working directory
+(inside the job container for AWS). Each pool creates a unique
+`input/ai_pal_assoc_*/` subdirectory. There is no OS-temp fallback and TMPDIR/TEMP
+do not control this cache. Choose a filesystem with enough space for all dense
+P/S grids. Publication checks available space, writes and syncs the complete file
+using normal checked I/O, and only then opens a read-only mapping. Space/quota
+failures report the directory and required bytes instead of writing through a
+potentially unbacked mapping. The free-space check is advisory; actual write
+failures are also caught and incomplete files are removed.
+Fatal-signal tracebacks are enabled in realtime and association workers.
+Startup recovery is visible at default verbosity through `[recovery]` stage
+messages and `[progress]` counters for waveform stations, repick event-station
+jobs, and collected reassociation event results. Counters show processed units,
+including units with no usable data/picks; they do not count accepted detections.
+Updates use the existing positive finite `progress_interval_sec` (default
+60 seconds), checked at station/chunk/result boundaries, plus stage start/end.
+A single long operation can delay the next update; this is not a background
+heartbeat. Quiet mode hides these messages. Normal continuous-picking station
+counters are unchanged. `[ready]` follows startup recovery and final merging.
+Do not truncate or remove backing files while the run is alive.
+Avoid NAS for performance. Saved `.paltt` grids are
+expanded once on publication, including unavailable cells, rather than lazily
+expanded in each worker. Files are removed after workers stop on normal shutdown;
+a force-killed run can leave an `ai_pal_assoc_*` directory (remove only after its
+processes have exited). Memory-mapped pages are shared by the OS; summed process
+RSS can double-count them. Association workspace remains private per worker.
+Table construction messages appear only at `console_verbosity = "debug"`
+(or `AI_PAL_CONSOLE_VERBOSITY=debug`), not default/quiet.
+More workers are not automatically faster. First-use startup/table loading is
+included in association timing. Per-subnet timing now includes queue wait and
+is not pure CPU time. Results include `association_num_workers` and
+`independent_clusters` (0 in serial mode) in the per-subnet timing records.
+
+Post-repick reassociation uses the same CPU pool, one initial event's repicks
+per task, with full-network PAL parameters. There are at most min(worker budget,
+available tasks) busy workers; idle processes remain reusable, and other queued
+tasks can use them. No dependent cluster is artificially split. GPU inference
+and threaded random-window preparation remain unchanged. Parent-process final
+amplitude/SNR measurement, QC, deduplication and publication are retained.
+`PAL reassoc.` reports this stage separately in monitoring.
+
+Offline/AWS initial association uses date tasks. Offline postprocessing uses
+a shared pending-event queue with models retained per outer process and a CPU
+reassociation pool per worker, as described under Event workers and checkpoints.
+GaMMA and training are unchanged.
 
 For preferred/reference FMD, event maps, phase-count histograms, and
 unmatched-event waveform inspection, see the

@@ -31,6 +31,7 @@ CONFIG_AI_PAL = Path("config_ai_pal_%s.py" % CASE_CODE)
 # USER SETTINGS: EXECUTION
 # ============================================================================
 NUM_WORKERS = 3
+ASSOCIATION_TABLE_DIR = "./input"  # Nonempty writable shared-table directory; relative to launch directory.
 OVERWRITE = False
 
 
@@ -99,6 +100,7 @@ def main():
         assoc_root=work_root,
         time_range=TIME_RANGE,
         num_workers=NUM_WORKERS,
+        association_table_dir=ASSOCIATION_TABLE_DIR,
         config_factory=cfg.Config,
         overwrite=OVERWRITE,
         output_catalog=out_root / "catalog_{}.dat".format(TIME_RANGE),

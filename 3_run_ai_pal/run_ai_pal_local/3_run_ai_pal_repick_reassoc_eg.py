@@ -68,14 +68,16 @@ PICKERS_GLOBAL = {
 
 # ============================================================================
 # USER SETTINGS: EXECUTION
-# NUM_WORKERS controls persistent event-queue processes (not date blocks).
-# Each process loads its models once and processes its events sequentially.
+# POSTPROCESS_NUM_WORKERS controls persistent workers pulling shared pending-event batches.
+# Each process loads its models once and repicks serially; CPU reassociation overlaps.
 # Workers concurrently read, merge, gain-correct, and filter station spans for
 # the current event. OVERWRITE=False resumes completed events and daily files.
 # Set it True after changing repick settings or enabling a new output product.
 # ============================================================================
-NUM_WORKERS = 4  # Independent event processes; positive integer; each loads its own models.
-PREPROCESSING_WORKERS = 4  # Station/window preparation threads per process; positive integer.
+POSTPROCESS_NUM_WORKERS = 4  # Independent event processes; positive integer; each loads its own models.
+ASSOCIATION_NUM_WORKERS = 4  # Positive integer CPU processes PER model worker; 1 = serial reassociation.
+ASSOCIATION_TABLE_DIR = "./input"  # Nonempty writable directory for shared P/S tables; relative to launch directory.
+PREPROCESSING_NUM_WORKERS = 4  # Station/window preparation threads per process; positive integer.
 OVERWRITE = False
 
 
@@ -114,6 +116,8 @@ from association_runner import offline_association_root
 
 def main():
     workflow_cfg = cfg.Config()
+    workflow_cfg.association_num_workers = ASSOCIATION_NUM_WORKERS
+    workflow_cfg.association_table_dir = ASSOCIATION_TABLE_DIR
     migrate_legacy_directory(
         RESULT_ROOT / "phase_ENSEMBLE_PAL",
         RESULT_ROOT / "2.1_phase_init_AI-PAL",
@@ -158,8 +162,8 @@ def main():
                            else case_path(INITIAL_PHASE_DIR)),
         final_root=case_path(FINAL_ROOT),
         time_range=TIME_RANGE,
-        num_processes=NUM_WORKERS,
-        num_workers=PREPROCESSING_WORKERS,
+        num_processes=POSTPROCESS_NUM_WORKERS,
+        num_workers=PREPROCESSING_NUM_WORKERS,
         overwrite=OVERWRITE,
     )
 

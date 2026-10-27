@@ -102,7 +102,9 @@ ASSOCIATORS_REF = {
 }  # Reference PAL uses the PAL parameters in CONFIG_AI_PAL.
 
 # Number of stations prepared concurrently. Inference is serialized per device.
-NUM_WORKERS = 5
+PREPROCESSING_NUM_WORKERS = 5
+ASSOCIATION_NUM_WORKERS = 4  # Positive integer CPU budget shared by initial PAL and event reassociation; 1 = serial.
+ASSOCIATION_TABLE_DIR = "./input"  # Nonempty writable directory for shared P/S tables; relative to launch directory.
 
 
 # ============================================================================
@@ -243,7 +245,9 @@ command = [
     "--in_dir={}".format(IN_DIR),
     "--in_glob={}".format(IN_GLOB),
     "--out_root={}".format(OUT_ROOT),
-    "--num_workers={}".format(NUM_WORKERS),
+    "--num_workers={}".format(PREPROCESSING_NUM_WORKERS),
+    "--association_num_workers={}".format(ASSOCIATION_NUM_WORKERS),
+    "--association_table_dir={}".format(ASSOCIATION_TABLE_DIR),
     "--native_pickers_json={}".format(json.dumps(native_runtime)),
     "--reference_pickers_json={}".format(json.dumps(reference_runtime)),
     "--reference_associators_json={}".format(json.dumps(reference_associators)),

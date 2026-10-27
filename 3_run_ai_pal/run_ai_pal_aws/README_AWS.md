@@ -26,8 +26,12 @@ only in the staged config, including AI-PAL reassociation. Missing tables fail
 before submission. Use literal path strings (relative to the workflow folder
 or absolute), or `None`; no computed expressions. Local configs are untouched.
 
-Offline postprocessing defaults to four persistent event-queue processes through
-`Config.repick_num_processes` (positive integer; 1 is serial). `NUM_WORKERS`
+Offline postprocessing defaults to `POSTPROCESS_NUM_WORKERS = 4` model-owning
+processes, each pulling same-day batches from a shared pending-event queue with its own
+`ASSOCIATION_NUM_WORKERS = 4` CPU reassociation pool (up to 16 total). Both
+settings are positive integers in step 3; association workers=1 disables the
+inner pool. Repicking is serial per model worker with at most that many events
+in flight; batches stop at day boundaries. `PREPROCESSING_NUM_WORKERS`
 continues to control preprocessing threads per process. GPU/RAM requirements
 scale with the process count. Daily and waveform upload callbacks execute in
 the parent; the final requested-range outputs are assembled only after success.

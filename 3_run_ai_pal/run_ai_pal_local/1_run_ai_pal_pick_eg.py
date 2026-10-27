@@ -12,9 +12,9 @@ CASE_CODE = "eg"  # Packaged example; drives configs, checkpoints, picks, and ph
 DATA_DIR = Path("/data/Example_data")
 FULL_STATION_FILE = Path("input/example_pal_format4.sta")
 TIME_RANGE = "20190704-20190707"  # Nominal dates; end date is exclusive.
-NUM_WORKERS = 4  # Independent date-block processes; each loads its own models.
+PICKING_NUM_WORKERS = 4  # Positive integer pending-date workers; each loads its models once.
 PROGRESS_INTERVAL_SEC = 60  # Positive seconds between routine reports; startup/final remain immediate.
-PREPROCESSING_WORKERS = 4  # Existing station I/O/preprocessing concurrency per process.
+PREPROCESSING_NUM_WORKERS = 4  # Existing station I/O/preprocessing concurrency per process.
 OVERWRITE_PICKS = False  # False resumes complete days and reruns incomplete days.
 # Config paths are derived from CASE_CODE; picker selection is in config.
 CONFIG_AI_PAL = Path("config_ai_pal_%s.py" % CASE_CODE)
@@ -123,8 +123,8 @@ def main():
         time_range=TIME_RANGE,
         individual_pick_root=case_path(PICK_ROOT),
         ensemble_pick_dir=case_path(ENSEMBLE_PICK_DIR),
-        num_workers=NUM_WORKERS,
-        preprocessing_workers=PREPROCESSING_WORKERS,
+        num_workers=PICKING_NUM_WORKERS,
+        preprocessing_workers=PREPROCESSING_NUM_WORKERS,
         progress_interval_sec=PROGRESS_INTERVAL_SEC,
         log_dir=case_path(PICK_ROOT / "pick_logs"),
         overwrite=OVERWRITE_PICKS,

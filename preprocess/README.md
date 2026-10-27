@@ -1,6 +1,7 @@
-# Preparing Continuous Waveforms for AI-PAL
+# Preparing Inputs for AI-PAL
 
-This folder contains only continuous-waveform and station-file preparation.
+This folder contains continuous-waveform, station-file, and optional regional
+velocity-model preparation.
 CEED models and optional preparation/training are described in
 [the consolidated CEED README](../Pre-trained_models/CEED/README.md).
 
@@ -14,6 +15,14 @@ paths are resolved from this directory, so the workflow also works when a script
 is launched from elsewhere.
 
 ## Requirements
+
+The waveform/station steps below are independent of the optional
+[1D velocity-model workflow](build_1d_velo_mod/README.md). That workflow uses
+UCVM plus NumPy/Matplotlib and config_eg.json to build a layered model.
+Its step-2 output, `build_1d_velo_mod/output/eg/velocity_model_1d.json`, is the
+`MODEL_FILE` input for `0_build_travel_time_table_eg.py` in the PAL or AI-PAL
+local workflow. CSV and paired CRE are also supported by that builder with
+explicit datum/bottom settings; see [input formats](../PAL_src/VELOCITY_MODEL_FORMATS.md).
 
 - Python 3
 - ObsPy

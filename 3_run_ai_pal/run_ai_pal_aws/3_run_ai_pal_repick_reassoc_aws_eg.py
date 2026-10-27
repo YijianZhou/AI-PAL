@@ -28,7 +28,10 @@ instance_type = "ml.g4dn.12xlarge"
 instance_count = 1
 volume_size_gb = 1024
 max_runtime_seconds = 432000
-num_workers = 12
+PREPROCESSING_NUM_WORKERS = 12  # Station/window preparation threads per model process.
+POSTPROCESS_NUM_WORKERS = 4  # Model-owning workers pulling pending batches; positive integer.
+ASSOCIATION_NUM_WORKERS = 4  # CPU reassociation processes per model worker; positive integer.
+ASSOCIATION_TABLE_DIR = "./input"  # Writable directory INSIDE the job container for shared P/S tables.
 cpu_threads = 1
 overwrite = False
 
@@ -46,10 +49,13 @@ if __name__ == "__main__":
         include_models=True,
         instance_type=instance_type, instance_count=instance_count,
         volume_size_gb=volume_size_gb,
-        max_runtime_seconds=max_runtime_seconds, num_workers=num_workers,
+        max_runtime_seconds=max_runtime_seconds, num_workers=PREPROCESSING_NUM_WORKERS,
         model_gpu_map=MODEL_GPU_MAP, overwrite=overwrite,
         cpu_threads=cpu_threads,
         extra_env={
+            "POSTPROCESS_NUM_WORKERS": str(POSTPROCESS_NUM_WORKERS),
+            "ASSOCIATION_NUM_WORKERS": str(ASSOCIATION_NUM_WORKERS),
+            "ASSOCIATION_TABLE_DIR": str(ASSOCIATION_TABLE_DIR),
             "SAVE_FILTERED_EVENT_WAVEFORMS": (
                 "1" if SAVE_FILTERED_EVENT_WAVEFORMS else "0"
             ),

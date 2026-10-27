@@ -41,6 +41,8 @@ def main():
         ),
     )
     cfg = config_module.Config()
+    cfg.association_num_workers = int(os.environ.get("ASSOCIATION_NUM_WORKERS", "4"))
+    cfg.association_table_dir = os.environ.get("ASSOCIATION_TABLE_DIR", "./input")
     cfg.enable_event_waveform_plot = (
         os.environ.get("ENABLE_EVENT_WAVEFORM_PLOT", "0") == "1"
     )
@@ -101,6 +103,7 @@ def main():
             final_root=final_root,
             time_range=time_range,
             num_workers=int(os.environ.get("NUM_WORKERS", "12")),
+            num_processes=int(os.environ.get("POSTPROCESS_NUM_WORKERS", "4")),
             overwrite=os.environ.get("OVERWRITE", "0") == "1",
             day_complete_callback=day_complete,
         )
