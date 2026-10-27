@@ -1,4 +1,4 @@
-"""Dynamic event repicking; daily merging and range publication remain ordered."""
+"""Shared pending-event queue with bounded CPU reassociation pipelines."""
 import contextlib
 from functools import partial
 from collections import deque
@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 from repick_checkpoints import (digest, file_identity, valid_checkpoint,
                                 save_checkpoint, release_checkpoint_waveforms)
+from offline_timing import write_event_timing
 
 
 def validate_process_count(value):
@@ -56,7 +57,7 @@ def _input_identity(path):
 def _run_key(cfg, kwargs):
     ignored = {'repick_num_processes', 'repick_num_workers', 'progress_interval_sec',
                'out_root', 'event_waveform_complete_callback', 'console_verbosity',
-               '_repick_resume_run_key'}
+               '_repick_resume_run_key', 'association_num_workers', 'association_table_dir'}
     settings = {k: v for k, v in vars(cfg).items() if k not in ignored}
     return digest({'schema': 1, 'config': _fingerprint_value(settings),
                    'local': _fingerprint_value(kwargs['repicker_local_specs']),
@@ -65,10 +66,68 @@ def _run_key(cfg, kwargs):
                    'data_dir': str(Path(kwargs['data_dir']).resolve())})
 
 
+def _process_event_batch(post, repicker, events, payloads, cfg, kwargs, stations):
+    """Retain at most one small batch of waveform contexts; checkpoint each event."""
+    with contextlib.ExitStack() as stack:
+        pending = []
+        for initial_path, event_index, root, key in payloads:
+            event_started = time.perf_counter()
+            timing = {}
+            event = events[event_index]
+            Path(root).mkdir(parents=True, exist_ok=True)
+            tmp = stack.enter_context(post.tempfile.TemporaryDirectory(dir=root))
+            phase, catalog = Path(tmp) / 'event.dat', Path(tmp) / 'catalog.dat'
+            repicker.write_events([event], phase, catalog)
+            context, _ = post._load_waveform_context(
+                repicker, [event], cfg, kwargs['data_dir'], stations, cfg.repick_num_workers, timing)
+            stack.callback(post._release_context, context)
+            steps = repicker._process_hour_steps(event['time'], event['time'], phase,
+                                                 catalog, context, {})
+            stack.callback(steps.close)
+            try:
+                next(steps)  # Serial repicking; queues CPU reassociation before yielding.
+                summary = None
+            except StopIteration as done:
+                summary = done.value
+            pending.append((steps, summary, phase, context, root, key, timing, event_started, event))
+        for steps, summary, phase, context, root, key, timing, event_started, event in pending:
+            if summary is None:
+                try:
+                    next(steps)
+                    raise RuntimeError('Unexpected extra repicking continuation')
+                except StopIteration as done:
+                    summary = done.value
+            outputs = post.read_phase_file(phase)
+            snapshots = []
+            try:
+                snapshot_started = time.perf_counter()
+                if (getattr(cfg, 'enable_event_waveform_plot', False) or
+                        getattr(cfg, 'save_filtered_event_waveform', False)):
+                    snapshots = repicker.capture_event_waveforms(outputs, context)
+                timing['checkpoint_snapshot_sec'] = time.perf_counter() - snapshot_started
+                checkpoint_started = time.perf_counter()
+                save_checkpoint(root, key, outputs, summary, snapshots)
+                timing['checkpoint_write_sec'] = time.perf_counter() - checkpoint_started
+                timing['event_wall_sec'] = time.perf_counter() - event_started
+                timing['origin_time'] = str(event['time'])
+                for name, value in summary.items():
+                    if name.endswith('_sec') and isinstance(value, (int, float)):
+                        timing['repick_' + name] = value
+                for name, value in summary.get('picker_seconds', {}).items():
+                    timing['picker_' + name + '_sec'] = value
+                write_event_timing(root, key, timing)
+            finally:
+                post._release_snapshots(snapshots)
+
+
 def _worker(index, state, kwargs, log_path, tasks, messages):
+    worker_started = time.perf_counter()
+    model_setup_sec = 0.0
+    geometry_sec = 0.0
     with open(log_path, 'w', encoding='utf-8', buffering=1) as log:
         with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
             repicker = None
+            association_pool = None
             try:
                 import runtime_console
                 runtime_console._ORIGINAL_STDOUT = log
@@ -77,6 +136,11 @@ def _worker(index, state, kwargs, log_path, tasks, messages):
                 cfg = SimpleNamespace(**state)
                 cfg.out_root = str(kwargs['final_root'])
                 cfg.repick_num_workers = max(1, int(kwargs['num_workers']))
+                from realtime_association_pool import RealtimeAssociationPool, validate_workers
+                association_workers = validate_workers(getattr(cfg, 'association_num_workers', 4))
+                if association_workers > 1:
+                    association_pool = RealtimeAssociationPool(
+                        association_workers, getattr(cfg, 'association_table_dir', './input'))
                 if cfg.event_waveform_complete_callback:
                     cfg.event_waveform_complete_callback = lambda *args: messages.put(('waveform', index, args))
                 else:
@@ -92,49 +156,39 @@ def _worker(index, state, kwargs, log_path, tasks, messages):
                     kind, day, payload = task
                     changed_day = day != current_day
                     if changed_day:
+                        geometry_started = time.perf_counter()
                         geometry = post.load_station_geometry(cfg, kwargs['station_file'], day)
+                        geometry_sec += time.perf_counter() - geometry_started
                         initial_events = None
                         current_day = day
                     if repicker is None:
+                        model_started = time.perf_counter()
                         repicker = post.EventRepicker(
                             kwargs['ai_pal_root'], cfg, kwargs['repicker_local_specs'],
                             kwargs['station_file'], station_dict=geometry,
                             repicker_global_specs=kwargs['repicker_global_specs'])
+                        model_setup_sec += time.perf_counter() - model_started
                     elif changed_day:
                         repicker.set_station_geometry(geometry)
+                    repicker.association_pool = association_pool
                     print('[repick] worker={} task={} date={}'.format(index, kind, day), flush=True)
-                    if kind == 'event':
-                        initial_path, event_index, root, key = payload
+                    if kind in ('event', 'events'):
+                        payloads = [payload] if kind == 'event' else payload
                         if initial_events is None:
-                            initial_events = post.read_phase_file(initial_path)
-                        event = initial_events[event_index]
+                            initial_events = post.read_phase_file(payloads[0][0])
                         if not loaded:
+                            model_started = time.perf_counter()
                             repicker.load_pickers()
+                            model_setup_sec += time.perf_counter() - model_started
                             loaded = True
+                            print('[timing] worker={} model_setup_sec={:.3f}'.format(
+                                index, model_setup_sec), flush=True)
                         stations = dict(geometry)
                         for selector, metadata in geometry.items():
                             stations.setdefault('.'.join(selector.split('.')[:2]), metadata)
-                        context, snapshots = [], []
-                        try:
-                            Path(root).mkdir(parents=True, exist_ok=True)
-                            with post.tempfile.TemporaryDirectory(dir=root) as tmp:
-                                phase = Path(tmp) / 'event.dat'
-                                catalog = Path(tmp) / 'catalog.dat'
-                                repicker.write_events([event], phase, catalog)
-                                context, _ = post._load_waveform_context(
-                                    repicker, [event], cfg, kwargs['data_dir'], stations,
-                                    cfg.repick_num_workers)
-                                summary = repicker.process_event(event['time'], phase, catalog, context, {})
-                                events = post.read_phase_file(phase)
-                                if (getattr(cfg, 'enable_event_waveform_plot', False) or
-                                    getattr(cfg, 'save_filtered_event_waveform',
-                                            getattr(cfg, 'save_filtered_event_waveforms', False))):
-                                    snapshots = repicker.capture_event_waveforms(events, context)
-                                save_checkpoint(root, key, events, summary, snapshots)
-                        finally:
-                            post._release_context(context)
-                            post._release_snapshots(snapshots)
-                        messages.put(('event', index, day))
+                        _process_event_batch(post, repicker, initial_events, payloads,
+                                             cfg, kwargs, stations)
+                        messages.put(('events', index, (day, len(payloads))))
                     else:
                         cache, day_key = payload
                         span = day.strftime('%Y%m%d') + '-' + (day + timedelta(days=1)).strftime('%Y%m%d')
@@ -155,6 +209,14 @@ def _worker(index, state, kwargs, log_path, tasks, messages):
             finally:
                 if repicker is not None:
                     repicker.close()
+                if association_pool is not None:
+                    association_pool.close()
+                Path(log_path).with_suffix('.timing.json').write_text(json.dumps(dict(
+                    worker=index, model_setup_sec=model_setup_sec,
+                    station_geometry_sec=geometry_sec,
+                    worker_lifetime_wall_sec=time.perf_counter() - worker_started,
+                    note='Worker lifetime includes queue waiting, finalization and shutdown; not additive across workers.',
+                ), indent=2), encoding='utf-8')
 
 
 def _plan(cfg, kwargs):
@@ -229,7 +291,7 @@ def _plan(cfg, kwargs):
 
 def _dispatch(plans, tasks, state, kwargs, count, interval, callback, waveform_callback,
               skipped, total, worker_target=_worker):
-    """Keep only one outstanding task per worker; prioritize ready daily merges."""
+    """Assign same-day batches dynamically; daily merges wait for all events."""
     ready = deque(('finalize', day, (plan['cache'], plan['key']))
                   for day, plan in plans.items() if not plan['done'] and not plan['pending'])
     count = min(count, len(tasks) + len(ready))
@@ -238,7 +300,10 @@ def _dispatch(plans, tasks, state, kwargs, count, interval, callback, waveform_c
     logs = Path(kwargs['final_root']).parent / '_internal' / 'postprocess_AI-PAL' / 'logs'
     logs.mkdir(parents=True, exist_ok=True)
     context = mp.get_context('spawn')
-    messages, jobs = context.Queue(), context.Queue()
+    messages = context.Queue()
+    jobs = [context.Queue() for _ in range(count)]
+    batch_size = validate_process_count(state.get('association_num_workers', 4))
+    busy = set()
     processes, outstanding = [], 0
     completed = 0
     started = last_report = time.monotonic()
@@ -249,28 +314,49 @@ def _dispatch(plans, tasks, state, kwargs, count, interval, callback, waveform_c
     try:
         for index in range(1, count+1):
             log = logs / ('repick_{}_worker{}.log'.format(kwargs['time_range'], index))
-            process = context.Process(target=worker_target, args=(index, state, kwargs, str(log), jobs, messages))
+            process = context.Process(target=worker_target, args=(index, state, kwargs, str(log), jobs[index-1], messages))
             process.start()
             processes.append(process)
-            print('AI repick worker {} | event queue | log {}'.format(index, log), flush=True)
+            print('AI repick worker {} | shared pending-event queue | reassociation workers={} | log {}'.format(
+                index, batch_size, log), flush=True)
         while tasks or ready or outstanding:
-            while outstanding < count and (ready or tasks):
-                jobs.put(ready.popleft() if ready else tasks.popleft())
+            for slot in range(count):
+                if slot + 1 in busy:
+                    continue
+                if ready:
+                    task = ready.popleft()
+                elif tasks:
+                    # Reserve work for other idle workers when the queue is short.
+                    idle = count - len(busy)
+                    limit = min(batch_size, (len(tasks) + idle - 1) // idle)
+                    _, day, payload = tasks.popleft()
+                    batch = [payload]
+                    while (len(batch) < limit and tasks
+                           and tasks[0][1] == day):
+                        batch.append(tasks.popleft()[2])
+                    task = ('events', day, batch)
+                else:
+                    continue
+                jobs[slot].put(task)
+                busy.add(slot + 1)
                 outstanding += 1
             try:
                 kind, index, payload = messages.get(timeout=.5)
             except queue.Empty:
                 pass
             else:
-                if kind == 'event':
-                    completed += 1
+                if kind in ('event', 'events'):
+                    day, finished = (payload, 1) if kind == 'event' else payload
+                    completed += finished
                     outstanding -= 1
-                    plan = plans[payload]
-                    plan['pending'] -= 1
+                    busy.remove(index)
+                    plan = plans[day]
+                    plan['pending'] -= finished
                     if not plan['pending']:
-                        ready.append(('finalize', payload, (plan['cache'], plan['key'])))
+                        ready.append(('finalize', day, (plan['cache'], plan['key'])))
                 elif kind == 'finalized':
                     outstanding -= 1
+                    busy.remove(index)
                     plans[payload]['done'] = True
                 elif kind == 'waveform':
                     waveform_callback(*payload)
@@ -286,8 +372,8 @@ def _dispatch(plans, tasks, state, kwargs, count, interval, callback, waveform_c
             if time.monotonic()-last_report >= interval:
                 report()
                 last_report = time.monotonic()
-        for _ in processes:
-            jobs.put(None)
+        for channel in jobs:
+            channel.put(None)
         for process in processes:
             process.join()
             if process.exitcode:
@@ -299,14 +385,17 @@ def _dispatch(plans, tasks, state, kwargs, count, interval, callback, waveform_c
                 process.terminate()
         for process in processes:
             process.join()
-        jobs.cancel_join_thread()
-        jobs.close()
+        for channel in jobs:
+            channel.cancel_join_thread()
+            channel.close()
         messages.close()
 
 
 def run_repick_blocks(cfg, kwargs, num_processes, day_complete_callback=None):
-    """Compatibility entry point: scheduling is now event-based, not block-based."""
+    """Dynamically queue pending events in bounded repick/reassociation batches."""
     count = validate_process_count(num_processes)
+    from realtime_association_pool import validate_workers
+    cfg.association_num_workers = validate_workers(getattr(cfg, 'association_num_workers', 4))
     interval = float(getattr(cfg, 'progress_interval_sec', 60))
     if not 0 < interval < float('inf'):
         raise ValueError('progress_interval_sec must be finite and positive')

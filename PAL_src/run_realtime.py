@@ -32,6 +32,7 @@ import runtime_console
 from reference_association import reference_workflows, run_gamma, require_gamma_runtime
 from picker_stream import configure_torch_backends
 from station_sets import build_station_union
+from realtime_association_pool import RealtimeAssociationPool, validate_workers
 # Load PAL under a unique module name without changing global import precedence.
 _ASSOCIATOR_PATH = os.path.join(PAL_DIR, "associator_pal.py")
 _assoc_spec = importlib.util.spec_from_file_location(
@@ -62,6 +63,8 @@ def parse_args():
     parser.add_argument("--in_glob", type=str, default="*.ms")
     parser.add_argument("--out_root", type=str, required=True)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--association_num_workers", type=int, default=4)
+    parser.add_argument("--association_table_dir", default="./input")
     parser.add_argument("--native_pickers_json", type=str, required=True)
     parser.add_argument("--reference_pickers_json", type=str, required=True)
     parser.add_argument("--reference_associators_json", type=str, default="{}")
@@ -128,6 +131,8 @@ def apply_overrides(cfg, args):
     cfg.in_dir = args.in_dir
     cfg.in_glob = args.in_glob
     cfg.num_workers = args.num_workers
+    cfg.association_num_workers = validate_workers(getattr(args, 'association_num_workers', 4))
+    cfg.association_table_dir = getattr(args, 'association_table_dir', './input')
     cfg.out_monitoring_dir = os.path.join(cfg.out_root, "monitoring")
     legacy_monitoring_dir = os.path.join(cfg.out_root, "timing")
     if (
@@ -456,6 +461,8 @@ class ParallelSubnetAssociators(object):
         self.station_dicts = {}
         self.pick_sta_dict = {}
         self.startup_timing = {}
+        self.association_num_workers = validate_workers(getattr(cfg, 'association_num_workers', 4))
+        self.process_pool = None
         self.full_station_dict = rtp.get_realtime_sta_dict(cfg.full_sta_file)
         specifications = {}
         for subnet_name, fsta in cfg.association_station_files.items():
@@ -472,7 +479,7 @@ class ParallelSubnetAssociators(object):
                 )
             })
         self.executor = ThreadPoolExecutor(
-            max_workers=max(1, len(specifications)),
+            max_workers=(1 if self.association_num_workers == 1 else max(1, len(specifications))),
             thread_name_prefix="PAL-subnet",
         )
         futures = {
@@ -501,8 +508,14 @@ class ParallelSubnetAssociators(object):
         print("parallel time-table wall time: {:.2f}s".format(
             self.time_table_wall_sec
         ))
-        print("initialized {} threaded association network(s)".format(
-            len(self.associators)
+        self.specifications = specifications
+        if self.association_num_workers > 1:
+            self.process_pool = RealtimeAssociationPool(
+                self.association_num_workers, getattr(cfg, 'association_table_dir', './input'))
+            for subnet_name, (stations, params) in specifications.items():
+                self.process_pool.register(stations, params, self.associators[subnet_name])
+        print("initialized {} association network(s) | CPU processes={}".format(
+            len(self.associators), self.association_num_workers
         ))
 
     @staticmethod
@@ -513,11 +526,11 @@ class ParallelSubnetAssociators(object):
 
     def assert_healthy(self):
         if self.closed:
-            raise RuntimeError("PAL association thread pool is closed")
+            raise RuntimeError("PAL association pool is closed")
 
     def health_summary(self):
         return ";".join(
-            "{}:thread:ready".format(name)
+            "{}:coordinator:ready".format(name)
             for name in sorted(self.associators)
         )
 
@@ -526,24 +539,34 @@ class ParallelSubnetAssociators(object):
         subnet_picks = picks[[pick["net_sta"] in sta_dict for pick in picks]]
         num_subnet_picks = len(subnet_picks)
         started = time.perf_counter()
+        num_clusters = 0
         try:
             with open(os.devnull, "w") as out_ctlg, open(pha_path, "w") as out_pha:
-                self.associators[subnet_name].associate(
-                    subnet_picks, out_ctlg, out_pha
-                )
+                engine = self.associators[subnet_name]
+                if self.process_pool is None:
+                    engine.associate(subnet_picks, out_ctlg, out_pha)
+                else:
+                    _, params = self.specifications[subnet_name]
+                    locations, selected, num_clusters = self.process_pool.associate(
+                        subnet_name, sta_dict, params, subnet_picks,
+                    )
+                    for location, rows in zip(locations, selected):
+                        engine.write_catalog(location, out_ctlg)
+                        engine.write_phase(location, rows, out_pha)
             num_prob_filled = rtp.enrich_phase_probabilities(
                 pha_path, subnet_picks
             )
         finally:
             del subnet_picks
-            # Association grids are allocated in this persistent worker
-            # thread, so trim from the same worker after every task.
+            # Release coordinator/serial-association temporary allocations.
             rtp.trim_cpu_allocator()
         return {
             "type": "associated",
             "subnet": subnet_name,
             "assoc_sec": time.perf_counter() - started,
             "num_picks": num_subnet_picks,
+            "association_num_workers": self.association_num_workers,
+            "independent_clusters": num_clusters,
             "num_prob_filled": num_prob_filled,
             "pha_path": pha_path,
         }
@@ -575,8 +598,12 @@ class ParallelSubnetAssociators(object):
         if not self.closed:
             self.closed = True
             self.executor.shutdown(wait=True, cancel_futures=True)
+            if self.process_pool is not None:
+                self.process_pool.close()
 
 if __name__ == "__main__":
+    import faulthandler
+    faulthandler.enable(all_threads=True)
     cfg, args = parse_args()
     cfg = apply_overrides(cfg, args)
     runtime_console.configure(cfg)
@@ -687,6 +714,8 @@ if __name__ == "__main__":
             },
         )
         event_repicker.load_pickers()
+        # One shared CPU budget, not a second nested pool or extra GPU models.
+        event_repicker.association_pool = subnet_associators.process_pool
         print(
             "dual repicker groups preloaded before waveform ingest | RSS {:.1f} MB"
             .format(rtp.release_transient_memory()),
@@ -708,7 +737,7 @@ if __name__ == "__main__":
             branch_cfg, event_repick_coordinator.completed_phase_paths
         )
         print(
-            "startup segment repick supplement for {}: {} original segments"
+            "[recovery] startup segment repick supplement for {}: {} original segments"
             .format(branch_name, len(pending_repick)),
             flush=True,
         )
@@ -716,7 +745,7 @@ if __name__ == "__main__":
             rtp.segment_code(path): path
             for path in glob.glob(os.path.join(cfg.in_dir, cfg.in_glob))
         }
-        for result in pending_repick:
+        for recovery_index, result in enumerate(pending_repick, 1):
             segment = result["segment"]
             mseed_path = input_by_segment.get(segment)
             if mseed_path is None:
@@ -728,7 +757,8 @@ if __name__ == "__main__":
                 continue
             event_repick_coordinator.begin_segment(segment)
             print(
-                "startup segment repick preprocessing {}".format(mseed_path),
+                "[recovery] segment {}/{} preprocessing {}".format(
+                    recovery_index, len(pending_repick), mseed_path),
                 flush=True,
             )
             try:
@@ -755,11 +785,13 @@ if __name__ == "__main__":
             event_repick_coordinator.process_segment_result(
                 branch_name, segment, result["phase_path"]
             )
+            runtime_console.log('recovery', 'segment {}/{} complete: {}'.format(
+                recovery_index, len(pending_repick), segment))
         event_repick_coordinator.release_segment_cache(
             "after startup segment repicking"
         )
         print(
-            "startup final merge for repicked {}".format(branch_name),
+            "[recovery] startup final merge for repicked {}".format(branch_name),
             flush=True,
         )
         try:

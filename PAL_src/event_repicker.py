@@ -26,6 +26,7 @@ from obspy import Stream, UTCDateTime
 from obspy.core.util.attribdict import AttribDict
 
 import associator_pal
+import runtime_console
 from continuous_pickers import picker_architecture
 from phase_merge import (
     format_time, group_events, read_phase_file, resolve_pick_provenance,
@@ -637,6 +638,18 @@ class EventRepicker(object):
         self, interval_start, interval_end, phase_path, catalog_path,
         waveform_context, association_summary,
     ):
+        steps = self._process_hour_steps(interval_start, interval_end, phase_path,
+                                         catalog_path, waveform_context, association_summary)
+        try:
+            while True:
+                next(steps)
+        except StopIteration as done:
+            return done.value
+
+    def _process_hour_steps(
+        self, interval_start, interval_end, phase_path, catalog_path,
+        waveform_context, association_summary,
+    ):
         started = time.perf_counter()
         events = read_phase_file(phase_path)
         if not events:
@@ -721,12 +734,18 @@ class EventRepicker(object):
             int(self.cfg.repick_batch_size) * 4
             // int(self.cfg.repick_num_repeat),
         )
+        report_progress = association_summary.get('segment_local_waveforms', False)
+        progress_interval = getattr(self.cfg, 'progress_interval_sec', 60.0)
+        repick_progress = runtime_console.Progress(
+            '{} repick event-station jobs'.format(Path(phase_path).stem),
+            len(candidates), progress_interval, enabled=report_progress)
         for chunk_start in range(0, len(candidates), chunk_size):
             candidate_chunk = candidates[chunk_start:chunk_start + chunk_size]
             prepare_started = time.perf_counter()
             prepared_jobs = self._prepare_job_chunk(candidate_chunk)
             window_prepare_sec += time.perf_counter() - prepare_started
             if not prepared_jobs:
+                repick_progress.update(min(chunk_start + chunk_size, len(candidates)))
                 continue
             windows, owners, window_starts = self._flatten_prepared_jobs(
                 prepared_jobs
@@ -775,6 +794,7 @@ class EventRepicker(object):
                 num_generated += len(results)
                 event["picks"].extend(results)
             result_merge_sec += time.perf_counter() - merge_started
+            repick_progress.update(min(chunk_start + chunk_size, len(candidates)))
 
         raw_provenance_counts = {key: 0 for key in ('both_groups', 'local_only', 'global_only')}
         for event in events:
@@ -783,10 +803,16 @@ class EventRepicker(object):
                 if provenance in raw_provenance_counts:
                     raw_provenance_counts[provenance] += 1
         reassociation_started = time.perf_counter()
+        reassoc_progress = runtime_console.Progress(
+            '{} reassociation events'.format(Path(phase_path).stem),
+            len(events), progress_interval, enabled=report_progress)
+        reassociation_results = self._queue_reassociation_events(events)
+        # Offline workers can prepare another event while its CPU task runs.
+        yield None
         waveform_qc_measurement_sec = 0.0
         reassociated_events = []
-        for event in events:
-            reassociated = self._reassociate_event(event)
+        for completed, (event, reassociated) in enumerate(reassociation_results, 1):
+            reassoc_progress.update(completed)
             if not reassociated:
                 num_events_reassociation_rejected += 1
                 num_picks_reassociation_rejected += len(event["picks"])
@@ -1897,6 +1923,36 @@ class EventRepicker(object):
 
     def _reassociate_event(self, event):
         """Associate all QC-accepted repicks; retain only PAL-selected pairs."""
+        original_picks, rows = self._reassociation_input(event)
+        if len(rows) == 0:
+            return []
+        associated = self.reassociator.associate(
+            rows, verbose=False,
+            unique_stations=self.reassociation_params.get("unique_stations", True),
+        )
+        return self._reassociation_output(event, original_picks, associated)
+
+    def _reassociate_events(self, events):
+        return self._queue_reassociation_events(events)
+
+    def _queue_reassociation_events(self, events):
+        pool = getattr(self, 'association_pool', None)
+        if pool is None:
+            return ((event, self._reassociate_event(event)) for event in events)
+        pool.register(self.stations, self.reassociation_params, self.reassociator)
+        pending = []
+        for event in events:
+            original_picks, rows = self._reassociation_input(event)
+            future = pool.submit_event(self.stations, self.reassociation_params, rows) if len(rows) else None
+            pending.append((event, original_picks, future))
+        def collect():
+            for event, original_picks, future in pending:
+                associated = future.result() if future is not None else None
+                # Reconnect worker-selected indices to original parent pick objects.
+                yield event, self._reassociation_output(event, original_picks, associated)
+        return collect()
+
+    def _reassociation_input(self, event):
         repicked_picks = []
         for pick in event["picks"]:
             station = self._station_geometry_key(pick["sta"])
@@ -1938,12 +1994,10 @@ class EventRepicker(object):
         if len({row[0] for row in rows}) < int(
             self.reassociation_params["min_sta"]
         ):
-            return []
+            rows = []
+        return original_picks, np.asarray(rows, dtype=dtype)
 
-        associated = self.reassociator.associate(
-            np.asarray(rows, dtype=dtype), verbose=False,
-            unique_stations=self.reassociation_params.get("unique_stations", True),
-        )
+    def _reassociation_output(self, event, original_picks, associated):
         if not associated:
             return []
         event_locations, event_pick_sets = associated

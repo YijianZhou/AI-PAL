@@ -553,6 +553,42 @@ def _write_ownership(ensemble_path, buffer_sec, selection_signature=None):
     partial.replace(path)
 
 
+def _selection_signature(cfg, picker_specs):
+    from pick_ensemble import validate_picker_support
+    required = validate_picker_support(cfg.picker_group_min_picker_support, picker_specs)
+    return required, json.dumps({
+        "specs": picker_specs, "min_support": required,
+        "tp_dev": cfg.tp_dev, "ts_dev": cfg.ts_dev,
+    }, sort_keys=True, default=str)
+
+
+def _individual_pick_dirs(picker_specs, root):
+    return {name: Path(root) / "1.1.{}_picks_{}_{}".format(
+        index, spec.get("group", "Local").lower(),
+        spec.get("identity", spec.get("model", name)))
+        for index, (name, spec) in enumerate(picker_specs.items(), 1)}
+
+
+def pending_pick_dates(cfg, picker_specs, time_range, individual_pick_root,
+                       ensemble_pick_dir, overwrite=False):
+    """Check output metadata only; never read waveforms or pick rows."""
+    _, signature = _selection_signature(cfg, picker_specs)
+    directories = _individual_pick_dirs(picker_specs, individual_pick_root)
+    pending, skipped = [], 0
+    for date in _date_list(time_range):
+        filename = '{}.pick'.format(date.date)
+        ensemble = Path(ensemble_pick_dir) / filename
+        complete = (not overwrite and ensemble.is_file() and
+                    (not cfg.save_individual_picker_outputs or
+                     all((path / filename).is_file() for path in directories.values())) and
+                    _has_current_ownership(ensemble, cfg.data_buffer_sec, signature))
+        if complete:
+            skipped += 1
+        else:
+            pending.append(str(date.date))
+    return pending, skipped
+
+
 def run_offline_picker_ensemble(
     ai_pal_root, cfg, picker_specs, data_dir, station_file, time_range,
     individual_pick_root, ensemble_pick_dir, num_workers=1,
@@ -560,6 +596,7 @@ def run_offline_picker_ensemble(
     day_waveforms_complete_callback=None,
     pickers_loaded_callback=None,
     overwrite=False,
+    _date_tasks=None,
 ):
     """Run configured native pickers and write individual/ensemble daily picks."""
     runtime_console.configure(cfg)
@@ -569,12 +606,7 @@ def run_offline_picker_ensemble(
     )
     if any(spec.get("group", "Local") not in ("Local", "Global") for spec in picker_specs.values()):
         raise ValueError("unsupported continuous picker group")
-    from pick_ensemble import validate_picker_support
-    required = validate_picker_support(cfg.picker_group_min_picker_support, picker_specs)
-    selection_signature = json.dumps({
-        "specs": picker_specs, "min_support": required,
-        "tp_dev": cfg.tp_dev, "ts_dev": cfg.ts_dev,
-    }, sort_keys=True, default=str)
+    required, selection_signature = _selection_signature(cfg, picker_specs)
     dates = _date_list(time_range)
     runtime_console.log(
         "AI-PAL",
@@ -598,7 +630,7 @@ def run_offline_picker_ensemble(
         ),
         flush=True,
     )
-    stations = _load_station_selectors(cfg, station_file, dates)
+    stations = _load_station_selectors(cfg, station_file, dates) if _date_tasks is None else {}
     print("full station file: {} | {} selectors".format(
         station_file, len(stations)
     ))
@@ -647,7 +679,13 @@ def run_offline_picker_ensemble(
             day_waveforms_complete_callback is not None
             and bool(getattr(cfg, "enable_post_process", False))
         )
-        for index, date in enumerate(dates, start=1):
+        previous_date = None
+        assigned_dates = dates if _date_tasks is None else (UTCDateTime(value) for value in _date_tasks)
+        for index, date in enumerate(assigned_dates, start=1):
+            if previous_date is None or date - previous_date != 86400:
+                previous_raw_tails = None
+            if _date_tasks is not None:
+                stations = _load_station_selectors(cfg, station_file, [date - 86400, date])
             filename = "{}.pick".format(date.date)
             ensemble_path = Path(ensemble_pick_dir) / filename
             runtime_console.log(
@@ -757,6 +795,7 @@ def run_offline_picker_ensemble(
                     retained_waveforms,
                 )
             previous_raw_tails = next_raw_tails
+            previous_date = date
             if needs_waveforms:
                 _trim_cpu_allocator()
     num_input = sum(sum(item["input_counts"].values()) for item in summaries)

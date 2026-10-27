@@ -547,21 +547,26 @@ def prepare_realtime_segment_waveforms(mseed_path, sta_dict, cfg):
 
     waveforms = {}
     started = time.perf_counter()
+    progress = runtime_console.Progress(
+        'segment={} recovery waveform stations'.format(segment), len(station_keys),
+        getattr(cfg, 'progress_interval_sec', 60.0))
     if cfg.num_workers and cfg.num_workers > 1:
         with ThreadPoolExecutor(max_workers=cfg.num_workers) as executor:
             results = _bounded_station_results(
                 executor, station_keys, cfg.num_workers, prepare
             )
-            for sta_key, waveform in results:
+            for completed, (sta_key, waveform) in enumerate(results, 1):
                 if waveform is not None:
                     waveforms[sta_key] = waveform
+                progress.update(completed)
                 if len(waveforms) % 10 == 0:
                     trim_cpu_allocator()
     else:
-        for sta_key in station_keys:
+        for completed, sta_key in enumerate(station_keys, 1):
             _, waveform = prepare(sta_key)
             if waveform is not None:
                 waveforms[sta_key] = waveform
+            progress.update(completed)
     timing["preprocess_sec"] = time.perf_counter() - started
     timing["num_station_streams"] = len(waveforms)
     timing["rss_after_picking_mb"] = process_rss_mb()
@@ -1314,6 +1319,9 @@ def process_segment(
         for subnet_name, result in sorted(assoc_results.items()):
             assoc_sum += result["assoc_sec"]
             timing["assoc_{}_{}_sec".format(branch_key, subnet_name)] = result["assoc_sec"]
+            for field in ("association_num_workers", "independent_clusters"):
+                if field in result:
+                    timing["assoc_{}_{}_{}".format(branch_key, subnet_name, field)] = result[field]
             timing["picks_{}_{}".format(branch_key, subnet_name)] = result["num_picks"]
             timing["events_{}_{}".format(branch_key, subnet_name)] = len(
                 read_phase_file(result["pha_path"])

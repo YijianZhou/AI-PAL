@@ -1,5 +1,10 @@
 # AI-PAL
 
+Offline continuous picking queues sorted unfinished dates across persistent
+workers, rather than assigning fixed date blocks. Existing completion markers
+are reusable; worker models load once. Shifted-day buffers reuse cached tails
+for consecutive assignments and load the preceding short tail after date jumps.
+
 AI-PAL is a self-supervised earthquake detection framework built around one
 central idea: use the rule-based Phase picking, Association, and Location (PAL)
 algorithm to generate locally adapted phase labels and training samples from

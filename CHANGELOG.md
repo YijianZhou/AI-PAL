@@ -5,6 +5,54 @@ procedure are in [CHANGELOG_INTERNAL.md](CHANGELOG_INTERNAL.md).
 
 ## Unreleased
 
+- Dynamically balance pending repick events across model workers while retaining
+  bounded same-day CPU reassociation batches and event-level resume.
+
+- Dynamically distribute unfinished local PAL picking dates across persistent
+  workers, preserving resume checks and shifted-day waveform buffers.
+
+- Balance offline continuous picking across pending dates with persistent model
+  workers, preserving shifted-day ownership and correct preceding-day buffers.
+
+- Offline PAL and AI-PAL initial association now share read-only float32 tables
+  across date workers, including saved travel-time archives. Launchers expose
+  `ASSOCIATION_TABLE_DIR`; date scheduling and association criteria are unchanged.
+
+- Offline postprocessing now exports per-event and daily timing reports,
+  including waveform discovery/read/preprocessing and checkpoint writes.
+  Overlapping worker times and missing legacy timings are identified explicitly.
+
+- Store PAL P/S travel-time tables in float32, halving dense table memory and
+  shared-cache payload where used. New travel-time archives also store float32;
+  existing float64 archives remain compatible and are not rewritten. Grid and
+  absolute-time precision are unchanged.
+
+- Show concise startup-recovery and repicking progress at default realtime
+  console verbosity, using the existing progress-report interval.
+
+- Store shared association tables under workflow `./input` by default, with
+  executable `ASSOCIATION_TABLE_DIR` control and no system-temp fallback.
+
+- Harden shared association-table publication against temporary disk/quota
+  exhaustion; report checked I/O errors and enable native crash tracebacks.
+
+- Share read-only travel-time tables across realtime association workers and
+  offline reassociation children, avoiding repeated network/segment rebuilds.
+  Table-construction messages are now debug-only.
+
+- Multi-worker executables use stage-qualified `XXX_NUM_WORKERS` settings
+  (picking, preprocessing, postprocessing, association, or upload). Existing
+  counts and runtime interfaces are unchanged; update custom launcher overrides.
+
+- Offline postprocessing now uses four contiguous event partitions by default,
+  each with serial repicking and four CPU reassociation workers. Per-event
+  checkpoints are retained; local and AWS launchers expose both worker budgets.
+
+- Realtime initial PAL association and event reassociation share a bounded CPU process pool via
+  executable ASSOCIATION_NUM_WORKERS (default 4; 1 serial), preserving
+  competing picks within independent origin-time clusters. GPU models are not
+  duplicated for event reassociation.
+
 - AWS workflows now include a local step-0 travel-time table builder (JSON,
   CSV or paired CRE); submissions automatically upload configured .paltt files.
 

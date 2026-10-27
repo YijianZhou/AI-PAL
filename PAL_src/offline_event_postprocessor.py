@@ -103,8 +103,10 @@ def _station_paths(cfg, data_dir, station, start_time, end_time):
 
 
 def _read_preprocessed_station(
-    station, bounds, cfg, data_dir, stations,
+    station, bounds, cfg, data_dir, stations, timing=None,
 ):
+    timing = {} if timing is None else timing
+    started = time.perf_counter()
     requested_start, requested_end = [UTCDateTime(value) for value in bounds]
     taper_sec = float(cfg.taper_max_length_sec)
     raw_start = requested_start - taper_sec
@@ -112,9 +114,16 @@ def _read_preprocessed_station(
     paths = _station_paths(
         cfg, data_dir, station, raw_start, raw_end
     )
+    timing['file_discovery_worker_sec'] = time.perf_counter() - started
     if not paths:
         print("no event waveform files for {}".format(station), flush=True)
         return station, None
+    started = time.perf_counter()
+    import inspect
+    reader_timing = {}
+    timing_kwargs = {}
+    if "timing" in inspect.signature(cfg.read_data).parameters:
+        timing_kwargs["timing"] = reader_timing
     stream = cfg.read_data(
         paths,
         stations,
@@ -131,9 +140,17 @@ def _read_preprocessed_station(
         channel_priority=getattr(
             cfg, "channel_priority", ("HH", "BH", "EH", "HN", "EN", "SH")
         ),
+        **timing_kwargs,
     )
+    timing['read_and_clean_worker_sec'] = time.perf_counter() - started
+    if timing_kwargs:
+        read_sec = reader_timing.get('waveform_read_worker_sec', 0.0)
+        timing['waveform_read_worker_sec'] = read_sec
+        timing['reader_selection_clean_calibration_worker_sec'] = max(
+            0.0, timing['read_and_clean_worker_sec'] - read_sec)
     if not stream:
         return station, None
+    started = time.perf_counter()
     filtered, _ = preprocess_picker_stream(
         stream,
         num_channels=int(cfg.num_chn),
@@ -144,6 +161,7 @@ def _read_preprocessed_station(
         to_filter=bool(getattr(cfg, "to_filter", True)),
         retain_raw=False,
     )
+    timing['filter_preprocess_worker_sec'] = time.perf_counter() - started
     if len(filtered) != int(cfg.num_chn):
         return station, None
     filtered = filtered.slice(
@@ -157,17 +175,20 @@ def _read_preprocessed_station(
 
 
 def _load_waveform_context(
-    repicker, events, cfg, data_dir, stations, num_workers,
+    repicker, events, cfg, data_dir, stations, num_workers, timing=None,
 ):
+    started = time.perf_counter()
+    timing = {} if timing is None else timing
     requests = repicker.waveform_requests(events)
     if not requests:
         return [], 0
     tasks = sorted(requests.items())
 
     def process(item):
-        return _read_preprocessed_station(
-            item[0], item[1], cfg, data_dir, stations
-        )
+        measured = {}
+        result = _read_preprocessed_station(
+            item[0], item[1], cfg, data_dir, stations, measured)
+        return result, measured
 
     if num_workers > 1 and len(tasks) > 1:
         with ThreadPoolExecutor(
@@ -177,6 +198,10 @@ def _load_waveform_context(
             loaded = list(executor.map(process, tasks))
     else:
         loaded = [process(item) for item in tasks]
+    for _, measured in loaded:
+        for name, seconds in measured.items():
+            timing[name] = timing.get(name, 0.0) + seconds
+    loaded = [result for result, _ in loaded]
     waveforms = {
         station: holder for station, holder in loaded if holder is not None
     }
@@ -185,6 +210,7 @@ def _load_waveform_context(
         "end": max(bounds[1] for bounds in requests.values()),
         "waveforms": waveforms,
     }]
+    timing['waveform_load_wall_sec'] = time.perf_counter() - started
     return context, len(requests)
 
 
@@ -305,6 +331,7 @@ def run_offline_event_postprocessing(
     unreleased_snapshots = []
     try:
         for current_date in target_dates:
+            finalization_started = time.perf_counter()
             current_stations = load_station_geometry(
                 cfg, station_file, current_date
             )
@@ -403,10 +430,13 @@ def run_offline_event_postprocessing(
                 dir=internal_root,
             ) as temp_dir:
                 temp_dir = Path(temp_dir)
+                checkpoint_load_sec = 0.0
                 for event_index, event in enumerate(initial_events):
                     from repick_checkpoints import load_checkpoint
                     cache_path, cache_key = _event_cache[event_index]
+                    checkpoint_load_started = time.perf_counter()
                     event_outputs, summary, new_snapshots = load_checkpoint(cache_path, cache_key)
+                    checkpoint_load_sec += time.perf_counter() - checkpoint_load_started
                     reassociated_events.extend(event_outputs)
                     for key in (
                         "num_station_event_attempts",
@@ -438,6 +468,7 @@ def run_offline_event_postprocessing(
                 repicker.write_events(
                     reassociated_events, candidate_phase, candidate_catalog
                 )
+                merge_started = time.perf_counter()
                 merge_summary = merge_canonical_interval(
                     day_start,
                     day_end,
@@ -450,8 +481,10 @@ def run_offline_event_postprocessing(
                 )
                 final_events = read_phase_file(daily_phase)
                 day_summary["post_reassociation_merge"] = merge_summary
+                merge_sec = time.perf_counter() - merge_started
                 day_summary["num_final_events"] = len(final_events)
 
+                products_started = time.perf_counter()
                 num_plots = 0
                 waveform_summary = {}
                 for final_event in final_events:
@@ -490,6 +523,12 @@ def run_offline_event_postprocessing(
                     if id(value) not in released_ids
                 ]
 
+            from offline_timing import export_daily_timing
+            day_summary["timing"] = export_daily_timing(
+                _event_cache, work_root / "timing", current_date,
+                dict(checkpoint_load_sec=checkpoint_load_sec, merge_sec=merge_sec,
+                     waveform_products_sec=time.perf_counter() - products_started,
+                     finalization_wall_sec=time.perf_counter() - finalization_started))
             partial = status_path.with_suffix(".json.partial")
             partial.write_text(
                 json.dumps(day_summary, indent=2, default=str) + "\n",

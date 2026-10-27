@@ -1,4 +1,4 @@
-"""Spawn independent date blocks for the pick-only AI ensemble workflow."""
+"""Dynamically schedule pending dates across persistent AI picking workers."""
 import contextlib
 from datetime import datetime
 import importlib.util
@@ -6,12 +6,12 @@ import multiprocessing as mp
 import os
 import math
 from pathlib import Path
+from numbers import Integral
 import queue
 import sys
 import time
 import traceback
 
-from local_pick_blocks import date_blocks
 
 
 def load_workflow_config(path):
@@ -23,7 +23,7 @@ def load_workflow_config(path):
     return module.Config()
 
 
-def _worker(index, kwargs, config_path, log_path, messages):
+def _worker(index, kwargs, config_path, log_path, messages, tasks):
     with open(log_path, "w", encoding="utf-8", buffering=1) as log:
         with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
             try:
@@ -55,7 +55,15 @@ def _worker(index, kwargs, config_path, log_path, messages):
                     print("[memory] GPU memory peaks (PyTorch only, process lifetime) "
                           "day={}: {}".format(day.date, memory), file=log, flush=True)
                     messages.put(("day", index, (str(day.date), skipped, memory)))
-                run_offline_picker_ensemble(cfg=cfg, day_complete_callback=complete, **kwargs)
+                def assigned_dates():
+                    while True:
+                        day = tasks.get()
+                        if day is None:
+                            return
+                        messages.put(('active', index, day))
+                        yield day
+                run_offline_picker_ensemble(cfg=cfg, day_complete_callback=complete,
+                                            _date_tasks=assigned_dates(), **kwargs)
                 messages.put(("done", index, None))
             except BaseException as exc:
                 traceback.print_exc(file=log)
@@ -72,13 +80,13 @@ def run_offline_pick_blocks(*, ai_pal_root, config_path, picker_specs, data_dir,
     progress_interval_sec = float(progress_interval_sec)
     if not math.isfinite(progress_interval_sec) or progress_interval_sec <= 0:
         raise ValueError("progress_interval_sec must be finite and positive")
-    if int(num_workers) < 1 or int(preprocessing_workers) < 1:
-        raise ValueError("worker counts must be positive")
+    for name, value in [('num_workers', num_workers), ('preprocessing_workers', preprocessing_workers)]:
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
+            raise ValueError('{} must be a positive integer'.format(name))
     start, end = [datetime.strptime(value, "%Y%m%d").date()
                   for value in time_range.split("-")]
     if start >= end:
         raise ValueError("time_range must have start < exclusive end")
-    blocks = date_blocks(start, end, num_workers)
     log_dir = Path(log_dir).resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     # Legacy branch-directory migrations must happen once, before workers start.
@@ -89,30 +97,46 @@ def run_offline_pick_blocks(*, ai_pal_root, config_path, picker_specs, data_dir,
         new = root / "1.1.{}_picks_{}_{}".format(index, spec.get("group", "Local").lower(), model)
         if old.is_dir() and not new.exists():
             old.replace(new)
+    cfg = load_workflow_config(config_path)
+    from offline_picker_runner import pending_pick_dates
+    pending, skipped = pending_pick_dates(cfg, picker_specs, time_range,
+        individual_pick_root, ensemble_pick_dir, overwrite)
+    print('[resume] AI picking | pending dates={} skipped={} total={}'.format(
+        len(pending), skipped, (end-start).days), flush=True)
+    if not pending:
+        print('[progress] AI picking | completed=0 skipped={} total={} | all dates complete'.format(
+            skipped, (end-start).days), flush=True)
+        return
+    worker_count = min(int(num_workers), len(pending))
     context = mp.get_context("spawn")
     messages = context.Queue()
+    tasks = context.Queue()
     processes = []
     logs = {}
-    completed = skipped = 0
+    completed = 0
+    active = {}
     started = last_report = time.monotonic()
     def report(detail):
         print("[progress] AI picking | completed={} skipped={} total={} | {} | elapsed {:.0f}s".format(
             completed, skipped, (end-start).days, detail, time.monotonic()-started), flush=True)
     try:
-        for index, (first, stop) in enumerate(blocks, 1):
-            interval = first.strftime("%Y%m%d") + "-" + stop.strftime("%Y%m%d")
-            log = str(log_dir / ("pick_" + interval + ".log"))
+        for day in pending:
+            tasks.put(day)
+        for _ in range(worker_count):
+            tasks.put(None)
+        for index in range(1, worker_count + 1):
+            log = str(log_dir / ('pick_{}_worker{}.log'.format(time_range, index)))
             logs[index] = log
             kwargs = dict(ai_pal_root=str(Path(ai_pal_root).resolve()),
                 picker_specs=picker_specs, data_dir=str(Path(data_dir).resolve()),
-                station_file=str(Path(station_file).resolve()), time_range=interval,
+                station_file=str(Path(station_file).resolve()), time_range=time_range,
                 individual_pick_root=str(Path(individual_pick_root).resolve()),
                 ensemble_pick_dir=str(Path(ensemble_pick_dir).resolve()),
                 num_workers=int(preprocessing_workers), overwrite=bool(overwrite))
-            print("AI worker {}: {} | preprocessing workers={} | log {}".format(
-                index, interval, preprocessing_workers, log), flush=True)
+            print("AI worker {}: pending-date queue | preprocessing workers={} | log {}".format(
+                index, preprocessing_workers, log), flush=True)
             process = context.Process(target=_worker, args=(
-                index, kwargs, str(Path(config_path).resolve()), log, messages))
+                index, kwargs, str(Path(config_path).resolve()), log, messages, tasks))
             process.start()
             processes.append(process)
         done = set()
@@ -126,6 +150,7 @@ def run_offline_pick_blocks(*, ai_pal_root, config_path, picker_specs, data_dir,
                         raise RuntimeError("AI worker {} exited ({}); see {}".format(index, process.exitcode, logs[index]))
             else:
                 if kind == "day":
+                    active.pop(index, None)
                     day, was_skipped, memory = payload
                     skipped += was_skipped
                     completed += not was_skipped
@@ -134,16 +159,20 @@ def run_offline_pick_blocks(*, ai_pal_root, config_path, picker_specs, data_dir,
                         last_report = time.monotonic()
                 elif kind == "done":
                     done.add(index)
+                    active.pop(index, None)
+                elif kind == 'active':
+                    active[index] = payload
                 else:
                     raise RuntimeError("AI worker {} failed: {}; see {}".format(index, payload, logs[index]))
             if time.monotonic() - last_report >= progress_interval_sec:
-                report("active blocks={}".format(len(processes)-len(done)))
+                report("active workers={} | dates={}".format(len(active),
+                    ','.join('worker{}:{}'.format(i, day) for i, day in sorted(active.items())) or '-'))
                 last_report = time.monotonic()
         for process in processes:
             process.join()
             if process.exitcode != 0:
                 raise RuntimeError("AI worker exited with code {}".format(process.exitcode))
-        report("all blocks complete")
+        report("all dates complete")
     finally:
         for process in processes:
             if process.is_alive():
@@ -152,3 +181,5 @@ def run_offline_pick_blocks(*, ai_pal_root, config_path, picker_specs, data_dir,
             process.join()
         messages.close()
         messages.join_thread()
+        tasks.cancel_join_thread()
+        tasks.close()
