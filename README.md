@@ -1,26 +1,16 @@
 # AI-PAL
 
-Offline continuous picking queues sorted unfinished dates across persistent
-workers, rather than assigning fixed date blocks. Existing completion markers
-are reusable; worker models load once. Shifted-day buffers reuse cached tails
-for consecutive assignments and load the preceding short tail after date jumps.
-
 AI-PAL is a self-supervised earthquake detection framework built around one
 central idea: use the rule-based Phase picking, Association, and Location (PAL)
 algorithm to generate locally adapted phase labels and training samples from
 continuous seismic data, then train AI phase pickers for that region and
 associate their picks with PAL.
 
-Version 7.x is a major update from v6.x. It reorganizes the package into shared
-source, model, and executable-workflow layers; extends continuous inference to
-multi-picker ensembles; and adds event-level repicking and reassociation as a
-new postprocessing stage. The established initial detection sequence of AI
-phase picking followed by PAL association is retained. The reorganized package
-supports local workstation, AWS, and persistent realtime workflows for model
-training and continuous-data processing, followed by final event location.
-
-Current release preparation: **v7.3**. See the [changelog](CHANGELOG.md)
-for major changes since v7.2. Future changes are tracked against this baseline.
+The package supports local workstation, AWS, and persistent realtime workflows.
+Locally trained and pre-trained Global pickers can be combined in multi-picker
+ensembles, followed by PAL association, optional event-level repicking and
+reassociation, and final event location. Shared source packages implement the
+processing; executable workflow folders contain user settings and launchers.
 
 ## 1. Overview
 
@@ -354,6 +344,8 @@ Detailed row schemas and restart-completion rules are documented in
 - 2022/08 Chinese online training: [KouShare](https://www.koushare.com/video/videodetail/31656)
 
 ## References
+
+For release history, see the [changelog](CHANGELOG.md).
 
 - **Zhou, Y.**, H. Ding, A. Ghosh, and Z. Ge (2025). AI-PAL:
   Self-Supervised AI Phase Picking via Rule-Based Algorithm for Generalized
