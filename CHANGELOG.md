@@ -5,150 +5,51 @@ procedure are in [CHANGELOG_INTERNAL.md](CHANGELOG_INTERNAL.md).
 
 ## Unreleased
 
-- Dynamically balance pending repick events across model workers while retaining
-  bounded same-day CPU reassociation batches and event-level resume.
+Future changes will be recorded relative to v7.3.
 
-- Dynamically distribute unfinished local PAL picking dates across persistent
-  workers, preserving resume checks and shifted-day waveform buffers.
+## v7.3 - Release Preparation
 
-- Balance offline continuous picking across pending dates with persistent model
-  workers, preserving shifted-day ownership and correct preceding-day buffers.
+Changes since v7.2. Prepared 2026-10-29; GitHub publication/tagging is performed separately.
 
-- Offline PAL and AI-PAL initial association now share read-only float32 tables
-  across date workers, including saved travel-time archives. Launchers expose
-  `ASSOCIATION_TABLE_DIR`; date scheduling and association criteria are unchanged.
+- Improve PAL association with distinct-station counting, P/S residual checks,
+  configurable origin-time grid search, adaptive spatial coverage, and faster
+  candidate searches with reuse of failed-search results.
+- Support precomputed travel-time archives built from JSON, combined Vp/Vs CSV,
+  or paired CRE velocity models. Include example 1D model preparation and local
+  table-building launchers for local and AWS workflows.
+- Store travel-time arrays in float32 and share read-only tables across offline
+  date workers. Existing float64 archives remain readable. Shared stores use
+  executable `ASSOCIATION_TABLE_DIR`, never system temp, with checked writes
+  and normal-run cleanup.
+- Dynamically schedule unfinished PAL picking and association dates, retaining
+  resume checks, waveform buffers, and persistent workers.
+- Use `nan` for missing station gains; gain `1` is valid for calibrated data.
+  Missing-gain stations remain usable for picking but not magnitude.
+- Simplify default progress output while retaining detailed debug diagnostics.
+  Multi-control launchers use stage-specific `XXX_NUM_WORKERS` names.
+- Improve realtime CPU association/reassociation parallelism without duplicating
+  GPU repickers; share read-only travel-time arrays across workers.
+- Dynamically balance offline picking dates and postprocessing events across
+  persistent model workers, with bounded CPU reassociation batches, atomic
+  event checkpoints, and stable cross-process resume fingerprints.
+- Export offline per-event and daily timing reports covering waveform discovery,
+  reading, preprocessing, repicking, and checkpoint writes.
+- Improve CPU/GPU picking concurrency and release unused GPU buffers/cache.
+  Default offline waveform PNG export to off, retaining explicit opt-in.
+- Add configurable magnitude-versus-station-participation QC. The default keeps
+  the detection and marks suspicious magnitude as `nan`; removal and disabled
+  modes are available with diagnostic CSVs.
+- Align training defaults: positive batch size 128; Local negative batches 64
+  (SAR/FT) and 16 (PHN/RUN), weight 1.0; CEED negative batches 16 and 4,
+  respectively, weight 0.1 for all models. Existing checkpoints are unchanged.
 
-- Offline postprocessing now exports per-event and daily timing reports,
-  including waveform discovery/read/preprocessing and checkpoint writes.
-  Overlapping worker times and missing legacy timings are identified explicitly.
+### Migration Notes
 
-- Store PAL P/S travel-time tables in float32, halving dense table memory and
-  shared-cache payload where used. New travel-time archives also store float32;
-  existing float64 archives remain compatible and are not rewritten. Grid and
-  absolute-time precision are unchanged.
-
-- Show concise startup-recovery and repicking progress at default realtime
-  console verbosity, using the existing progress-report interval.
-
-- Store shared association tables under workflow `./input` by default, with
-  executable `ASSOCIATION_TABLE_DIR` control and no system-temp fallback.
-
-- Harden shared association-table publication against temporary disk/quota
-  exhaustion; report checked I/O errors and enable native crash tracebacks.
-
-- Share read-only travel-time tables across realtime association workers and
-  offline reassociation children, avoiding repeated network/segment rebuilds.
-  Table-construction messages are now debug-only.
-
-- Multi-worker executables use stage-qualified `XXX_NUM_WORKERS` settings
-  (picking, preprocessing, postprocessing, association, or upload). Existing
-  counts and runtime interfaces are unchanged; update custom launcher overrides.
-
-- Offline postprocessing now uses four contiguous event partitions by default,
-  each with serial repicking and four CPU reassociation workers. Per-event
-  checkpoints are retained; local and AWS launchers expose both worker budgets.
-
-- Realtime initial PAL association and event reassociation share a bounded CPU process pool via
-  executable ASSOCIATION_NUM_WORKERS (default 4; 1 serial), preserving
-  competing picks within independent origin-time clusters. GPU models are not
-  duplicated for event reassociation.
-
-- AWS workflows now include a local step-0 travel-time table builder (JSON,
-  CSV or paired CRE); submissions automatically upload configured .paltt files.
-
-- Build PAL travel-time tables from combined Vp/Vs CSV or paired P/S CRE,
-  as well as JSON, with explicit preparation-only datum/bottom settings.
-
-- Provide a configurable regional 1D velocity-model preprocessing example and
-  document its JSON handoff to PAL/AI-PAL travel-time-table preparation.
-
-- Hide detailed PAL association attempt/cache counters at normal console
-  verbosity; retain them with console_verbosity="debug".
-
-- Default offline event waveform plots to off; retain explicit opt-in and
-  existing realtime defaults.
-
-- Fix event-repick resume fingerprints changing between Python processes and
-  avoid parsing input phase files for unchanged completed days.
-
-- Run offline repicking with four persistent event workers by default, dynamic
-  load balancing and atomic event-level resume; retain daily merging/products
-  and station preprocessing concurrency.
-
-- Default routine picking and association console progress to 60 seconds,
-  including rapid date-completion updates; preserve immediate failure reports.
-
-- Balance offline association dynamically across pending dates, retain worker
-  caches, report active dates, and fail promptly on unexpected worker exits.
-
-- Avoid repeating failed association searches after unrelated events are found,
-  without restricting the spatial search or changing association thresholds.
-
-- Reuse decoded station travel-time tables during association instead of
-  repeatedly loading them; add flushed search diagnostics to daily logs.
-
-- Added optional local `0_build_travel_time_table_eg.py` preparation with
-  editable settings at the top and a shared `PAL_src` helper; no separate
-  builder configuration file is needed.
-
-- Use `nan` for unavailable station gains; gain `1` now correctly permits
-  already-calibrated data to contribute to magnitude. Missing-gain stations
-  remain usable for picking. Migrate older gain-1 placeholders before rerunning.
-
-- Association now accepts only homogeneous `velo_mod=[Vp, Vs]` or a saved
-  `travel_time_table` (.paltt). Build layered-model tables separately; runtime
-  model-file inputs and `layered_model_options` have been removed from active
-  workflows. Existing saved tables and homogeneous settings remain compatible.
-
-- Load precomputed P/S times from one `.paltt` file using optional
-  `travel_time_table`; skip unavailable station/cell pairs safely.
-
-- Accept scalar `max_res=r` as shorthand for equal P/S residual limits `[r, r]`.
-
-- PAL spatial association now checks both P and S arrivals. Configure homogeneous
-  `velo_mod=[5.9, 3.5]` (km/s) and `max_res=[res_p, res_s]` (seconds);
-  active workflow configs are migrated, retaining regional tolerances.
-
-- Speed up PAL association with sliding-window station counts, local count
-  updates, stable pick indices, and reused per-cluster calculations. Existing
-  association settings and selection rules are preserved.
-
-- PAL now counts distinct stations by default (`unique_stations=True`) while
-  retaining alternative P-S pairs for spatial selection. Failed neighborhoods
-  yield to alternative centers; retries no longer discard their candidates.
-  Fix adaptive grid coverage and preserve internal location precision. Catalog
-  coordinates use four decimal places for lat/lon and one for depth.
-
-- Configurable final AI-PAL station-participation QC flags unusually large
-  magnitudes supported by few stations within the Local+Global pick radius.
-  Default action preserves detections but marks magnitude `nan`; removal and
-  disabled modes are available, with per-event diagnostic CSVs.
-
-- PAL association now searches up to ten origin times at 0.1-second spacing
-  near the cluster median, bounded by its 5th-95th percentiles. Solutions maximize
-  associated count, then minimize median absolute P residual. Temporal step,
-  maximum span, and point count are configurable per subnet (defaults: 0.1 s,
-  1.0 s, and 10 points).
-
-
-- Faster offline picking resume: skipped days no longer reload waveform tails;
-  only the context needed by the next unfinished day is loaded.
-
-- Offline GPU picking now releases unused CUDA allocator cache after each
-  successful station/device group. This reduces idle reservation, not the
-  required peak inference memory; CPU picking and checkpoints are unchanged.
-
-- Offline CPU pickers now run concurrently by model within each date-block
-  process, while GPU inference remains serialized per device.
-- Release finished GPU waveform copies without waiting for CPU pickers, and
-  avoid unused SAR attention weights. Existing checkpoints remain compatible.
-- Local AI-PAL pick-only examples now default to four date-block processes;
-  preprocessing concurrency remains four workers per process.
-- Local training defaults now use 64 negative windows for SAR/FT and 16 for
-  PHN/RUN, with negative loss weight 1.0. CEED training uses 16 and 4 respectively,
-  with negative loss weight 0.1 for every model. Positive batch size remains 128.
-  Align these defaults across active workflow, benchmark, and pretrained-model
-  config copies; existing checkpoint weights and inference settings are unchanged.
+- Replace old gain-1 placeholders with `nan` only where gains are unavailable.
+- Runtime association uses homogeneous `velo_mod=[Vp, Vs]` or a saved
+  `travel_time_table`; build layered-model tables before running association.
+- Ensure `ASSOCIATION_TABLE_DIR` has enough disk space for shared tables.
+  Per-worker search workspaces still require additional RAM.
 
 ## v7.2 - Release Preparation
 
