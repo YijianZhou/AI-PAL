@@ -5,6 +5,10 @@ procedure are in [CHANGELOG_INTERNAL.md](CHANGELOG_INTERNAL.md).
 
 ## Unreleased
 
+- Align Global CEED SAR/FT training configs with the current models:
+  `batch_size = [128, 32]` (positive/negative windows), retaining negative loss
+  weight 0.1. CEED PHN/RUN and Local settings are unchanged.
+
 Future changes will be recorded relative to v7.3.
 
 ## v7.3 - Release Preparation

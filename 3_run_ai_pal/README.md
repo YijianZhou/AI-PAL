@@ -327,6 +327,10 @@ its S3 checkpoint inputs must contain that exact file. Use
 device. In the local pick-only `1_run_ai_pal_pick_eg.py`, `PICKING_NUM_WORKERS = 4`
 controls persistent spawned pending-date workers; `PREPROCESSING_NUM_WORKERS = 4`
 retains concurrent station-date reading/preprocessing inside each process.
+Workers pull sorted unfinished dates dynamically and load their models once.
+Existing completion markers are reusable. Shifted-day buffers reuse cached
+tails for consecutive assignments and load the preceding short tail after
+date jumps.
 The Central California run measured about 2228 MiB per process (about 8.7 GiB
 for four). Allow GPU memory headroom and reduce `PICKING_NUM_WORKERS` when using more
 models, larger batches, or a GPU shared with other jobs.

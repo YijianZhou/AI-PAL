@@ -7,7 +7,7 @@ pretrained-model config copies):
 | --- | --- | --- | --- |
 | Local | SAR, FT | `[128, 64]` | `1.0` |
 | Local | PHN, RUN | `[128, 16]` | `1.0` |
-| Global CEED | SAR, FT | `[128, 16]` | `0.1` |
+| Global CEED | SAR, FT | `[128, 32]` | `0.1` |
 | Global CEED | PHN, RUN | `[128, 4]` | `0.1` |
 
 Batch sizes count positive/negative windows, respectively, and must be integers
