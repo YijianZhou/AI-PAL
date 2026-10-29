@@ -5,10 +5,6 @@ procedure are in [CHANGELOG_INTERNAL.md](CHANGELOG_INTERNAL.md).
 
 ## Unreleased
 
-- Align Global CEED SAR/FT training configs with the current models:
-  `batch_size = [128, 32]` (positive/negative windows), retaining negative loss
-  weight 0.1. CEED PHN/RUN and Local settings are unchanged.
-
 Future changes will be recorded relative to v7.3.
 
 ## v7.3 - Release Preparation
@@ -44,8 +40,10 @@ Changes since v7.2. Prepared 2026-10-29; GitHub publication/tagging is performed
   the detection and marks suspicious magnitude as `nan`; removal and disabled
   modes are available with diagnostic CSVs.
 - Align training defaults: positive batch size 128; Local negative batches 64
-  (SAR/FT) and 16 (PHN/RUN), weight 1.0; CEED negative batches 16 and 4,
+  (SAR/FT) and 16 (PHN/RUN), weight 1.0; CEED negative batches 32 and 4,
   respectively, weight 0.1 for all models. Existing checkpoints are unchanged.
+- Keep the package README overview-first, with consistent repository navigation
+  links and operational details in workflow documentation.
 
 ### Migration Notes
 
