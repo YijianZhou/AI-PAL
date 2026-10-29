@@ -69,16 +69,15 @@ release, without changing its established theoretical basis.
 
 | Path | Purpose |
 | --- | --- |
-| `PAL_src/` | Shared waveform pipeline, PAL algorithms, configuration, orchestration, merging, and postprocessing. |
-| [`preprocess/`](preprocess/README.md) | Example workflow for station metadata, waveform download, validated daily merging, continuity checks, and station maps. |
-| `picker_SAR/`, `picker_FT/`, `picker_PHN/`, `picker_RUN/` | Peer AI picker packages. Each includes preprocessing and sample construction, model and dataset definitions, training, and continuous/positive inference. |
-| `1_run_pal/` | Executable rule-based PAL workflows for label generation and association. |
-| `2_train_picker/` | Shared training-data preparation and picker-training workflows. |
-| `3_run_ai_pal/` | Multi-picker continuous inference, association, and postprocessing workflows. |
-| `4_location/` | Hypoinverse and HypoDD workflows for final AI-PAL event location. |
-| `Pre-trained_models/` | Packaged model checkpoints and their matching model configs. |
-| `benchmark_picker/` | Picker benchmarking and positive-picker research workflows. |
-| `References/` | External implementations and preserved migration material. |
+| [PAL_src/](PAL_src/README.md) | Shared waveform pipeline, PAL algorithms, configuration, orchestration, merging, and postprocessing. |
+| [preprocess/](preprocess/README.md) | Example workflow for station metadata, waveform download, validated daily merging, continuity checks, and station maps. |
+| [picker_SAR/](picker_SAR/README.md), [picker_FT/](picker_FT/README.md), [picker_PHN/](picker_PHN/README.md), [picker_RUN/](picker_RUN/README.md) | Peer AI picker packages for preprocessing, sample construction, model and dataset definitions, training, and continuous inference. |
+| [1_run_pal/](1_run_pal/README.md) | Executable rule-based PAL workflows for label generation and association. |
+| [2_train_picker/](2_train_picker/README.md) | Shared training-data preparation and picker-training workflows. |
+| [3_run_ai_pal/](3_run_ai_pal/README.md) | Multi-picker continuous inference, association, and postprocessing workflows. |
+| [4_location/](4_location/README.md) | Hypoinverse and HypoDD workflows for final AI-PAL event location. |
+| [Pre-trained_models/](Pre-trained_models/README.md) | Packaged model checkpoints and their matching model configs. |
+| [References/](References/README.md) | External implementations and preserved migration material. |
 
 The four `picker_*` packages have equal status. Any one can be trained and run
 as an independent picker, or combined with the others in an AI-PAL ensemble.
