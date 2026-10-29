@@ -19,8 +19,8 @@ phase picking followed by PAL association is retained. The reorganized package
 supports local workstation, AWS, and persistent realtime workflows for model
 training and continuous-data processing, followed by final event location.
 
-Current release preparation: **v7.2**. See the [changelog](CHANGELOG.md)
-for major changes since v7.1. Future changes are tracked against this baseline.
+Current release preparation: **v7.3**. See the [changelog](CHANGELOG.md)
+for major changes since v7.2. Future changes are tracked against this baseline.
 
 ## 1. Overview
 
